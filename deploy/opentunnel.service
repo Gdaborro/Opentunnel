@@ -1,0 +1,21 @@
+[Unit]
+Description=opentunnel relay server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=otu
+ExecStart=/usr/local/bin/otu-server -c /etc/opentunnel/server.toml
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ReadWritePaths=/var/lib/opentunnel
+StateDirectory=opentunnel
+WorkingDirectory=/var/lib/opentunnel
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

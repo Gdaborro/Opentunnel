@@ -1,0 +1,6 @@
+bin/
+*.exe
+*.toml.orig
+srv*.log
+srv*.out
+fetch*.html
