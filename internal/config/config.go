@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -30,6 +31,7 @@ type ClientConf struct {
 	Transport   string   `toml:"transport"`    // wstls (default) | ssh
 	SSHUser     string   `toml:"ssh_user"`     // for transport="ssh"
 	SSHKey      string   `toml:"ssh_key"`      // path to private key
+	SSHPort     string   `toml:"ssh_port"`     // default "22"
 	SSHInternal string   `toml:"ssh_internal"` // loopback ws target on VPS, e.g. 127.0.0.1:8081
 	Profile     string   `toml:"profile"`      // auto | fast | balanced | stealth
 	FallbackSSH *bool    `toml:"fallback_ssh"` // add ssh last-resort tier to the ladder
@@ -43,6 +45,22 @@ type ClientConf struct {
 // FallbackSSHEnabled reports whether the ssh last-resort tier should be
 // added to the adaptive ladder (opt-in).
 func (c *ClientConf) FallbackSSHEnabled() bool { return c.FallbackSSH != nil && *c.FallbackSSH }
+
+// SSHPortOrDefault returns the SSH port ("22" unless configured).
+func (c *ClientConf) SSHPortOrDefault() string {
+	if c.SSHPort == "" {
+		return "22"
+	}
+	return c.SSHPort
+}
+
+// SSHHostOnly strips any port from ServerAddr for SSH dialing.
+func (c *ClientConf) SSHHostOnly() string {
+	if h, _, err := net.SplitHostPort(c.ServerAddr); err == nil {
+		return h
+	}
+	return c.ServerAddr
+}
 
 // TransportKind returns "wstls" unless explicitly set to "ssh".
 func (c *ClientConf) TransportKind() string {

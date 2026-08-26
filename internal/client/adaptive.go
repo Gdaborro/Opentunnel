@@ -66,6 +66,7 @@ type Adaptive struct {
 	factory     func(a *Adaptive, idx int) *Client
 	Logger      *log.Logger // optional; nil = log.Default()
 	mux         bool        // multiplexing requested by config
+	failStreak  int         // consecutive failures on current tier
 
 	// transportBuilder lets configs swap the underlying transport per
 	// profile (e.g. ssh). Defaults to ws-tls with Chrome hello above fast.
@@ -156,6 +157,14 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 	a.mu.Lock()
 	start := a.idx
 	probeDown := a.auto && start > 0 && time.Since(a.lastProbe) > 10*time.Minute
+	// Probe downward early if the current tier keeps failing (e.g. the
+	// fallback tier itself became unreachable) instead of waiting out the
+	// full cool-off.
+	if a.failStreak >= 3 {
+		a.lastProbe = time.Now()
+		a.failStreak = 0
+		probeDown = start > 0
+	}
 	if probeDown {
 		a.lastProbe = time.Now()
 	}
@@ -181,6 +190,7 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		if err == nil {
 			elapsed := time.Since(t0)
 			a.mu.Lock()
+			a.failStreak = 0
 			switch {
 			case probeDown && idx == 0:
 				a.idx = 0 // lower profile healthy again — stay fast
@@ -208,6 +218,9 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		}
 		a.mu.Lock()
 		lastErr = fmt.Errorf("tier %q: %w", a.tierName(idx), err)
+		if idx == a.idx {
+			a.failStreak++
+		}
 		a.mu.Unlock()
 	}
 	if lastErr == nil {

@@ -124,9 +124,10 @@ func main() {
 		if key == "" {
 			log.Fatal("transport=ssh requires ssh_key in config")
 		}
+		sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
 		dialer.UseTransportBuilder(func(profile string) transport.Transport {
 			return transport.NewSSH(transport.SSHOptions{
-				Host:       cfg.ServerAddr,
+				Host:       sshAddr,
 				User:       user,
 				KeyFile:    key,
 				InternalWS: internal,
@@ -147,9 +148,10 @@ func main() {
 			if user == "" {
 				user = "ubuntu"
 			}
+			sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
 			dialer.EnableSSHFallback(func() transport.Transport {
 				return transport.NewSSH(transport.SSHOptions{
-					Host:       cfg.ServerAddr,
+					Host:       sshAddr,
 					User:       user,
 					KeyFile:    cfg.SSHKey,
 					InternalWS: internal,
