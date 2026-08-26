@@ -32,7 +32,7 @@ const adaptiveToken = "adaptive-test-token"
 
 // startAdaptiveFixture runs a local server + target and returns an Adaptive.
 // failFast makes only the "fast" slot fail; failAll makes every slot fail.
-func startAdaptiveFixture(t *testing.T, profile string, fastCalls *int, failAll bool) (*Adaptive, *protocol.Address, func()) {
+func startAdaptiveFixture(t *testing.T, profile string, fastCalls *int, failAll bool) (*Adaptive, *protocol.Address, transport.WSTLSOptions, func()) {
 	t.Helper()
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "OK")
@@ -58,7 +58,8 @@ func startAdaptiveFixture(t *testing.T, profile string, fastCalls *int, failAll 
 	a := NewAdaptive(adaptiveToken, base, profile, 5*time.Second)
 	realFactory := defaultFactory
 	a.factory = func(a *Adaptive, idx int) *Client {
-		if failAll || idx == 0 {
+		// Fail fast always; when failAll, also fail every ws-tls tier.
+		if idx == 0 || (failAll && idx < len(profileOrder)) {
 			return NewWithOptions(&failTransport{calls: fastCalls}, Options{Token: adaptiveToken})
 		}
 		return realFactory(a, idx)
@@ -74,12 +75,12 @@ func startAdaptiveFixture(t *testing.T, profile string, fastCalls *int, failAll 
 		target.Close()
 		srvHTTP.Close()
 	}
-	return a, addr, cleanup
+	return a, addr, base, cleanup
 }
 
 func TestAdaptiveEscalatesAndSticks(t *testing.T) {
 	calls := 0
-	a, addr, cleanup := startAdaptiveFixture(t, "auto", &calls, false)
+	a, addr, _, cleanup := startAdaptiveFixture(t, "auto", &calls, false)
 	defer cleanup()
 
 	conn, err := a.DialTunnel(context.Background(), addr)
@@ -104,7 +105,7 @@ func TestAdaptiveEscalatesAndSticks(t *testing.T) {
 
 func TestFixedProfileNeverEscalates(t *testing.T) {
 	calls := 0
-	a, addr, cleanup := startAdaptiveFixture(t, "stealth", &calls, true)
+	a, addr, _, cleanup := startAdaptiveFixture(t, "stealth", &calls, true)
 	defer cleanup()
 
 	if _, err := a.DialTunnel(context.Background(), addr); err == nil {
@@ -115,5 +116,27 @@ func TestFixedProfileNeverEscalates(t *testing.T) {
 	}
 	if calls != 1 { // fixed profile => exactly one attempt at idx 2
 		t.Fatalf("fixed profile must attempt once, calls=%d", calls)
+	}
+}
+
+// TestSSHFallbackTierRescuesTotalTLSInterception: all ws-tls tiers fail
+// (simulating a full MITM), the ssh last-resort tier succeeds and sticks.
+func TestSSHFallbackTierRescuesTotalTLSInterception(t *testing.T) {
+	wstlsCalls := 0
+	a, addr, base, cleanup := startAdaptiveFixture(t, "auto", &wstlsCalls, true)
+	defer cleanup()
+
+	// A genuinely working transport for the ssh tier (ws stands in for ssh
+	// at unit level — the tier mechanics are what we're testing).
+	realTr := transport.NewWSTLS(base)
+	a.EnableSSHFallback(func() transport.Transport { return realTr })
+
+	conn, err := a.DialTunnel(context.Background(), addr)
+	if err != nil {
+		t.Fatalf("ssh tier should rescue total tls interception: %v", err)
+	}
+	conn.Close()
+	if a.Current() != SshTierName || a.idx != 3 {
+		t.Fatalf("expected sticky escalation to ssh tier (idx=3), got idx=%d", a.idx)
 	}
 }

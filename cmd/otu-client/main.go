@@ -109,6 +109,57 @@ func main() {
 	}
 	dialer := client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
 	dialer.Logger = log.Default()
+
+	switch cfg.TransportKind() {
+	case "ssh":
+		internal := cfg.SSHInternal
+		if internal == "" {
+			internal = "127.0.0.1:8081"
+		}
+		user := cfg.SSHUser
+		if user == "" {
+			user = "ubuntu"
+		}
+		key := cfg.SSHKey
+		if key == "" {
+			log.Fatal("transport=ssh requires ssh_key in config")
+		}
+		dialer.UseTransportBuilder(func(profile string) transport.Transport {
+			return transport.NewSSH(transport.SSHOptions{
+				Host:       cfg.ServerAddr,
+				User:       user,
+				KeyFile:    key,
+				InternalWS: internal,
+				WSPath:     cfg.WSPath,
+			})
+		})
+		fmt.Println("[i] transport: ssh (tunnel inside SSH; AEAD still end-to-end)")
+	default:
+		fmt.Println("[i] transport: ws-tls")
+		// Optional last-resort tier: if every ws-tls tier is intercepted,
+		// try tunneling inside real SSH before giving up.
+		if cfg.FallbackSSHEnabled() && cfg.SSHKey != "" {
+			internal := cfg.SSHInternal
+			if internal == "" {
+				internal = "127.0.0.1:8081"
+			}
+			user := cfg.SSHUser
+			if user == "" {
+				user = "ubuntu"
+			}
+			dialer.EnableSSHFallback(func() transport.Transport {
+				return transport.NewSSH(transport.SSHOptions{
+					Host:       cfg.ServerAddr,
+					User:       user,
+					KeyFile:    cfg.SSHKey,
+					InternalWS: internal,
+					WSPath:     cfg.WSPath,
+				})
+			})
+			fmt.Println("[i] ssh fallback tier enabled (last resort)")
+		}
+	}
+
 	if cfg.MuxEnabled() {
 		dialer.EnableMux()
 	}

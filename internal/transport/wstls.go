@@ -150,10 +150,10 @@ func newPinnedHTTPClient(cfg *tls.Config, timeout time.Duration, chrome bool) *h
 					}
 					return tconn, nil
 				}
-				// Chrome's fingerprint ships ALPN h2+http/1.1, but our
-				// transport speaks HTTP/1.1 WebSocket upgrades — rewrite the
-				// spec's ALPN to match while keeping every other byte of the
-				// Chrome hello intact.
+				// Chrome ships ALPN h2+http/1.1; we speak HTTP/1.1 WebSocket
+				// upgrades only, so pin the spec's ALPN to http/1.1.
+				// (Networks that classify hellos are defeated by the ssh
+				// fallback tier, not by hello tricks.)
 				spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 				if err != nil {
 					_ = raw.Close()

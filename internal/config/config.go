@@ -10,26 +10,46 @@ import (
 )
 
 type Server struct {
-	Listen   string `toml:"listen"` // e.g. ":443"
-	Token    string `toml:"token"`  // shared secret; generate with a password manager
-	CertFile string `toml:"cert_file"`
-	KeyFile  string `toml:"key_file"`
-	WSPath   string `toml:"ws_path"` // default "/ws"
-	Host     string `toml:"host"`    // public hostname, used for self-signed CN
+	Listen         string `toml:"listen"`          // e.g. ":443"
+	ListenAlt      string `toml:"listen_alt"`      // optional extra TLS port sharing cert/handler
+	ListenInternal string `toml:"listen_internal"` // optional PLAIN ws listener bound to loopback (for the ssh transport)
+	Token          string `toml:"token"`           // shared secret; generate with a password manager
+	CertFile       string `toml:"cert_file"`
+	KeyFile        string `toml:"key_file"`
+	AcmeDomain     string `toml:"acme_domain"` // optional: obtain/renew a public LE cert (TLS-ALPN)
+	WSPath         string `toml:"ws_path"`     // default "/ws"
+	Host           string `toml:"host"`        // public hostname, used for self-signed CN
 }
 
 type ClientConf struct {
 	ServerAddr  string   `toml:"server_addr"` // host[:port]
 	Token       string   `toml:"token"`
-	Fingerprint string   `toml:"fingerprint"` // SHA-256 hex pin of server cert
+	Fingerprint string   `toml:"fingerprint"` // SHA-256 hex pin of server cert (wstls only)
 	Insecure    bool     `toml:"insecure"`    // dev only
 	WSPath      string   `toml:"ws_path"`
-	Profile     string   `toml:"profile"`     // auto | fast | balanced | stealth
-	Mux         *bool    `toml:"mux"`         // default true: multiplexed sessions
-	UDP         *bool    `toml:"udp"`         // default true: SOCKS5 UDP ASSOCIATE
-	SOCKSAddr   string   `toml:"socks_addr"`  // default 127.0.0.1:1080
-	HTTPAddr    string   `toml:"http_addr"`   // default 127.0.0.1:8118
-	BypassList  []string `toml:"bypass_list"` // extra ProxyOverride entries
+	Transport   string   `toml:"transport"`    // wstls (default) | ssh
+	SSHUser     string   `toml:"ssh_user"`     // for transport="ssh"
+	SSHKey      string   `toml:"ssh_key"`      // path to private key
+	SSHInternal string   `toml:"ssh_internal"` // loopback ws target on VPS, e.g. 127.0.0.1:8081
+	Profile     string   `toml:"profile"`      // auto | fast | balanced | stealth
+	FallbackSSH *bool    `toml:"fallback_ssh"` // add ssh last-resort tier to the ladder
+	Mux         *bool    `toml:"mux"`          // default true: multiplexed sessions
+	UDP         *bool    `toml:"udp"`          // default true: SOCKS5 UDP ASSOCIATE
+	SOCKSAddr   string   `toml:"socks_addr"`   // default 127.0.0.1:1080
+	HTTPAddr    string   `toml:"http_addr"`    // default 127.0.0.1:8118
+	BypassList  []string `toml:"bypass_list"`  // extra ProxyOverride entries
+}
+
+// FallbackSSHEnabled reports whether the ssh last-resort tier should be
+// added to the adaptive ladder (opt-in).
+func (c *ClientConf) FallbackSSHEnabled() bool { return c.FallbackSSH != nil && *c.FallbackSSH }
+
+// TransportKind returns "wstls" unless explicitly set to "ssh".
+func (c *ClientConf) TransportKind() string {
+	if c.Transport == "ssh" {
+		return "ssh"
+	}
+	return "wstls"
 }
 
 // MuxEnabled reports the effective multiplexing setting (default true).
@@ -103,6 +123,12 @@ profile = "auto"
 # Multiplexing (recommended): one tunnel session, many connections.
 mux = true
 udp = true              # SOCKS5 UDP ASSOCIATE over the tunnel
+# Last-resort tier: if all TLS tiers get intercepted, tunnel inside real SSH.
+# Requires ssh_user + ssh_key (+ server running listen_internal).
+fallback_ssh = false
+ssh_user = "ubuntu"
+ssh_key = 'C:\path\to\ssh-key'
+ssh_internal = "127.0.0.1:8081"
 socks_addr = "127.0.0.1:1080"
 http_addr = "127.0.0.1:8118"
 bypass_list = ["*.internal.example.com"]
