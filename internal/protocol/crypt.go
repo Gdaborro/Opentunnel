@@ -29,8 +29,11 @@ const (
 	SaltSize = 16
 	KeySize  = 32
 
-	maxPlaintext  = 16384 + 2 + 512 // payload + length prefix + worst padding
-	maxCiphertext = maxPlaintext + 16 + 4
+	// maxPayloadChunk caps one AEAD frame's payload. 32 KiB halves per-byte
+	// framing overhead versus 16 KiB while keeping latency bounded.
+	maxPayloadChunk = 32768
+	maxPlaintext    = maxPayloadChunk + 2 + 512 // payload + length prefix + worst padding
+	maxCiphertext   = maxPlaintext + 16 + 4
 
 	dirClientToServer byte = 0
 	dirServerToClient byte = 1
@@ -161,7 +164,7 @@ func (s *SecureStream) padLen(payload int) int {
 		return 0
 	}
 	total := payload + 2
-	for _, b := range [...]int{64, 256, 1024, 4096, 16384} {
+	for _, b := range [...]int{64, 256, 1024, 4096, 16384, 32768} {
 		if total <= b {
 			jitter := b / 8
 			pad := mathrand.Intn(jitter + 1)
@@ -183,8 +186,8 @@ func (s *SecureStream) Write(p []byte) (int, error) {
 	written := 0
 	for written < len(p) {
 		chunk := p[written:]
-		if len(chunk) > 16384 {
-			chunk = chunk[:16384]
+		if len(chunk) > maxPayloadChunk {
+			chunk = chunk[:maxPayloadChunk]
 		}
 		if s.params.MaxJitter > 0 {
 			time.Sleep(time.Duration(mathrand.Int63n(int64(s.params.MaxJitter) + 1)))

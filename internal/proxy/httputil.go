@@ -99,14 +99,17 @@ func httpRespondError(conn net.Conn, code int, msg string) {
 }
 
 // Pipe copies both directions until either side closes or ctx is cancelled.
+// 256 KiB buffers reduce syscall pressure on high-BDP paths.
 func Pipe(ctx context.Context, a, b net.Conn) {
+	bufA := make([]byte, 256*1024)
+	bufB := make([]byte, 256*1024)
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(a, b)
+		_, _ = io.CopyBuffer(a, b, bufA)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(b, a)
+		_, _ = io.CopyBuffer(b, a, bufB)
 		done <- struct{}{}
 	}()
 	select {

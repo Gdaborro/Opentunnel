@@ -186,9 +186,13 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options) {
 	_ = rw.SetDeadline(time.Time{})
 	_ = upstream.(*net.TCPConn).SetNoDelay(true)
 
+	// 256 KiB copy buffers keep syscalls (and per-frame overhead) low on
+	// high-BDP paths; both directions must finish before teardown.
+	buf1 := make([]byte, 256*1024)
+	buf2 := make([]byte, 256*1024)
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, rw); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(rw, upstream); done <- struct{}{} }()
+	go func() { _, _ = io.CopyBuffer(upstream, rw, buf1); done <- struct{}{} }()
+	go func() { _, _ = io.CopyBuffer(rw, upstream, buf2); done <- struct{}{} }()
 	<-done
 	<-done
 }

@@ -11,14 +11,16 @@ import (
 )
 
 // MuxConfig returns the smux parameters used on both ends of a tunnel so
-// buffer sizes and keepalives always match.
+// buffer sizes and keepalives always match. Windows are sized for high-BDP
+// paths: throughput <= buffer / RTT, so 8 MB stream buffers sustain
+// hundreds of Mbps even at ~150 ms RTT.
 func MuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.KeepAliveInterval = 20 * time.Second
 	cfg.KeepAliveTimeout = 40 * time.Second
-	cfg.MaxFrameSize = 16384
-	cfg.MaxReceiveBuffer = 4 * 1024 * 1024
-	cfg.MaxStreamBuffer = 2 * 1024 * 1024
+	cfg.MaxFrameSize = 32768
+	cfg.MaxReceiveBuffer = 16 * 1024 * 1024
+	cfg.MaxStreamBuffer = 8 * 1024 * 1024
 	return cfg
 }
 
