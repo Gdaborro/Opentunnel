@@ -70,6 +70,9 @@ func addrHost(v any) string {
 // The returned release function must be called when the tunnel finishes;
 // release==nil means denied (serve the decoy page instead).
 func (g *Guard) Acquire(ip string) (release func()) {
+	if isLoopbackIP(ip) {
+		return func() {}
+	}
 	g.mu.Lock()
 	if until, banned := g.bans[ip]; banned {
 		if time.Now().Before(until) {
@@ -109,6 +112,9 @@ func (g *Guard) releaseSlot(ip string) {
 
 // Punish records a failed handshake and escalates the peer's ban.
 func (g *Guard) Punish(ip string) {
+	if isLoopbackIP(ip) {
+		return
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	now := time.Now()
@@ -145,6 +151,11 @@ func (g *Guard) Punish(ip string) {
 		}
 		g.lastCleanupNs = now.UnixNano()
 	}
+}
+
+func isLoopbackIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.IsLoopback()
 }
 
 func minInt(a, b int) int {
