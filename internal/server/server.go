@@ -210,15 +210,16 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token string) {
 		return
 	}
 
-	// Site blocklist enforcement (footer-block page for HTTP-style clients).
+	// Site blocklist enforcement - ISP level domain blocking
 	if opt.PanelDB != nil && target.Domain != "" && opt.PanelDB.IsBlocked(target.Domain) {
+		opt.logger().Printf("blocked %s for %s", target.Domain, token)
 		_ = protocol.WriteTargetResponse(rw, protocol.StatusOK)
-		buf := make([]byte, 256*1024)
-		done := make(chan struct{}, 2)
-		go func() { _, _ = io.CopyBuffer(io.Discard, rw, buf); done <- struct{}{} }()
-		go func() { _, _ = io.CopyBuffer(io.Discard, rw, buf); done <- struct{}{} }()
-		<-done
-		<-done
+		// Send ISP block page (visible for HTTP, forwarded as data for SOCKS)
+		page := []byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><head><title>Blocked</title></head><body style=\"font-family:system-ui;padding:2rem;text-align:center\"><h1>🚫 Blocked by ISP</h1><p>Domain <b>" + target.Domain + "</b> is blocked by policy.</p><p style=\"color:#666;font-size:0.9em\">Contact administrator to unblock.</p></body></html>")
+		_, _ = rw.Write(page)
+		// Drain any remaining client data then close
+		_ = rw.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = io.CopyN(io.Discard, rw, 1<<20)
 		return
 	}
 

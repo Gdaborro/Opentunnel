@@ -2,6 +2,7 @@ package panel
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -144,7 +145,27 @@ func (db *DB) WeeklyReport() []map[string]any {
 }
 
 func (db *DB) IsBlocked(domain string) bool {
-	var c int
-	db.QueryRow(`SELECT COUNT(*) FROM blocklist WHERE domain=?`, domain).Scan(&c)
-	return c > 0
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return false
+	}
+	rows, err := db.Query(`SELECT domain FROM blocklist`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			continue
+		}
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" {
+			continue
+		}
+		if domain == d || strings.HasSuffix(domain, "."+d) {
+			return true
+		}
+	}
+	return false
 }
