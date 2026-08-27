@@ -32,12 +32,17 @@ func isWebSocketUpgrade(r *http.Request) bool {
 }
 
 type Options struct {
-	Token       string                // shared secret
+	Token       string                // shared secret (fallback, also inner AEAD key)
 	WSPath      string                // websocket endpoint path (default /ws)
 	Logger      *log.Logger           // nil = std log
 	DecoyHTML   []byte                // served to non-tunnel requests
 	ReplayCache *protocol.ReplayCache // nil = default (10 min TTL, 100k salts)
 	Guard       *Guard                // nil = DefaultGuard()
+	PanelDB     interface {           // optional panel DB for per-token checks
+		CheckToken(token string) (status, reason, kickExpires string, err error)
+		RecordTraffic(token string, up, down int64)
+		IsBlocked(domain string) bool
+	}
 }
 
 func (o *Options) guard() *Guard {
@@ -144,6 +149,83 @@ func handleSession(stream net.Conn, opt Options) {
 		return
 	}
 
+	// Per-client token (v4): client sends its device token first if it has one.
+	// We peek to stay backwards-compatible with older clients that send the
+	// mode byte directly (no per-device token).
+	if opt.PanelDB != nil {
+		opt.logger().Printf("server: checking per-device token")
+		// Peek 1 byte to distinguish token length prefix (0x00) vs mode/ATYP
+		peek := make([]byte, 1)
+		if _, err := io.ReadFull(sec, peek); err != nil {
+			opt.logger().Printf("server: peek failed: %v", err)
+			return
+		}
+		opt.logger().Printf("server: peek byte=%d", peek[0])
+		if peek[0] == 0x00 {
+			// Likely a token (length prefix 0x00 0x??) — put back and read token
+			// We need to unread the byte; wrap sec in a buffered reader for this session.
+			// For now, handle by reading the second length byte and then the token.
+			second := make([]byte, 1)
+			if _, err := io.ReadFull(sec, second); err != nil {
+				return
+			}
+			length := int(peek[0])<<8 | int(second[0])
+			if length > 0 && length <= 1024 {
+				tokenBytes := make([]byte, length)
+				if _, err := io.ReadFull(sec, tokenBytes); err != nil {
+					opt.logger().Printf("server: bad client token body: %v", err)
+					return
+				}
+				clientToken := string(tokenBytes)
+				status, reason, kickExpires, _ := opt.PanelDB.CheckToken(clientToken)
+				switch status {
+				case "banned":
+					_ = protocol.WriteToken(sec, "banned:"+reason)
+					return
+				case "kicked":
+					_ = protocol.WriteToken(sec, "kicked:"+reason+":"+kickExpires)
+				case "pending", "expired":
+					_ = protocol.WriteToken(sec, status)
+					return
+				case "approved", "":
+					_ = protocol.WriteToken(sec, "ok")
+				default:
+					_ = protocol.WriteToken(sec, status)
+				}
+				go opt.PanelDB.RecordTraffic(clientToken, 0, 0)
+			} else {
+				// Not a valid token length, treat peek as mode byte (legacy)
+				_ = protocol.WriteToken(sec, "ok")
+				// Put back the two bytes we consumed? They were not a token, so the first byte is actually the mode.
+				// We already consumed 0x00 and second byte, which is not correct. For legacy, the first byte should be mode, not 0x00.
+				// This path is unlikely (mode 0x00 is invalid), so just return.
+				return
+			}
+		} else {
+			// Legacy client: first byte is mode/ATYP, no per-device token.
+			// Create a synthetic peer entry for dashboard visibility.
+			legacyIP := addrHost(stream.RemoteAddr())
+			if db, ok := opt.PanelDB.(interface{ Exec(string, ...interface{}) (interface{}, error) }); ok {
+				_, _ = db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,status,created_at,last_seen) VALUES(?,?,?, 'approved', datetime('now'), datetime('now'))`,
+					"legacy-"+legacyIP, legacyIP, "legacy-"+legacyIP)
+				_, _ = db.Exec(`UPDATE peers SET last_seen=datetime('now'), bytes_up=bytes_up+1 WHERE token=?`, "legacy-"+legacyIP)
+			}
+			_ = protocol.WriteToken(sec, "ok")
+			mode := peek
+			switch mode[0] {
+			case protocol.MuxMarker:
+				opt.serveMuxSession(sec)
+			case protocol.UdpMarker:
+				serveUDPStream(sec, opt.logger())
+			default:
+				relayTarget(mode[0], sec, opt)
+			}
+			return
+		}
+	} else {
+		_ = protocol.WriteToken(sec, "ok")
+	}
+
 	// One mode byte decides the session shape (protocol v3).
 	mode := make([]byte, 1)
 	if _, err := io.ReadFull(sec, mode); err != nil {
@@ -164,6 +246,7 @@ func handleSession(stream net.Conn, opt Options) {
 // sessions and by every multiplexed stream.
 func relayTarget(atyp byte, rw deadlineRW, opt Options) {
 	defer rw.Close()
+	opt.logger().Printf("server: relayTarget atyp=%d", atyp)
 
 	target, err := protocol.ReadAddressWithATYP(atyp, rw)
 	if err != nil {

@@ -26,13 +26,16 @@ const (
 	//   MuxMarker  -> this connection carries smux streams
 	//   UdpMarker  -> this stream relays UDP datagrams
 	//   otherwise  -> the byte IS an ATYP: legacy single-target request
-	ProtoVersion = 3
+	ProtoVersion = 4
 
 	StatusOK          = 0
 	StatusBadToken    = 1
 	StatusBadVersion  = 2
 	StatusDialFailed  = 3
 	StatusRateLimited = 4
+	StatusPending     = 5
+	StatusBanned      = 6
+	StatusKicked      = 7
 
 	MuxMarker byte = 0x4D // 'M'
 	UdpMarker byte = 0x55 // 'U'

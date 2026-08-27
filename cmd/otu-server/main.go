@@ -12,12 +12,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
 
 	"opentunnel/internal/config"
+	"opentunnel/internal/panel"
 	"opentunnel/internal/server"
 	"opentunnel/internal/transport"
 )
@@ -66,21 +68,24 @@ func main() {
 	}
 
 	var tlsCfg *tls.Config
+	var acmeDomains []string
 	if cfg.AcmeDomain != "" {
 		stateDir := os.Getenv("TMPDIR")
 		if stateDir == "" {
 			stateDir = "."
 		}
+			// Support comma-separated domains for zero-downtime migration.
+		acmeDomains = splitAndTrim(cfg.AcmeDomain)
 		mgr := &autocert.Manager{
 			Cache:      autocert.DirCache(filepath.Join(stateDir, "acme")),
 			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(cfg.AcmeDomain),
+			HostPolicy: autocert.HostWhitelist(acmeDomains...),
 		}
 		tlsCfg = mgr.TLSConfig()
 		tlsCfg.MinVersion = tls.VersionTLS12
 		fingerprint = "(managed by Let's Encrypt — fetch with: openssl s_client -connect 127.0.0.1:443 -servername " +
-			cfg.AcmeDomain + " </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout)"
-		fmt.Printf("ACME enabled for %s\n", cfg.AcmeDomain)
+			acmeDomains[0] + " </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout)"
+		fmt.Printf("ACME enabled for %v\n", acmeDomains)
 	} else {
 		tlsCfg = &tls.Config{
 			MinVersion:   tls.VersionTLS12,
@@ -91,12 +96,68 @@ func main() {
 	fmt.Printf("  certificate fingerprint (pin this in the client):\n    %s\n", fingerprint)
 	fmt.Println("========================================================")
 
+	// Panel DB (same machine, shadcn UI at /admin)
+	stateDirForPanel := os.Getenv("TMPDIR")
+	if stateDirForPanel == "" {
+		stateDirForPanel = "/var/lib/opentunnel"
+	}
+	panelDB, err := panel.Open(filepath.Join(stateDirForPanel, "panel.db"))
+	if err != nil {
+		log.Printf("panel db: %v (panel disabled)", err)
+		panelDB = nil
+	}
+	var panelHandler http.Handler
+	if panelDB != nil {
+		auth := panel.NewAuth(panelDB)
+		// One-time setup: if ADMIN_USER/PASSWORD env is set, pre-seed it
+		// (useful for headless deploys). Otherwise first visitor to
+		// /admin/setup creates the admin — after that only that login works.
+		if envUser := os.Getenv("ADMIN_USER"); envUser != "" {
+			if envPass := os.Getenv("ADMIN_PASSWORD"); envPass != "" {
+				_ = auth.EnsureAdmin(envUser, envPass)
+			}
+		}
+		if auth.NeedsSetup() {
+			log.Printf("panel: no admin — visit https://%s/admin/setup to create one (one-time)", func() string {
+				h := cfg.Host
+				if len(acmeDomains) > 0 {
+					h = acmeDomains[0]
+				}
+				if h == "" {
+					h = "localhost" + cfg.Listen
+				}
+				return h
+			}())
+		}
+		panelHandler = panel.New(panelDB, auth).Handler()
+		panelHost := cfg.Host
+		if len(acmeDomains) > 0 {
+			panelHost = acmeDomains[0]
+		}
+		if panelHost == "" {
+			panelHost = "localhost" + cfg.Listen
+		}
+		log.Printf("panel enabled at https://%s/admin", panelHost)
+	}
+
+	baseHandler := server.Handler(server.Options{
+		Token:   cfg.Token,
+		WSPath:  cfg.WSPath,
+		PanelDB: panelDB, // nil-safe: legacy mode when panel disabled
+	})
+	var handler http.Handler = baseHandler
+	if panelHandler != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/admin/", panelHandler)
+		mux.Handle("/admin", panelHandler)
+		mux.Handle("/api/token/", panelHandler)
+		mux.Handle("/", baseHandler)
+		handler = mux
+	}
+
 	srv := &http.Server{
-		Addr: cfg.Listen,
-		Handler: server.Handler(server.Options{
-			Token:  cfg.Token,
-			WSPath: cfg.WSPath,
-		}),
+		Addr:              cfg.Listen,
+		Handler:           handler,
 		ReadHeaderTimeout: 15 * time.Second,
 		TLSConfig:         tlsCfg,
 	}
@@ -148,4 +209,15 @@ func main() {
 			log.Fatalf("listen: %v", err)
 		}
 	}
+}
+
+func splitAndTrim(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }

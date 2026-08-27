@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel — opentunnel</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>:root{--border:240 5.9% 90%}</style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+<header class="border-b bg-white">
+<div class="max-w-6xl mx-auto px-4 py-3 flex justify-between items-center">
+<h1 class="font-semibold">opentunnel — {{.User}}</h1>
+<a href="/admin/logout" class="text-sm border rounded-md px-3 py-1">Logout</a>
+</div>
+</header>
+<main class="max-w-6xl mx-auto p-4 space-y-6">
+<div class="grid grid-cols-3 gap-4">
+<div class="border bg-white rounded-lg p-4"><div class="text-sm text-gray-500">Active</div><div id="s-active" class="text-2xl font-bold">-</div></div>
+<div class="border bg-white rounded-lg p-4"><div class="text-sm text-gray-500">Pending</div><div id="s-pending" class="text-2xl font-bold">-</div></div>
+<div class="border bg-white rounded-lg p-4"><div class="text-sm text-gray-500">Banned</div><div id="s-banned" class="text-2xl font-bold">-</div></div>
+</div>
+
+<div class="border bg-white rounded-lg">
+<div class="p-4 border-b flex justify-between"><h2 class="font-medium">Clients</h2><button onclick="load()" class="text-sm border rounded px-2 py-1">Refresh</button></div>
+<div class="overflow-auto">
+<table class="w-full text-sm">
+<thead class="bg-gray-50"><tr><th class="p-2 text-left">Token</th><th class="p-2">Device</th><th class="p-2">Status</th><th class="p-2">Last seen</th><th class="p-2">Traffic</th><th class="p-2">Action</th></tr></thead>
+<tbody id="peers"></tbody>
+</table>
+</div>
+</div>
+
+<div class="border bg-white rounded-lg p-4">
+<h2 class="font-medium mb-2">Blocklist</h2>
+<div class="flex gap-2 mb-3"><input id="bdom" placeholder="domain.com" class="border rounded px-2 py-1 text-sm flex-1"><input id="breason" placeholder="reason" class="border rounded px-2 py-1 text-sm flex-1"><button onclick="addBlock()" class="bg-black text-white rounded px-3 py-1 text-sm">Add</button></div>
+<div id="blocklist" class="text-sm text-gray-600"></div>
+</div>
+</main>
+<div id="empty" class="hidden p-8 text-center text-gray-500">
+<p class="font-medium">No clients yet</p>
+<p class="text-sm mt-1">Connect a device with the tunnel — it will appear here for approval. Make sure <code>cdn.aborro.dev</code> is in your client's <code>bypass_list</code> and Firefox's "No proxy for" so the panel itself isn't tunneled.</p>
+</div>
+<script>
+async function load(){
+ try{
+  const [peers,stats,blocks]=await Promise.all([
+   fetch('/admin/api/peers').then(r=>{if(!r.ok) throw new Error(r.status); return r.json()}),
+   fetch('/admin/api/stats').then(r=>r.json()),
+   fetch('/admin/api/blocklist').then(r=>r.json())
+  ])
+  document.getElementById('s-active').textContent=stats.active ?? 0
+  document.getElementById('s-pending').textContent=stats.pending ?? 0
+  document.getElementById('s-banned').textContent=stats.banned ?? 0
+  const tb=document.getElementById('peers'); tb.innerHTML='';
+  const empty=document.getElementById('empty');
+  if(!peers || peers.length===0){ empty.classList.remove('hidden'); tb.innerHTML='<tr><td colspan="6" class="p-4 text-center text-gray-400">No peers — connect a client to see it here</td></tr>'; }
+  else { empty.classList.add('hidden');
+   peers.forEach(p=>{
+    const tr=document.createElement('tr'); tr.className='border-t';
+    tr.innerHTML=`<td class="p-2 font-mono text-xs">${(p.Token||'').slice(0,8)}...</td><td class="p-2">${p.DeviceName||p.Fingerprint?.slice(0,8)||''}</td><td class="p-2"><span class="px-2 py-0.5 rounded text-xs ${p.Status==='approved'?'bg-green-100':p.Status==='pending'?'bg-yellow-100':p.Status==='banned'?'bg-red-100':'bg-gray-100'}">${p.Status}</span></td><td class="p-2">${p.LastSeen||''}</td><td class="p-2">${(((p.BytesUp||0)+(p.BytesDown||0))/1024/1024).toFixed(1)} MB</td><td class="p-2 space-x-1">${p.Status==='pending'?`<button onclick="act('${p.Token}','approve')" class="border rounded px-2 py-0.5">Approve</button>`:''}${p.Status!=='banned'?`<button onclick="kick('${p.Token}')" class="border rounded px-2 py-0.5">Kick</button><button onclick="ban('${p.Token}')" class="border rounded px-2 py-0.5 bg-red-50">Ban</button>`:`<button onclick="act('${p.Token}','unban')" class="border rounded px-2 py-0.5">Unban</button>`}</td>`;
+    tb.appendChild(tr)
+   })
+  }
+  document.getElementById('blocklist').innerHTML=blocks.map(b=>`<div class="flex justify-between py-1"><span>${b.domain} — ${b.reason}</span><button onclick="delBlock('${b.domain}')" class="text-red-600">remove</button></div>`).join('')||'No blocked domains';
+ }catch(e){ console.error(e); document.getElementById('peers').innerHTML='<tr><td colspan="6" class="p-4 text-center text-red-600">Failed to load — check server log. Maybe not logged in?</td></tr>'; }
+}
+async function act(t,a){ await fetch(`/admin/api/peers/${t}/${a}`,{method:'POST'}); load() }
+async function kick(t){ const r=prompt('Kick reason:'); if(r!==null) { await fetch(`/admin/api/peers/${t}/kick`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:r})}); load() } }
+async function ban(t){ const r=prompt('Ban reason:'); if(r!==null) { await fetch(`/admin/api/peers/${t}/ban`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:r,duration:'permanent'})}); load() } }
+async function addBlock(){ await fetch('/admin/api/blocklist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:bdom.value,reason:breason.value})}); bdom.value=''; breason.value=''; load() }
+async function delBlock(d){ await fetch('/admin/api/blocklist',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d})}); load() }
+load(); setInterval(load,5000)
+</script>
+</body>
+</html>

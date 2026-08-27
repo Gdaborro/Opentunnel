@@ -36,6 +36,18 @@ func New(t transport.Transport, token string) *Client {
 
 func NewWithOptions(t transport.Transport, o Options) *Client { return &Client{Transport: t, opts: o} }
 
+func (c *Client) perDeviceToken() string {
+	store, err := NewTokenStore()
+	if err != nil {
+		return ""
+	}
+	df, err := store.LoadOrCreate()
+	if err != nil {
+		return ""
+	}
+	return df.Token
+}
+
 // muxSessionFactory performs the full authenticated handshake and switches
 // the resulting secure stream into mux mode; the returned conn is handed to
 // smux.Client.
@@ -67,6 +79,23 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: secure stream: %w", err)
+	}
+	// Per-device token for panel approval (v4) — if we have one, send it
+	if perToken := c.perDeviceToken(); perToken != "" {
+		if err := protocol.WriteToken(sec, perToken); err != nil {
+			sec.Close()
+			return nil, fmt.Errorf("client: token write: %w", err)
+		}
+		if resp, err := protocol.ReadToken(sec); err != nil {
+			sec.Close()
+			return nil, fmt.Errorf("client: token response: %w", err)
+		} else if resp != "ok" {
+			sec.Close()
+			return nil, fmt.Errorf("client: token %s", resp)
+		}
+	} else {
+		// Legacy: no per-device token yet, skip panel check and proceed
+		// Server will handle this as legacy (no token) and create a peer for IP
 	}
 	if _, err := sec.Write([]byte{protocol.MuxMarker}); err != nil {
 		sec.Close()

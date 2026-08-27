@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login — opentunnel panel</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+:root{--background:0 0% 100%;--foreground:240 10% 3.9%;--card:0 0% 100%;--primary:240 5.9% 10%;--primary-foreground:0 0% 98%;--muted:240 4.8% 95.9%;--border:240 5.9% 90%;}
+*{border-color:hsl(var(--border))}
+</style>
+</head>
+<body class="min-h-screen bg-white flex items-center justify-center p-4">
+<div class="w-full max-w-sm border rounded-lg shadow-sm p-6 bg-white">
+<h1 class="text-xl font-semibold mb-1">opentunnel</h1>
+<p class="text-sm text-gray-500 mb-6">Sign in to manage your network</p>
+<form id="f" class="space-y-4">
+<input id="u" placeholder="Username" class="w-full border rounded-md px-3 py-2 text-sm">
+<input id="p" type="password" placeholder="Password" class="w-full border rounded-md px-3 py-2 text-sm">
+<button class="w-full bg-black text-white rounded-md py-2 text-sm">Sign in</button>
+<p id="e" class="text-sm text-red-600 hidden"></p>
+</form>
+</div>
+<script>
+document.getElementById('f').onsubmit=async e=>{
+ e.preventDefault();
+ const r=await fetch('/admin/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.value,password:p.value})});
+ if(r.ok) location.href='/admin/'; else {e.style.display='block'; document.getElementById('e').textContent='Invalid credentials'; document.getElementById('e').classList.remove('hidden')}
+}
+</script>
+</body>
+</html>

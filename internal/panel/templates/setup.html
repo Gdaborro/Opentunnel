@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup — opentunnel panel</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+:root{--background:0 0% 100%;--foreground:240 10% 3.9%;--card:0 0% 100%;--primary:240 5.9% 10%;--primary-foreground:0 0% 98%;--muted:240 4.8% 95.9%;--border:240 5.9% 90%;}
+*{border-color:hsl(var(--border))}
+</style>
+</head>
+<body class="min-h-screen bg-white flex items-center justify-center p-4">
+<div class="w-full max-w-sm border rounded-lg shadow-sm p-6 bg-white">
+<h1 class="text-xl font-semibold mb-1">Welcome to opentunnel</h1>
+<p class="text-sm text-gray-500 mb-6">Create your admin account — this only appears once.</p>
+<form id="f" class="space-y-4">
+<input id="u" placeholder="Username (min 3)" class="w-full border rounded-md px-3 py-2 text-sm">
+<input id="p" type="password" placeholder="Password (min 8)" class="w-full border rounded-md px-3 py-2 text-sm">
+<input id="c" type="password" placeholder="Confirm password" class="w-full border rounded-md px-3 py-2 text-sm">
+<button class="w-full bg-black text-white rounded-md py-2 text-sm">Create admin & continue</button>
+<p id="e" class="text-sm text-red-600 hidden"></p>
+</form>
+<p class="text-xs text-gray-400 mt-4">After this, only this login works. Keep it safe.</p>
+</div>
+<script>
+document.getElementById('f').onsubmit=async e=>{
+ e.preventDefault();
+ const u=document.getElementById('u').value.trim();
+ const p=document.getElementById('p').value;
+ const c=document.getElementById('c').value;
+ const err=document.getElementById('e');
+ err.classList.add('hidden');
+ if(p!==c){ err.textContent='Passwords do not match'; err.classList.remove('hidden'); return; }
+ const r=await fetch('/admin/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+ if(r.ok) location.href='/admin/'; else { const t=await r.text(); err.textContent=t||'Setup failed'; err.classList.remove('hidden'); }
+}
+</script>
+</body>
+</html>

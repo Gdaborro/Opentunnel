@@ -74,6 +74,29 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	// Per-device token (10-day inactivity expiry, hard ban persistence)
+	// This token is *separate* from cfg.Token (the static outer secret).
+	// cfg.Token stays as the outer AEAD key; device.Token is the panel identity.
+	tokenStore, err := client.NewTokenStore()
+	if err != nil {
+		log.Fatalf("token store: %v", err)
+	}
+	if tokenStore.IsHardBanned() {
+		fmt.Println("This device is banned. Please contact the administrator.")
+		if data, err := os.ReadFile(tokenStore.BanPath()); err == nil {
+			fmt.Printf("Ban info: %s\n", string(data))
+		}
+		os.Exit(1)
+	}
+	device, err := tokenStore.LoadOrCreate()
+	if err != nil {
+		log.Fatalf("device token: %v", err)
+	}
+	// Register with panel (fire-and-forget; panel will create pending peer)
+	go client.RegisterWithPanel(cfg, device)
+	// Background heartbeat and status poll (kick/ban/pending)
+	go client.PollTokenStatus(cfg, device)
+
 	if *shareLink {
 		link, lerr := share.Build(share.Params{
 			ServerAddr:  cfg.ServerAddr,

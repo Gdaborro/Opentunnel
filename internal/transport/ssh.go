@@ -8,6 +8,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -101,6 +102,14 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 		Subprotocols: []string{"otu1"},
 	})
 	if err != nil {
+		if resp != nil {
+			// Surface body for diagnosis (decoy vs protocol error).
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			_ = resp.Body.Close()
+			ch.Close()
+			client.Close()
+			return nil, fmt.Errorf("transport: websocket over ssh: %w (status=%d body=%q)", err, resp.StatusCode, string(body))
+		}
 		ch.Close()
 		client.Close()
 		return nil, fmt.Errorf("transport: websocket over ssh: %w", err)
