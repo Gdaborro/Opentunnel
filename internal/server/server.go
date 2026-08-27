@@ -38,10 +38,11 @@ type Options struct {
 	DecoyHTML   []byte                // served to non-tunnel requests
 	ReplayCache *protocol.ReplayCache // nil = default (10 min TTL, 100k salts)
 	Guard       *Guard                // nil = DefaultGuard()
-	PanelDB     interface {           // optional panel DB for per-token checks
+	PanelDB     interface { // optional panel DB for per-token checks
 		CheckToken(token string) (status, reason, kickExpires string, err error)
 		RecordTraffic(token string, up, down int64)
 		IsBlocked(domain string) bool
+		CreateLegacyPeer(ip string)
 	}
 }
 
@@ -149,80 +150,36 @@ func handleSession(stream net.Conn, opt Options) {
 		return
 	}
 
-	// Per-client token (v4): client sends its device token first if it has one.
-	// We peek to stay backwards-compatible with older clients that send the
-	// mode byte directly (no per-device token).
+	// Per-client token (v4): always length-prefixed; "" = legacy client.
+	clientToken, err := protocol.ReadToken(sec)
+	if err != nil {
+		opt.logger().Printf("server: bad client token: %v", err)
+		return
+	}
 	if opt.PanelDB != nil {
-		opt.logger().Printf("server: checking per-device token")
-		// Peek 1 byte to distinguish token length prefix (0x00) vs mode/ATYP
-		peek := make([]byte, 1)
-		if _, err := io.ReadFull(sec, peek); err != nil {
-			opt.logger().Printf("server: peek failed: %v", err)
-			return
-		}
-		opt.logger().Printf("server: peek byte=%d", peek[0])
-		if peek[0] == 0x00 {
-			// Likely a token (length prefix 0x00 0x??) — put back and read token
-			// We need to unread the byte; wrap sec in a buffered reader for this session.
-			// For now, handle by reading the second length byte and then the token.
-			second := make([]byte, 1)
-			if _, err := io.ReadFull(sec, second); err != nil {
-				return
-			}
-			length := int(peek[0])<<8 | int(second[0])
-			if length > 0 && length <= 1024 {
-				tokenBytes := make([]byte, length)
-				if _, err := io.ReadFull(sec, tokenBytes); err != nil {
-					opt.logger().Printf("server: bad client token body: %v", err)
-					return
-				}
-				clientToken := string(tokenBytes)
-				status, reason, kickExpires, _ := opt.PanelDB.CheckToken(clientToken)
-				switch status {
-				case "banned":
-					_ = protocol.WriteToken(sec, "banned:"+reason)
-					return
-				case "kicked":
-					_ = protocol.WriteToken(sec, "kicked:"+reason+":"+kickExpires)
-				case "pending", "expired":
-					_ = protocol.WriteToken(sec, status)
-					return
-				case "approved", "":
-					_ = protocol.WriteToken(sec, "ok")
-				default:
-					_ = protocol.WriteToken(sec, status)
-				}
-				go opt.PanelDB.RecordTraffic(clientToken, 0, 0)
-			} else {
-				// Not a valid token length, treat peek as mode byte (legacy)
-				_ = protocol.WriteToken(sec, "ok")
-				// Put back the two bytes we consumed? They were not a token, so the first byte is actually the mode.
-				// We already consumed 0x00 and second byte, which is not correct. For legacy, the first byte should be mode, not 0x00.
-				// This path is unlikely (mode 0x00 is invalid), so just return.
-				return
-			}
-		} else {
-			// Legacy client: first byte is mode/ATYP, no per-device token.
-			// Create a synthetic peer entry for dashboard visibility.
-			legacyIP := addrHost(stream.RemoteAddr())
-			if db, ok := opt.PanelDB.(interface{ Exec(string, ...interface{}) (interface{}, error) }); ok {
-				_, _ = db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,status,created_at,last_seen) VALUES(?,?,?, 'approved', datetime('now'), datetime('now'))`,
-					"legacy-"+legacyIP, legacyIP, "legacy-"+legacyIP)
-				_, _ = db.Exec(`UPDATE peers SET last_seen=datetime('now'), bytes_up=bytes_up+1 WHERE token=?`, "legacy-"+legacyIP)
-			}
+		if clientToken == "" {
+			// Legacy/no-token clients: synthetic approved entry for visibility.
+			clientToken = "legacy-" + addrHost(stream.RemoteAddr())
+			opt.PanelDB.CreateLegacyPeer(clientToken)
 			_ = protocol.WriteToken(sec, "ok")
-			mode := peek
-			switch mode[0] {
-			case protocol.MuxMarker:
-				opt.serveMuxSession(sec)
-			case protocol.UdpMarker:
-				serveUDPStream(sec, opt.logger())
-			default:
-				relayTarget(mode[0], sec, opt)
+		} else {
+			status, reason, kickExpires, _ := opt.PanelDB.CheckToken(clientToken)
+			switch status {
+			case "banned":
+				_ = protocol.WriteToken(sec, "banned:"+reason)
+				return
+			case "pending", "expired":
+				_ = protocol.WriteToken(sec, status)
+				return
+			case "kicked":
+				_ = protocol.WriteToken(sec, "kicked:"+reason+":"+kickExpires)
+			default: // approved
+				_ = protocol.WriteToken(sec, "ok")
 			}
-			return
+			go opt.PanelDB.RecordTraffic(clientToken, 0, 0)
 		}
 	} else {
+		// No panel: legacy mode, just ack
 		_ = protocol.WriteToken(sec, "ok")
 	}
 
@@ -233,24 +190,35 @@ func handleSession(stream net.Conn, opt Options) {
 	}
 	switch mode[0] {
 	case protocol.MuxMarker:
-		opt.serveMuxSession(sec)
+		opt.serveMuxSession(sec, clientToken)
 	case protocol.UdpMarker:
 		serveUDPStream(sec, opt.logger())
 	default:
-		relayTarget(mode[0], sec, opt)
+		relayTarget(mode[0], sec, opt, clientToken)
 	}
 }
 
 // relayTarget performs the classic single-target exchange on rw and pipes it
 // to the dialed upstream until both directions finish. Used by legacy
-// sessions and by every multiplexed stream.
-func relayTarget(atyp byte, rw deadlineRW, opt Options) {
+// sessions and by every multiplexed stream. Traffic is recorded per-token.
+func relayTarget(atyp byte, rw deadlineRW, opt Options, token string) {
 	defer rw.Close()
-	opt.logger().Printf("server: relayTarget atyp=%d", atyp)
 
 	target, err := protocol.ReadAddressWithATYP(atyp, rw)
 	if err != nil {
 		opt.logger().Printf("server: bad target: %v", err)
+		return
+	}
+
+	// Site blocklist enforcement (footer-block page for HTTP-style clients).
+	if opt.PanelDB != nil && target.Domain != "" && opt.PanelDB.IsBlocked(target.Domain) {
+		_ = protocol.WriteTargetResponse(rw, protocol.StatusOK)
+		buf := make([]byte, 256*1024)
+		done := make(chan struct{}, 2)
+		go func() { _, _ = io.CopyBuffer(io.Discard, rw, buf); done <- struct{}{} }()
+		go func() { _, _ = io.CopyBuffer(io.Discard, rw, buf); done <- struct{}{} }()
+		<-done
+		<-done
 		return
 	}
 
@@ -266,23 +234,34 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options) {
 	if err := protocol.WriteTargetResponse(rw, protocol.StatusOK); err != nil {
 		return
 	}
-	_ = rw.SetDeadline(time.Time{})
+	_ = rw.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = upstream.SetDeadline(time.Now().Add(10 * time.Second))
 	_ = upstream.(*net.TCPConn).SetNoDelay(true)
 
 	// 256 KiB copy buffers keep syscalls (and per-frame overhead) low on
 	// high-BDP paths; both directions must finish before teardown.
 	buf1 := make([]byte, 256*1024)
 	buf2 := make([]byte, 256*1024)
+	var n1, n2 int64
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.CopyBuffer(upstream, rw, buf1); done <- struct{}{} }()
-	go func() { _, _ = io.CopyBuffer(rw, upstream, buf2); done <- struct{}{} }()
+	go func() {
+		n1, _ = io.CopyBuffer(upstream, rw, buf1)
+		done <- struct{}{}
+	}()
+	go func() {
+		n2, _ = io.CopyBuffer(rw, upstream, buf2)
+		done <- struct{}{}
+	}()
 	<-done
 	<-done
+	if opt.PanelDB != nil && token != "" {
+		opt.PanelDB.RecordTraffic(token, n1, n2)
+	}
 }
 
 // serveMuxSession upgrades an authenticated secure stream into a smux
 // session; every stream inside carries one relayTarget exchange.
-func (o Options) serveMuxSession(sec io.ReadWriteCloser) {
+func (o Options) serveMuxSession(sec io.ReadWriteCloser, token string) {
 	sess, err := smux.Server(sec, protocol.MuxConfig())
 	if err != nil {
 		o.logger().Printf("server: mux setup failed: %v", err)
@@ -304,7 +283,7 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser) {
 				serveUDPStream(s, o.logger())
 				return
 			}
-			relayTarget(atyp[0], s, o)
+			relayTarget(atyp[0], s, o, token)
 		}(stream)
 	}
 }

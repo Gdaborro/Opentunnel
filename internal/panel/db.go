@@ -107,6 +107,40 @@ func (db *DB) CheckToken(token string) (status, reason, kickExpires string, err 
 
 func (db *DB) RecordTraffic(token string, up, down int64) {
 	db.Exec(`UPDATE peers SET bytes_up=bytes_up+?, bytes_down=bytes_down+?, last_seen=datetime('now') WHERE token=?`, up, down, token)
+	if up != 0 || down != 0 {
+		db.TrackDaily(token, up, down)
+	}
+}
+
+// CreateLegacyPeer registers IP-derived clients so they show in the UI.
+func (db *DB) CreateLegacyPeer(token string) {
+	db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,status,created_at,last_seen,ssh_pubkey) VALUES(?,?,?,'approved',datetime('now'),datetime('now'),NULL)`,
+		token, token, token)
+	db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, token)
+}
+
+// TrackDaily upserts today's cumulative traffic per token.
+func (db *DB) TrackDaily(token string, up, down int64) {
+	db.Exec(`CREATE TABLE IF NOT EXISTS daily_usage(token TEXT, day TEXT, up INTEGER DEFAULT 0, down INTEGER DEFAULT 0, PRIMARY KEY(token, day))`)
+	db.Exec(`INSERT INTO daily_usage(token, day, up, down) VALUES(?, date('now'), ?, ?)
+	         ON CONFLICT(token, day) DO UPDATE SET up=up+excluded.up, down=down+excluded.down`, token, up, down)
+}
+
+// WeeklyReport: aggregated totals for the last 7 days across all tokens.
+func (db *DB) WeeklyReport() []map[string]any {
+	rows, err := db.Query(`SELECT day, SUM(up) as up, SUM(down) as down FROM daily_usage GROUP BY day ORDER BY day DESC LIMIT 7`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var day string
+		var up, down int64
+		rows.Scan(&day, &up, &down)
+		out = append(out, map[string]any{"day": day, "up": up, "down": down})
+	}
+	return out
 }
 
 func (db *DB) IsBlocked(domain string) bool {

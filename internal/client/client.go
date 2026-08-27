@@ -80,22 +80,18 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 		raw.Close()
 		return nil, fmt.Errorf("client: secure stream: %w", err)
 	}
-	// Per-device token for panel approval (v4) — if we have one, send it
-	if perToken := c.perDeviceToken(); perToken != "" {
-		if err := protocol.WriteToken(sec, perToken); err != nil {
-			sec.Close()
-			return nil, fmt.Errorf("client: token write: %w", err)
-		}
-		if resp, err := protocol.ReadToken(sec); err != nil {
-			sec.Close()
-			return nil, fmt.Errorf("client: token response: %w", err)
-		} else if resp != "ok" {
-			sec.Close()
-			return nil, fmt.Errorf("client: token %s", resp)
-		}
-	} else {
-		// Legacy: no per-device token yet, skip panel check and proceed
-		// Server will handle this as legacy (no token) and create a peer for IP
+	// Per-device token for panel approval (v4): always sent; "" signals legacy.
+	tok := c.perDeviceToken()
+	if err := protocol.WriteToken(sec, tok); err != nil {
+		sec.Close()
+		return nil, fmt.Errorf("client: token write: %w", err)
+	}
+	if resp, err := protocol.ReadToken(sec); err != nil {
+		sec.Close()
+		return nil, fmt.Errorf("client: token response: %w", err)
+	} else if resp != "ok" {
+		sec.Close()
+		return nil, fmt.Errorf("client: token %s", resp)
 	}
 	if _, err := sec.Write([]byte{protocol.MuxMarker}); err != nil {
 		sec.Close()
@@ -178,6 +174,18 @@ func (c *Client) legacyConnect(ctx context.Context) (*protocol.SecureStream, err
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: secure stream: %w", err)
+	}
+	// Per-device token (v4): always sent; server reads it unconditionally.
+	if err := protocol.WriteToken(sec, c.perDeviceToken()); err != nil {
+		sec.Close()
+		return nil, fmt.Errorf("client: token write: %w", err)
+	}
+	if resp, err := protocol.ReadToken(sec); err != nil {
+		sec.Close()
+		return nil, fmt.Errorf("client: token response: %w", err)
+	} else if resp != "ok" {
+		sec.Close()
+		return nil, fmt.Errorf("client: token %s", resp)
 	}
 	return sec, nil
 }

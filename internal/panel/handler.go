@@ -33,6 +33,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.Handle("/admin/api/peers/", h.auth.RequireAuth(http.HandlerFunc(h.apiPeerAction)))
 	mux.Handle("/admin/api/blocklist", h.auth.RequireAuth(http.HandlerFunc(h.apiBlocklist)))
 	mux.Handle("/admin/api/stats", h.auth.RequireAuth(http.HandlerFunc(h.apiStats)))
+	mux.Handle("/admin/api/report", h.auth.RequireAuth(http.HandlerFunc(h.apiReport)))
 	mux.Handle("/admin/", h.auth.RequireAuth(http.HandlerFunc(h.dashboard)))
 
 	// Public token API (no auth)
@@ -215,6 +216,10 @@ func (h *Handler) apiStats(w http.ResponseWriter, r *http.Request) {
 		"total_up": totalUp, "total_down": totalDown,
 		"active": active, "pending": pending, "banned": banned,
 	})
+}
+
+func (h *Handler) apiReport(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(h.db.WeeklyReport())
 }
 
 func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
