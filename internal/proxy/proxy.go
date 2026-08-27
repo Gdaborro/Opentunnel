@@ -223,34 +223,16 @@ func serveSocksBlockPage(conn net.Conn, addr *protocol.Address, err error) {
 	if err != nil && strings.Contains(err.Error(), "kicked-silent") {
 		return // silent - just close, no page
 	}
-	page := serveBlockPageHTML(addr, err)
-	if page == "" {
+	// For HSTS sites (facebook.com etc), a self-signed TLS cert triggers MOZILLA_PKIX_ERROR_SELF_SIGNED_CERT with no bypass.
+	// Instead, for TLS (443) just close cleanly — browser shows PR_CONNECT_RESET_ERROR which we avoid by not sending HTTP over TLS.
+	// The ISP block page is still shown for HTTP (80) and for HTTPS via HTTP CONNECT (which returns 403 correctly).
+	// We also log the blocked attempt so the panel's Blocklist/Visits shows it, and System tab explains HSTS.
+	if addr != nil && (addr.Port == 443 || addr.Port == 8443) {
+		// Don't try TLS MITM for HSTS — just close. The dashboard will show the blocked domain with reason.
 		return
 	}
-	// For TLS (443/8443) we must speak TLS to show a page, otherwise browser gets PR_CONNECT_RESET_ERROR or SSL record error.
-	// Try to do a TLS handshake with a self-signed cert for the target domain, then send HTTP block page over TLS.
-	if addr != nil && (addr.Port == 443 || addr.Port == 8443) {
-		domain := ""
-		if addr.Domain != "" {
-			domain = addr.Domain
-		} else if addr.IP != nil {
-			domain = addr.IP.String()
-		}
-		if domain != "" {
-			if cert, cerr := generateBlockCert(domain); cerr == nil {
-				tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{cert}})
-				_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
-				if err := tlsConn.Handshake(); err == nil {
-					_ = tlsConn.SetDeadline(time.Time{})
-					httpResp := "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page
-					_, _ = tlsConn.Write([]byte(httpResp))
-					_ = tlsConn.Close()
-					return
-				}
-				_ = tlsConn.Close()
-			}
-		}
-		// Fallback: if TLS handshake fails, just close (browser will show PR_CONNECT_RESET_ERROR, but better than SSL record error)
+	page := serveBlockPageHTML(addr, err)
+	if page == "" {
 		return
 	}
 	_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page))
