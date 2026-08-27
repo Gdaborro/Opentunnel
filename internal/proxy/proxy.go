@@ -4,12 +4,20 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"strings"
+	"time"
 
 	"opentunnel/internal/protocol"
 )
@@ -100,23 +108,26 @@ func handleSocks(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logge
 	if err != nil {
 		return
 	}
-	// Success reply with wildcard bind address.
-	_, _ = conn.Write([]byte{socksVer, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-
+	// ISP-level: try to dial first, so blocked/banned can be signaled
 	up, err := d.DialTunnel(ctx, addr)
 	if err != nil {
 		if isBlockedErr(err) {
+			// For SOCKS, send success first (as if tunnel established), then send block page as if from target
+			// This way browser sees HTTP 403 instead of SOCKS failure or PR_CONNECT_RESET_ERROR
+			_, _ = conn.Write([]byte{socksVer, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			serveSocksBlockPage(conn, addr, err)
 			if logErr != nil {
 				logErr.Printf("socks: blocked %s: %v", addr, err)
 			}
 			return
 		}
+		_, _ = conn.Write([]byte{socksVer, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		if logErr != nil {
 			logErr.Printf("socks: tunnel %s: %v", addr, err)
 		}
 		return
 	}
+	_, _ = conn.Write([]byte{socksVer, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	defer up.Close()
 	Pipe(ctx, conn, up)
 }
@@ -212,20 +223,83 @@ func serveSocksBlockPage(conn net.Conn, addr *protocol.Address, err error) {
 	if err != nil && strings.Contains(err.Error(), "kicked-silent") {
 		return // silent - just close, no page
 	}
-	// For TLS ports (443, 8443), don't send HTTP block page over TLS - it causes SSL record error
-	// Just close, browser will see "connection closed" which is cleaner than SSL error
-	if addr != nil && (addr.Port == 443 || addr.Port == 8443) {
-		return
-	}
 	page := serveBlockPageHTML(addr, err)
 	if page == "" {
+		return
+	}
+	// For TLS (443/8443) we must speak TLS to show a page, otherwise browser gets PR_CONNECT_RESET_ERROR or SSL record error.
+	// Try to do a TLS handshake with a self-signed cert for the target domain, then send HTTP block page over TLS.
+	if addr != nil && (addr.Port == 443 || addr.Port == 8443) {
+		domain := ""
+		if addr.Domain != "" {
+			domain = addr.Domain
+		} else if addr.IP != nil {
+			domain = addr.IP.String()
+		}
+		if domain != "" {
+			if cert, cerr := generateBlockCert(domain); cerr == nil {
+				tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{cert}})
+				_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
+				if err := tlsConn.Handshake(); err == nil {
+					_ = tlsConn.SetDeadline(time.Time{})
+					httpResp := "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page
+					_, _ = tlsConn.Write([]byte(httpResp))
+					_ = tlsConn.Close()
+					return
+				}
+				_ = tlsConn.Close()
+			}
+		}
+		// Fallback: if TLS handshake fails, just close (browser will show PR_CONNECT_RESET_ERROR, but better than SSL record error)
 		return
 	}
 	_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page))
 }
 
+var blockCertCache = make(map[string]tls.Certificate)
+var blockCertKey *rsa.PrivateKey
+
+func generateBlockCert(domain string) (tls.Certificate, error) {
+	if c, ok := blockCertCache[domain]; ok {
+		return c, nil
+	}
+	if blockCertKey == nil {
+		k, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return tls.Certificate{}, err
+		}
+		blockCertKey = k
+	}
+	serial, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+	template := x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{CommonName: domain, Organization: []string{"opentunnel ISP"}},
+		NotBefore: time.Now().Add(-time.Hour),
+		NotAfter:  time.Now().Add(24 * time.Hour),
+		KeyUsage:  x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames: []string{domain},
+	}
+	if ip := net.ParseIP(domain); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &blockCertKey.PublicKey, blockCertKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(blockCertKey)})
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	blockCertCache[domain] = cert
+	return cert, nil
+}
+
 func serveHTTPBlockPage(conn net.Conn, addr *protocol.Address, err error) {
 	if err != nil && strings.Contains(err.Error(), "kicked-silent") {
+		_, _ = conn.Write([]byte("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"))
 		return
 	}
 	page := serveBlockPageHTML(addr, err)
@@ -233,9 +307,8 @@ func serveHTTPBlockPage(conn net.Conn, addr *protocol.Address, err error) {
 		_, _ = conn.Write([]byte("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"))
 		return
 	}
-	// For CONNECT, we already have not yet sent 200, so we can send 403 directly
-	// Detect if this was CONNECT by checking if we are still in handshake phase
-	// Simplest: send HTTP 403 with block page
+	// For CONNECT (HTTPS) we send 403 with block page directly - browser will display it instead of doing TLS
+	// This avoids PR_CONNECT_RESET_ERROR and shows reason. No SSL error because we never do TLS.
 	_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page))
 }
 
