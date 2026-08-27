@@ -123,7 +123,7 @@
           <h2 class="font-semibold">Blocked Sites — ISP Level</h2>
           <span id="b-count" class="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded">0 domains</span>
         </div>
-        <p class="text-xs text-slate-500 mb-3">Blocked domains are enforced at relay (suffix-matched). HTTP shows ISP block page; HSTS HTTPS (facebook.com) cannot show custom page due to browser HSTS — blocked HTTPS will show connection closed/reset, not cert error. Use HTTP proxy for full HTTPS block page via CONNECT 403.</p>
+        <p class="text-xs text-slate-500 mb-3">Blocked at relay (suffix-matched). <b>HTTP</b> shows ISP block page. <b>HTTPS</b> via HTTP proxy (CONNECT) shows <code>403 Blocked by ISP</code>; via SOCKS, HSTS sites (facebook.com) show browser “Unable to connect” (SOCKS 0x02) not certificate error — reason always in panel below. Use HTTP proxy <code>127.0.0.1:18080</code> for full HTTPS block pages.</p>
         <div class="flex gap-2 mb-3">
           <input id="bdom" placeholder="domain.com (blocks subdomains too)" class="border rounded-md px-3 py-2 text-sm flex-1 focus:outline-none focus:ring-2 focus:ring-indigo-500">
           <input id="breason" placeholder="reason" class="border rounded-md px-3 py-2 text-sm flex-1 focus:outline-none focus:ring-2 focus:ring-indigo-500">

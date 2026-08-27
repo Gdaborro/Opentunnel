@@ -112,10 +112,15 @@ func handleSocks(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logge
 	up, err := d.DialTunnel(ctx, addr)
 	if err != nil {
 		if isBlockedErr(err) {
-			// For SOCKS, send success first (as if tunnel established), then send block page as if from target
-			// This way browser sees HTTP 403 instead of SOCKS failure or PR_CONNECT_RESET_ERROR
-			_, _ = conn.Write([]byte{socksVer, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-			serveSocksBlockPage(conn, addr, err)
+			// For HTTP (80) we can show ISP block page (plain HTTP). For TLS (443) HSTS would reject self-signed cert,
+			// so just send SOCKS failure 0x02 (connection not allowed) — Firefox shows clean "Unable to connect" not PR_CONNECT_ABORTED_ERROR.
+			// The block reason is always visible in panel Blocklist/Visits and System tab. HTTP proxy CONNECT already shows 403 page for HTTPS.
+			if addr != nil && addr.Port == 80 {
+				_, _ = conn.Write([]byte{socksVer, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+				serveSocksBlockPage(conn, addr, err)
+			} else {
+				_, _ = conn.Write([]byte{socksVer, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			}
 			if logErr != nil {
 				logErr.Printf("socks: blocked %s: %v", addr, err)
 			}
