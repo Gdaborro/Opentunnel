@@ -56,8 +56,23 @@ func migrate(db *sql.DB) error {
 		reason TEXT,
 		banned_at DATETIME NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS visits (
+		token TEXT NOT NULL,
+		domain TEXT NOT NULL,
+		hits INTEGER DEFAULT 1,
+		last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY(token, domain)
+	);
+	CREATE TABLE IF NOT EXISTS daily_usage (
+		token TEXT NOT NULL,
+		day TEXT NOT NULL,
+		up INTEGER DEFAULT 0,
+		down INTEGER DEFAULT 0,
+		PRIMARY KEY(token, day)
+	);
 	CREATE INDEX IF NOT EXISTS idx_peers_status ON peers(status);
 	CREATE INDEX IF NOT EXISTS idx_peers_fingerprint ON peers(fingerprint);
+	CREATE INDEX IF NOT EXISTS idx_visits_domain ON visits(domain);
 	`)
 	return err
 }

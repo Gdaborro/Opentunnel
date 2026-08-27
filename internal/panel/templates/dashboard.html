@@ -152,25 +152,45 @@
         <h3 class="font-semibold text-sm">Per-Client Traffic (from peers)</h3>
         <div id="traffic-per-client" class="mt-3 space-y-2 text-sm"></div>
       </div>
+      <div class="bg-white rounded-xl border shadow-sm p-4">
+        <h3 class="font-semibold text-sm">Aggregated Sites Visited (privacy — domain only, no URLs)</h3>
+        <p class="text-xs text-slate-500">Top domains across all clients, counts only. No IPs, no full URLs. For abuse review.</p>
+        <div id="visits" class="mt-3 text-sm border rounded-md p-2 bg-slate-50/50 min-h-[40px]">Loading…</div>
+        <p id="visits-err" class="hidden mt-2 text-xs text-red-600"></p>
+      </div>
     </div>
 
     <!-- System tab -->
     <div id="tab-system" class="tab-panel hidden space-y-6">
       <div class="bg-white rounded-xl border shadow-sm p-4">
         <h2 class="font-semibold">System — ISP Controls</h2>
-        <p class="text-xs text-slate-500">Every control at ISP level</p>
+        <p class="text-xs text-slate-500">Every control at ISP level + abuse & Oracle stealth</p>
         <div class="grid grid-cols-2 gap-3 mt-4 text-sm">
           <button onclick="purgeExpired()" class="border rounded p-3 text-left hover:bg-slate-50"><div class="font-medium">Purge Expired</div><div class="text-xs text-slate-500">Remove expired peers</div></button>
           <button onclick="purgeBanned()" class="border rounded p-3 text-left hover:bg-slate-50"><div class="font-medium">Purge Banned</div><div class="text-xs text-slate-500">Delete all banned peers</div></button>
           <button onclick="clearBlocks()" class="border rounded p-3 text-left hover:bg-slate-50"><div class="font-medium">Clear Blocklist</div><div class="text-xs text-slate-500">Unblock all domains</div></button>
           <button onclick="resetAllTraffic()" class="border rounded p-3 text-left hover:bg-slate-50"><div class="font-medium">Reset All Traffic</div><div class="text-xs text-slate-500">Zero counters for all peers</div></button>
         </div>
+        <div class="mt-4 border rounded-md p-3 bg-slate-50">
+          <h3 class="font-medium text-sm">Abuse Protection</h3>
+          <p class="text-xs text-slate-500">Per-IP 10/min, per-peer 100 domains/10s → temp kick, fingerprint+IP hard ban (hard to bypass), one-click Unban, silent kick option (no page).</p>
+          <div id="abuse-stats" class="mt-2 text-xs">Loading…</div>
+        </div>
+        <div class="mt-4 border rounded-md p-3 bg-slate-50">
+          <h3 class="font-medium text-sm">Oracle Stealth</h3>
+          <p class="text-xs text-slate-500">Decoy site + normal system activity so VPS looks like a regular web server. Not a weirdo.</p>
+          <ul class="text-xs text-slate-600 list-disc pl-4 mt-1">
+            <li>Decoy homepage at <code>/</code> (Welcome) + ACME + normal TLS</li>
+            <li>Daily <code>apt update &amp;&amp; apt upgrade</code> cron, logrotate, unattended-upgrades</li>
+            <li>Panel only on <code>cdn.aborro.dev/admin</code>, bypassed from tunnel</li>
+          </ul>
+        </div>
         <div class="mt-4 flex gap-2 text-xs">
           <button onclick="exportPeers()" class="border rounded px-3 py-1 bg-white hover:bg-slate-50">Export peers JSON</button>
           <button onclick="exportBlocks()" class="border rounded px-3 py-1 bg-white hover:bg-slate-50">Export blocklist</button>
           <button onclick="loadAll()" class="bg-slate-900 text-white rounded px-3 py-1">Refresh All</button>
         </div>
-        <p class="text-xs text-slate-400 mt-4">Unban: find banned peer → Unban → Approve. Block: add domain → client sees block page; unblock via Remove/Clear.</p>
+        <p class="text-xs text-slate-400 mt-4">Unban: Banned → Unban (clears fingerprint) → Approve (easy). Kick: choose silent (no page) or normal. Hard to bypass: token+fingerprint+IP.</p>
       </div>
     </div>
 
@@ -280,7 +300,24 @@ async function loadBlocklist(){
     el.innerHTML=list.map(b=>{ const d=esc(b.domain||b.Domain||''); const rsn=esc(b.reason||b.Reason||''); const safe=String(b.domain||b.Domain||'').replace(/'/g,"\\'"); return `<div class="flex justify-between items-center py-1.5 border-b border-slate-100 last:border-0"><span class="font-mono text-xs">${d} <span class="text-slate-500">— ${rsn||'blocked'}</span> <span class="ml-1 px-1.5 py-0.5 bg-red-50 text-red-600 border border-red-200 rounded text-[10px]">BLOCKED</span></span><button onclick="delBlock('${safe}')" class="text-red-600 hover:text-red-700 text-xs border border-red-200 bg-red-50 rounded px-2 py-0.5">remove</button></div>`; }).join('');
   }catch(e){ if(String(e).includes('401')) return; errEl.textContent='Blocklist failed: '+e.message; errEl.classList.remove('hidden'); el.innerHTML='<div class="text-red-600">Failed to load — retrying</div>'; }
 }
-async function loadAll(){ await loadStats(); await loadPeers(); await loadReport(); await loadBlocklist(); }
+async function loadVisits(){
+  const el=document.getElementById('visits'); const errEl=document.getElementById('visits-err');
+  try{
+    const data=await fetchJSON('/admin/api/visits'); if(errEl) errEl.classList.add('hidden');
+    const list=Array.isArray(data)?data:[];
+    if(!list.length){ el.innerHTML='<div class="text-slate-500">No visits yet — aggregated domain hits will appear here</div>'; return; }
+    el.innerHTML=list.slice(0,20).map(v=> `<div class="flex justify-between py-1 border-b last:border-0"><span class="font-mono text-xs">${esc(v.domain||v.Domain)}</span><span class="text-xs">${v.hits||v.Hits} hits <span class="text-slate-500">${esc((v.last||v.Last||'').slice(0,16))}</span></span></div>`).join('');
+  }catch(e){ if(String(e).includes('401')) return; if(errEl){ errEl.textContent='Visits failed: '+e.message; errEl.classList.remove('hidden'); } el.innerHTML='<div class="text-red-600">Failed to load</div>'; }
+}
+async function loadAbuse(){
+  const el=document.getElementById('abuse-stats');
+  try{
+    const data=await fetchJSON('/admin/api/abuse');
+    if(!el) return;
+    el.innerHTML=`<div>Banned: ${data.banned??0} · Rate-limited: ${data.rate_limited??0}</div><div class="text-slate-500">${esc(data.note||'')}</div>`;
+  }catch(e){ if(el) el.innerHTML='<div class="text-red-600">Failed</div>'; }
+}
+async function loadAll(){ await loadStats(); await loadPeers(); await loadReport(); await loadBlocklist(); await loadVisits(); await loadAbuse(); }
 async function loadStats(){
   const elErr=document.getElementById('stats-err');
   try{
@@ -303,7 +340,7 @@ async function loadStats(){
   }catch(e){ if(String(e).includes('401')) return; ['s-active','s-pending','s-kicked','s-banned','s-blocked'].forEach(id=>{ const el=document.getElementById(id); if(el.textContent==='-') el.textContent='0'; }); elErr.textContent='Stats failed: '+e.message+' — retrying'; elErr.classList.remove('hidden'); }
 }
 async function act(t,a){ try{ const r=await fetch(`/admin/api/peers/${encodeURIComponent(t)}/${a}`,{method:'POST'}); if(r.status===401){ location.href='/admin/login'; return; } if(!r.ok) throw new Error(await r.text()); }catch(e){ alert('Action failed: '+e.message); } loadAll(); }
-async function kick(t){ const r=prompt('Kick reason (10 min):'); if(r===null) return; try{ const res=await fetch(`/admin/api/peers/${encodeURIComponent(t)}/kick`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:r})}); if(res.status===401){ location.href='/admin/login'; return; } if(!res.ok) throw new Error(await res.text()); }catch(e){ alert('Kick failed: '+e.message); } loadAll(); }
+async function kick(t){ const r=prompt('Kick reason (10 min, prefix silent: for silent kick - no page):'); if(r===null) return; try{ const res=await fetch(`/admin/api/peers/${encodeURIComponent(t)}/kick`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:r})}); if(res.status===401){ location.href='/admin/login'; return; } if(!res.ok) throw new Error(await res.text()); }catch(e){ alert('Kick failed: '+e.message); } loadAll(); }
 async function ban(t){ const r=prompt('Ban reason:'); if(r===null) return; try{ const res=await fetch(`/admin/api/peers/${encodeURIComponent(t)}/ban`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:r,duration:'permanent'})}); if(res.status===401){ location.href='/admin/login'; return; } if(!res.ok) throw new Error(await res.text()); }catch(e){ alert('Ban failed: '+e.message); } loadAll(); }
 async function doDelete(t){ if(!confirm('Delete '+t.slice(0,8)+'…?')) return; try{ const r=await fetch(`/admin/api/peers/${encodeURIComponent(t)}/delete`,{method:'POST'}); if(r.status===401){ location.href='/admin/login'; return; } if(!r.ok) throw new Error(await r.text()); }catch(e){ alert('Delete failed: '+e.message); } loadAll(); }
 async function doReset(t){ if(!confirm('Reset traffic '+t.slice(0,8)+'…?')) return; try{ const r=await fetch(`/admin/api/peers/${encodeURIComponent(t)}/reset`,{method:'POST'}); if(r.status===401){ location.href='/admin/login'; return; } if(!r.ok) throw new Error(await r.text()); }catch(e){ alert('Reset failed: '+e.message); } loadAll(); }

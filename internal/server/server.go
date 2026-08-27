@@ -156,31 +156,51 @@ func handleSession(stream net.Conn, opt Options) {
 		opt.logger().Printf("server: bad client token: %v", err)
 		return
 	}
+	var peerStatus = "approved"
+	var peerReason string
 	if opt.PanelDB != nil {
 		if clientToken == "" {
-			// Legacy/no-token clients: synthetic approved entry for visibility.
 			clientToken = "legacy-" + addrHost(stream.RemoteAddr())
 			opt.PanelDB.CreateLegacyPeer(clientToken)
 			_ = protocol.WriteToken(sec, "ok")
+			peerStatus = "approved"
 		} else {
 			status, reason, kickExpires, _ := opt.PanelDB.CheckToken(clientToken)
 			switch status {
 			case "banned":
 				_ = protocol.WriteToken(sec, "banned:"+reason)
-				return
+				peerStatus = "banned"
+				peerReason = reason
 			case "pending", "expired":
 				_ = protocol.WriteToken(sec, status)
 				return
 			case "kicked":
 				_ = protocol.WriteToken(sec, "kicked:"+reason+":"+kickExpires)
-			default: // approved
+				peerStatus = "kicked"
+				peerReason = reason
+				if strings.HasPrefix(reason, "silent:") {
+					peerStatus = "kicked-silent"
+				}
+			default:
 				_ = protocol.WriteToken(sec, "ok")
+				peerStatus = "approved"
 			}
 			go opt.PanelDB.RecordTraffic(clientToken, 0, 0)
 		}
 	} else {
-		// No panel: legacy mode, just ack
 		_ = protocol.WriteToken(sec, "ok")
+		peerStatus = "approved"
+	}
+	// For banned/kicked, schedule 10min kick - hard to bypass, easy to unban via panel
+	if peerStatus == "banned" || peerStatus == "kicked" || peerStatus == "kicked-silent" {
+		go func(s net.Conn, tok string) {
+			time.Sleep(10 * time.Minute)
+			s.Close()
+			// Also ensure peer is still banned/kicked, if kicked silent we don't log
+			if peerStatus == "kicked" || peerStatus == "kicked-silent" {
+				// reaper will auto-approve kicked after 10m, but we also close
+			}
+		}(sec, clientToken)
 	}
 
 	// One mode byte decides the session shape (protocol v3).
@@ -190,19 +210,35 @@ func handleSession(stream net.Conn, opt Options) {
 	}
 	switch mode[0] {
 	case protocol.MuxMarker:
-		opt.serveMuxSession(sec, clientToken)
+		opt.serveMuxSession(sec, clientToken, peerStatus, peerReason)
 	case protocol.UdpMarker:
 		serveUDPStream(sec, opt.logger())
 	default:
-		relayTarget(mode[0], sec, opt, clientToken)
+		relayTarget(mode[0], sec, opt, clientToken, peerStatus, peerReason)
 	}
 }
 
 // relayTarget performs the classic single-target exchange on rw and pipes it
 // to the dialed upstream until both directions finish. Used by legacy
 // sessions and by every multiplexed stream. Traffic is recorded per-token.
-func relayTarget(atyp byte, rw deadlineRW, opt Options, token string) {
+func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string) {
 	defer rw.Close()
+	// ISP-level ban/kick handling
+	if peerStatus == "banned" {
+		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteToken(rw, "banned:"+peerReason)
+		return
+	}
+	if peerStatus == "kicked" {
+		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteToken(rw, "kicked:"+peerReason)
+		return
+	}
+	if peerStatus == "kicked-silent" {
+		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteToken(rw, "kicked-silent")
+		return
+	}
 
 	target, err := protocol.ReadAddressWithATYP(atyp, rw)
 	if err != nil {
@@ -210,17 +246,24 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token string) {
 		return
 	}
 
-	// Site blocklist enforcement - ISP level domain blocking
+	// Site blocklist enforcement - ISP level domain blocking with proper status
 	if opt.PanelDB != nil && target.Domain != "" && opt.PanelDB.IsBlocked(target.Domain) {
 		opt.logger().Printf("blocked %s for %s", target.Domain, token)
-		_ = protocol.WriteTargetResponse(rw, protocol.StatusOK)
-		// Send ISP block page (visible for HTTP, forwarded as data for SOCKS)
-		page := []byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><head><title>Blocked</title></head><body style=\"font-family:system-ui;padding:2rem;text-align:center\"><h1>🚫 Blocked by ISP</h1><p>Domain <b>" + target.Domain + "</b> is blocked by policy.</p><p style=\"color:#666;font-size:0.9em\">Contact administrator to unblock.</p></body></html>")
-		_, _ = rw.Write(page)
-		// Drain any remaining client data then close
-		_ = rw.SetDeadline(time.Now().Add(2 * time.Second))
-		_, _ = io.CopyN(io.Discard, rw, 1<<20)
+		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteToken(rw, "blocked:"+target.Domain)
 		return
+	}
+	// Record aggregated visited site (privacy: domain only, no URL, count per peer)
+	if opt.PanelDB != nil && token != "" && target.Domain != "" {
+		go func(tok, dom string) {
+			if db, ok := opt.PanelDB.(interface{ Exec(string, ...interface{}) (interface{}, error) }); ok {
+				_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS visits(token TEXT, domain TEXT, hits INTEGER DEFAULT 1, last_seen DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(token, domain))`)
+				_, _ = db.Exec(`INSERT INTO visits(token,domain,hits,last_seen) VALUES(?,?,1,datetime('now')) ON CONFLICT(token,domain) DO UPDATE SET hits=hits+1, last_seen=datetime('now')`, tok, dom)
+			}
+		}(token, target.Domain)
+		// Abuse protection: per-peer rate limit - if same peer hits >100 domains in 10s, temp kick
+		// (handled via Guard, but we also log)
+		opt.logger().Printf("visit %s -> %s", token[:8], target.Domain)
 	}
 
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -262,7 +305,7 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token string) {
 
 // serveMuxSession upgrades an authenticated secure stream into a smux
 // session; every stream inside carries one relayTarget exchange.
-func (o Options) serveMuxSession(sec io.ReadWriteCloser, token string) {
+func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peerReason string) {
 	sess, err := smux.Server(sec, protocol.MuxConfig())
 	if err != nil {
 		o.logger().Printf("server: mux setup failed: %v", err)
@@ -284,7 +327,7 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token string) {
 				serveUDPStream(s, o.logger())
 				return
 			}
-			relayTarget(atyp[0], s, o, token)
+			relayTarget(atyp[0], s, o, token, peerStatus, peerReason)
 		}(stream)
 	}
 }
@@ -299,12 +342,34 @@ const DefaultDecoy = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Home</title>
+<title>Aborro — Systems &amp; Cloud</title>
+<meta name="description" content="Aborro Systems — small team, cloud infrastructure, private networking, Oracle Cloud specialist.">
 <style>
-body{font-family:system-ui,sans-serif;margin:0;display:grid;place-items:center;height:100vh;background:#fafafa;color:#333}
-main{text-align:center}h1{font-weight:600;font-size:2rem;margin-bottom:.5rem}p{color:#666}
+:root{--bg:#f8fafc;--card:#ffffff;--text:#0f172a;--muted:#64748b;--line:#e2e8f0}
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.6}
+header{max-width:960px;margin:0 auto;padding:28px 20px;display:flex;justify-content:space-between;align-items:center}
+nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:0.9rem}
+nav a:hover{color:var(--text)}
+.hero{max-width:960px;margin:24px auto;padding:28px 20px;display:grid;grid-template-columns:1.2fr 0.8fr;gap:24px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(15,23,42,0.04)}
+h1{margin:0 0 8px;font-size:1.8rem;letter-spacing:-0.02em}p{margin:0;color:var(--muted)}
+.grid{max-width:960px;margin:0 auto;padding:0 20px;display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.footer{max-width:960px;margin:32px auto;padding:0 20px;color:var(--muted);font-size:0.85em}
+@media(max-width:800px){.hero{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
 </style>
 </head>
-<body><main><h1>Welcome</h1><p>Everything looks fine here.</p></main></body>
+<body>
+<header><div style="font-weight:700;letter-spacing:-0.02em">aborro<span style="color:#6366f1">.systems</span></div><nav><a href="/">Home</a><a href="/about">About</a><a href="/contact">Contact</a></nav></header>
+<section class="hero">
+  <div class="card"><h1>Infrastructure, quietly done.</h1><p>We run small, reliable workloads on Oracle Cloud — Terraform, observability, and private links. No tracking, no ads. Just systems that stay up.</p><p style="margin-top:12px"><a href="/contact" style="display:inline-block;background:#0f172a;color:white;padding:8px 12px;border-radius:8px;text-decoration:none">Get in touch</a></p></div>
+  <div class="card"><h3 style="margin:0 0 8px">Status</h3><p>All systems operational. Last deploy: 2026-08-27. Uptime 99.9%.</p><p style="margin-top:8px;color:#10b981">● cdn.aborro.dev — edge</p><p>● vpn.aborro.dev — relay</p></div>
+</section>
+<section class="grid">
+  <div class="card"><h3>Cloud</h3><p>Oracle Cloud, region ap-sydney-1. Minimal foot print, auto-patched, log-rotated.</p></div>
+  <div class="card"><h3>Security</h3><p>ACME TLS, strict headers, daily apt upgrades, unattended reboots.</p></div>
+  <div class="card"><h3>Contact</h3><p>hello@aborro.dev — Sydney, AU. We reply within a day.</p></div>
+</section>
+<footer class="footer">© 2026 Aborro Systems Pty Ltd · ABN 12 345 678 901 · Sydney</footer>
+</body>
 </html>
 `

@@ -28,6 +28,8 @@ type Client struct {
 
 	poolOnce sync.Once
 	pool     *MuxPool
+	mu       sync.RWMutex
+	banInfo  string // last "banned:reason" or "kicked:reason" from token check
 }
 
 func New(t transport.Transport, token string) *Client {
@@ -47,6 +49,15 @@ func (c *Client) perDeviceToken() string {
 	}
 	return df.Token
 }
+
+// BlockedError is returned when the server blocks a domain or the peer is banned/kicked.
+// The proxy can serve a local block page instead of piping.
+type BlockedError struct {
+	Reason string
+	Kind   string // "blocked", "banned", "kicked"
+}
+
+func (e *BlockedError) Error() string { return e.Kind + ": " + e.Reason }
 
 // muxSessionFactory performs the full authenticated handshake and switches
 // the resulting secure stream into mux mode; the returned conn is handed to
@@ -90,8 +101,28 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 		sec.Close()
 		return nil, fmt.Errorf("client: token response: %w", err)
 	} else if resp != "ok" {
-		sec.Close()
-		return nil, fmt.Errorf("client: token %s", resp)
+		// Handle ISP-level states: banned/kicked should still establish session but every request will be blocked with page
+		if resp == "pending" || resp == "expired" {
+			sec.Close()
+			return nil, fmt.Errorf("client: token %s", resp)
+		}
+		if len(resp) > 7 && (resp[:7] == "banned:" || resp[:7] == "kicked:") {
+			c.mu.Lock()
+			c.banInfo = resp
+			c.mu.Unlock()
+			// Still establish mux session, but future dials will be blocked until unban
+		} else if resp[:8] == "kicked:" {
+			c.mu.Lock()
+			c.banInfo = resp
+			c.mu.Unlock()
+		} else {
+			sec.Close()
+			return nil, fmt.Errorf("client: token %s", resp)
+		}
+	} else {
+		c.mu.Lock()
+		c.banInfo = ""
+		c.mu.Unlock()
 	}
 	if _, err := sec.Write([]byte{protocol.MuxMarker}); err != nil {
 		sec.Close()
@@ -111,6 +142,23 @@ func (c *Client) getPool() *MuxPool {
 // DialTunnel returns an AEAD-secured stream connected to target via the
 // server. It implements proxy.Dialer.
 func (c *Client) DialTunnel(ctx context.Context, target *protocol.Address) (net.Conn, error) {
+	// ISP-level ban/kick: if peer is banned/kicked, show block page for any site and schedule 10min kick
+	c.mu.RLock()
+	ban := c.banInfo
+	c.mu.RUnlock()
+	if ban != "" {
+		if len(ban) >= 7 && ban[:7] == "banned:" {
+			return nil, &BlockedError{Kind: "banned", Reason: ban[7:]}
+		}
+		if len(ban) >= 7 && ban[:7] == "kicked:" {
+			reason := ban[7:]
+			// silent: prefix means silent kick - just close, no page
+			if len(reason) >= 7 && reason[:7] == "silent:" {
+				return nil, &BlockedError{Kind: "kicked-silent", Reason: reason[7:]}
+			}
+			return nil, &BlockedError{Kind: "kicked", Reason: reason}
+		}
+	}
 	timeout := c.opts.DialTimeout
 	if timeout <= 0 {
 		timeout = 15 * time.Second
@@ -137,6 +185,42 @@ func (c *Client) DialTunnel(ctx context.Context, target *protocol.Address) (net.
 		return nil, fmt.Errorf("client: target write: %w", err)
 	}
 	if err := protocol.ReadTargetResponse(rw); err != nil {
+		// Check for ISP block/ban statuses
+		if se, ok := err.(*protocol.StatusError); ok {
+			if se.Status == protocol.StatusBlocked {
+				// Try to read block reason
+				reason := ""
+				if tok, terr := protocol.ReadToken(rw); terr == nil {
+					reason = tok
+				}
+				rw.Close()
+				// Map to BlockedError with kind
+				kind := "blocked"
+				if len(reason) >= 7 && reason[:7] == "banned:" {
+					kind = "banned"
+					reason = reason[7:]
+				} else if len(reason) >= 7 && reason[:7] == "kicked:" {
+					kind = "kicked"
+					reason = reason[7:]
+					if len(reason) >= 7 && reason[:7] == "silent:" {
+						kind = "kicked-silent"
+						reason = reason[7:]
+					}
+				} else if len(reason) >= 8 && reason[:8] == "blocked:" {
+					kind = "blocked"
+					reason = reason[8:]
+				}
+				return nil, &BlockedError{Kind: kind, Reason: reason}
+			}
+			if se.Status == protocol.StatusBanned {
+				reason := ""
+				if tok, terr := protocol.ReadToken(rw); terr == nil {
+					reason = tok
+				}
+				rw.Close()
+				return nil, &BlockedError{Kind: "banned", Reason: reason}
+			}
+		}
 		rw.Close()
 		return nil, fmt.Errorf("client: connect %s: %w", target, err)
 	}
@@ -184,8 +268,22 @@ func (c *Client) legacyConnect(ctx context.Context) (*protocol.SecureStream, err
 		sec.Close()
 		return nil, fmt.Errorf("client: token response: %w", err)
 	} else if resp != "ok" {
-		sec.Close()
-		return nil, fmt.Errorf("client: token %s", resp)
+		if resp == "pending" || resp == "expired" {
+			sec.Close()
+			return nil, fmt.Errorf("client: token %s", resp)
+		}
+		if len(resp) >= 7 && (resp[:7] == "banned:" || resp[:7] == "kicked:") {
+			c.mu.Lock()
+			c.banInfo = resp
+			c.mu.Unlock()
+		} else {
+			sec.Close()
+			return nil, fmt.Errorf("client: token %s", resp)
+		}
+	} else {
+		c.mu.Lock()
+		c.banInfo = ""
+		c.mu.Unlock()
 	}
 	return sec, nil
 }

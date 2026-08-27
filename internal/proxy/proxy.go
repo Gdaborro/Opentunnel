@@ -5,9 +5,11 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"strings"
 
 	"opentunnel/internal/protocol"
 )
@@ -103,6 +105,13 @@ func handleSocks(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logge
 
 	up, err := d.DialTunnel(ctx, addr)
 	if err != nil {
+		if isBlockedErr(err) {
+			serveSocksBlockPage(conn, addr, err)
+			if logErr != nil {
+				logErr.Printf("socks: blocked %s: %v", addr, err)
+			}
+			return
+		}
 		if logErr != nil {
 			logErr.Printf("socks: tunnel %s: %v", addr, err)
 		}
@@ -126,6 +135,110 @@ func ServeHTTPProxy(ctx context.Context, ln net.Listener, d Dialer, logErr *log.
 	}
 }
 
+func isBlockedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "banned:") || strings.Contains(s, "kicked:") || strings.Contains(s, "blocked:") || strings.Contains(s, "StatusBlocked") || strings.Contains(s, "blocked")
+}
+
+func blockReason(err error) string {
+	if err == nil {
+		return "blocked by policy"
+	}
+	s := err.Error()
+	for _, p := range []string{"banned:", "kicked:", "blocked:", "kicked-silent:"} {
+		if idx := strings.Index(s, p); idx != -1 {
+			reason := s[idx+len(p):]
+			if i := strings.Index(reason, ":"); i != -1 && p == "kicked:" {
+				// handle silent prefix inside
+			}
+			// trim trailing quotes/brackets
+			reason = strings.Trim(reason, "\"' ")
+			if reason == "" {
+				reason = p[:len(p)-1]
+			}
+			return reason
+		}
+	}
+	// also try StatusBlocked
+	if strings.Contains(s, "8") {
+		return "blocked"
+	}
+	return "blocked by policy"
+}
+
+func serveBlockPageHTML(addr *protocol.Address, err error) string {
+	domain := ""
+	if addr != nil {
+		if addr.Domain != "" {
+			domain = addr.Domain
+		} else if addr.IP != nil {
+			domain = addr.IP.String()
+		}
+	}
+	reason := blockReason(err)
+	kind := "Blocked"
+	if err != nil && strings.Contains(err.Error(), "banned:") {
+		kind = "Banned"
+	} else if err != nil && strings.Contains(err.Error(), "kicked") {
+		kind = "Kicked"
+	}
+	title := kind + " by ISP"
+	msg := ""
+	if kind == "Banned" {
+		msg = fmt.Sprintf("You are <b>banned</b>: %s<br>Any site will show this page.<br>You will be kicked off the network in 10 minutes.<br>Hard to bypass (fingerprint+IP banned).<br>Easy to unban via panel.", escHTML(reason))
+	} else if kind == "Kicked" {
+		if strings.Contains(err.Error(), "silent") {
+			return "" // silent kick - no page
+		}
+		msg = fmt.Sprintf("You are <b>kicked</b>: %s<br>You will be disconnected in 10 minutes.<br>Silent kick available for stealth.", escHTML(reason))
+	} else {
+		msg = fmt.Sprintf("Domain <b>%s</b> is blocked: %s<br>Contact admin to unblock. Subdomains also blocked.", escHTML(domain), escHTML(reason))
+	}
+	return fmt.Sprintf("<html><head><title>%s</title><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>body{font-family:system-ui,sans-serif;background:#f8fafc;margin:0;display:grid;place-items:center;min-height:100vh;color:#1e293b}main{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:2rem;max-width:520px;box-shadow:0 4px 12px rgba(0,0,0,0.05)}h1{margin:0 0 0.5rem;font-size:1.4rem}p{color:#475569;line-height:1.5}</style></head><body><main><h1>🚫 %s</h1><p>%s</p><p style=\"font-size:0.85em;color:#64748b;margin-top:1rem\">opentunnel ISP • aggregated visits only (privacy) • abuse protection active</p></main></body></html>", escHTML(title), escHTML(title), msg)
+}
+
+func escHTML(s string) string {
+	r := strings.ReplaceAll(s, "&", "&amp;")
+	r = strings.ReplaceAll(r, "<", "&lt;")
+	r = strings.ReplaceAll(r, ">", "&gt;")
+	r = strings.ReplaceAll(r, "\"", "&quot;")
+	return r
+}
+
+func serveSocksBlockPage(conn net.Conn, addr *protocol.Address, err error) {
+	if err != nil && strings.Contains(err.Error(), "kicked-silent") {
+		return // silent - just close, no page
+	}
+	// For TLS ports (443, 8443), don't send HTTP block page over TLS - it causes SSL record error
+	// Just close, browser will see "connection closed" which is cleaner than SSL error
+	if addr != nil && (addr.Port == 443 || addr.Port == 8443) {
+		return
+	}
+	page := serveBlockPageHTML(addr, err)
+	if page == "" {
+		return
+	}
+	_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page))
+}
+
+func serveHTTPBlockPage(conn net.Conn, addr *protocol.Address, err error) {
+	if err != nil && strings.Contains(err.Error(), "kicked-silent") {
+		return
+	}
+	page := serveBlockPageHTML(addr, err)
+	if page == "" {
+		_, _ = conn.Write([]byte("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"))
+		return
+	}
+	// For CONNECT, we already have not yet sent 200, so we can send 403 directly
+	// Detect if this was CONNECT by checking if we are still in handshake phase
+	// Simplest: send HTTP 403 with block page
+	_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page))
+}
+
 func handleHTTPOne(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logger) {
 	defer conn.Close()
 	req, err := httpReadRequest(conn)
@@ -143,14 +256,23 @@ func handleHTTPOne(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Log
 		return
 	}
 	if req.method == httpMethodConnect {
-		_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
 		up, err := d.DialTunnel(ctx, addr)
 		if err != nil {
+			if isBlockedErr(err) {
+				// For CONNECT (usually TLS), just close - browser will show connection reset, but also try to serve block page via HTTP
+				// For better UX, close and let browser retry as HTTP block page
+				serveHTTPBlockPage(conn, addr, err)
+				if logErr != nil {
+					logErr.Printf("http: blocked %s: %v", addr, err)
+				}
+				return
+			}
 			if logErr != nil {
 				logErr.Printf("http: tunnel %s: %v", addr, err)
 			}
 			return
 		}
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
 		defer up.Close()
 		Pipe(ctx, conn, up)
 		return
@@ -158,6 +280,10 @@ func handleHTTPOne(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Log
 	// Absolute-form request: rewrite to origin-form and relay raw bytes.
 	up, err := d.DialTunnel(ctx, addr)
 	if err != nil {
+		if isBlockedErr(err) {
+			serveHTTPBlockPage(conn, addr, err)
+			return
+		}
 		httpRespondError(conn, 502, "tunnel unavailable")
 		return
 	}

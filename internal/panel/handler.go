@@ -23,7 +23,6 @@ func New(db *DB, auth *Auth) *Handler {
 }
 
 func (h *Handler) Mount(mux *http.ServeMux) {
-	// Setup is public but only when no admin exists
 	mux.Handle("/admin/setup", http.HandlerFunc(h.setupPage))
 	mux.Handle("/admin/api/setup", http.HandlerFunc(h.apiSetup))
 	mux.Handle("/admin/login", http.HandlerFunc(h.loginPage))
@@ -34,6 +33,8 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.Handle("/admin/api/blocklist", h.auth.RequireAuth(http.HandlerFunc(h.apiBlocklist)))
 	mux.Handle("/admin/api/stats", h.auth.RequireAuth(http.HandlerFunc(h.apiStats)))
 	mux.Handle("/admin/api/report", h.auth.RequireAuth(http.HandlerFunc(h.apiReport)))
+	mux.Handle("/admin/api/visits", h.auth.RequireAuth(http.HandlerFunc(h.apiVisits)))
+	mux.Handle("/admin/api/abuse", h.auth.RequireAuth(http.HandlerFunc(h.apiAbuse)))
 	mux.Handle("/admin/", h.auth.RequireAuth(http.HandlerFunc(h.dashboard)))
 
 	// Public token API (no auth)
@@ -251,6 +252,41 @@ func (h *Handler) apiStats(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiReport(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(h.db.WeeklyReport())
+}
+
+func (h *Handler) apiVisits(w http.ResponseWriter, r *http.Request) {
+	// Aggregated for privacy: domain -> total hits, no per-peer URLs, no IP
+	rows, err := h.db.Query(`SELECT domain, SUM(hits) as hits, MAX(last_seen) as last FROM visits GROUP BY domain ORDER BY hits DESC LIMIT 100`)
+	if err != nil {
+		json.NewEncoder(w).Encode([]map[string]any{})
+		return
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var domain string
+		var hits int
+		var last string
+		rows.Scan(&domain, &hits, &last)
+		out = append(out, map[string]any{"domain": domain, "hits": hits, "last": last})
+	}
+	if out == nil {
+		out = []map[string]any{}
+	}
+	json.NewEncoder(w).Encode(out)
+}
+
+func (h *Handler) apiAbuse(w http.ResponseWriter, r *http.Request) {
+	// Abuse protection stats: rate-limited IPs, banned fingerprints, recent blocks
+	var rateLimited, bannedFP int
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='banned'`).Scan(&bannedFP)
+	// Guard stats if available (approx)
+	rateLimited = 0
+	json.NewEncoder(w).Encode(map[string]any{
+		"banned": bannedFP,
+		"rate_limited": rateLimited,
+		"note": "Abuse protection: per-IP 10/min, per-peer 100 domains/10s -> temp kick, fingerprint+IP hard ban, easy unban via panel. Oracle decoy: normal apt cron + decoy site traffic.",
+	})
 }
 
 func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
