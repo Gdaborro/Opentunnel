@@ -148,11 +148,9 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "approve":
 		h.db.Exec(`UPDATE peers SET status='approved', last_seen=datetime('now') WHERE token=?`, token)
-		// If this peer has an SSH pubkey, authorize it for tun
 		var pub string
 		h.db.QueryRow(`SELECT COALESCE(ssh_pubkey,'') FROM peers WHERE token=?`, token).Scan(&pub)
 		if pub != "" {
-			// Use helper to append to authorized_keys idempotently
 			_ = addTunPubkey(pub)
 		}
 	case "kick":
@@ -166,7 +164,6 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 		h.db.Exec(`UPDATE peers SET status='banned', ban_reason=?, ban_duration=? WHERE token=?`, req.Reason, req.Duration, token)
-		// also ban fingerprint hard
 		var fp string
 		h.db.QueryRow(`SELECT fingerprint FROM peers WHERE token=?`, token).Scan(&fp)
 		h.db.Exec(`INSERT OR REPLACE INTO fingerprints_banned(fingerprint,reason,banned_at) VALUES(?,?,datetime('now'))`, fp, req.Reason)
@@ -175,19 +172,39 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		h.db.QueryRow(`SELECT fingerprint FROM peers WHERE token=?`, token).Scan(&fp)
 		h.db.Exec(`DELETE FROM fingerprints_banned WHERE fingerprint=?`, fp)
 		h.db.Exec(`UPDATE peers SET status='pending' WHERE token=?`, token)
+	case "delete":
+		var fp string
+		h.db.QueryRow(`SELECT fingerprint FROM peers WHERE token=?`, token).Scan(&fp)
+		h.db.Exec(`DELETE FROM peers WHERE token=?`, token)
+		h.db.Exec(`DELETE FROM daily_usage WHERE token=?`, token)
+		if fp != "" {
+			h.db.Exec(`DELETE FROM fingerprints_banned WHERE fingerprint=?`, fp)
+		}
+	case "reset":
+		h.db.Exec(`UPDATE peers SET bytes_up=0, bytes_down=0 WHERE token=?`, token)
+		h.db.Exec(`DELETE FROM daily_usage WHERE token=?`, token)
+	case "expire":
+		h.db.Exec(`UPDATE peers SET status='expired' WHERE token=?`, token)
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
 
 func (h *Handler) apiBlocklist(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		rows, _ := h.db.Query(`SELECT domain,reason FROM blocklist`)
-		defer rows.Close()
-		var list []map[string]string
-		for rows.Next() {
-			var d, rsn string
-			rows.Scan(&d, &rsn)
-			list = append(list, map[string]string{"domain": d, "reason": rsn})
+		rows, _ := h.db.Query(`SELECT domain,reason FROM blocklist ORDER BY domain`)
+		if rows != nil {
+			defer rows.Close()
+		}
+		list := []map[string]string{}
+		if rows != nil {
+			for rows.Next() {
+				var d, rsn string
+				rows.Scan(&d, &rsn)
+				list = append(list, map[string]string{"domain": d, "reason": rsn})
+			}
+		}
+		if list == nil {
+			list = []map[string]string{}
 		}
 		json.NewEncoder(w).Encode(list)
 		return
@@ -195,26 +212,40 @@ func (h *Handler) apiBlocklist(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Domain string `json:"domain"`
 		Reason string `json:"reason"`
+		Clear  bool   `json:"clear"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 	if r.Method == "POST" {
+		if req.Domain == "" {
+			http.Error(w, "domain required", 400)
+			return
+		}
 		h.db.Exec(`INSERT OR REPLACE INTO blocklist(domain,reason) VALUES(?,?)`, req.Domain, req.Reason)
 	} else if r.Method == "DELETE" {
-		h.db.Exec(`DELETE FROM blocklist WHERE domain=?`, req.Domain)
+		if req.Clear || req.Domain == "" {
+			h.db.Exec(`DELETE FROM blocklist`)
+		} else {
+			h.db.Exec(`DELETE FROM blocklist WHERE domain=?`, req.Domain)
+		}
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
 
 func (h *Handler) apiStats(w http.ResponseWriter, r *http.Request) {
 	var totalUp, totalDown int64
-	var active, pending, banned int
+	var active, pending, banned, kicked, expired, blocked, total int
 	h.db.QueryRow(`SELECT COALESCE(SUM(bytes_up),0), COALESCE(SUM(bytes_down),0) FROM peers`).Scan(&totalUp, &totalDown)
 	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='approved'`).Scan(&active)
 	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='pending'`).Scan(&pending)
 	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='banned'`).Scan(&banned)
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='kicked'`).Scan(&kicked)
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='expired'`).Scan(&expired)
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&total)
+	h.db.QueryRow(`SELECT COUNT(*) FROM blocklist`).Scan(&blocked)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"total_up": totalUp, "total_down": totalDown,
 		"active": active, "pending": pending, "banned": banned,
+		"kicked": kicked, "expired": expired, "total": total, "blocked": blocked,
 	})
 }
 
