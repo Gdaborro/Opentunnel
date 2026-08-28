@@ -1,23 +1,57 @@
 import { useCallback, useEffect, useState } from "react"
 import { api, type Peer, type PeerLimits } from "@/lib/api"
-import { Card, CardContent } from "@/components/ui/card"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
-  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
 } from "@/components/ui/dialog"
-import { formatBytes, timeAgo } from "@/lib/utils"
-import { Check, Footprints, Gauge, Ban, Trash2, RotateCcw, Timer } from "lucide-react"
+import { formatBytes, timeAgo } from "@/lib/format"
+import {
+  CheckIcon,
+  FootprintsIcon,
+  GaugeIcon,
+  BanIcon,
+  Trash2Icon,
+  RotateCcwIcon,
+  TimerIcon,
+  UsersIcon,
+} from "lucide-react"
 
-const statusVariant: Record<string, "success" | "warning" | "destructive" | "secondary"> = {
-  approved: "success",
-  pending: "warning",
-  banned: "destructive",
-  kicked: "warning",
-  expired: "secondary",
+function statusTone(status: string): string {
+  switch (status) {
+    case "approved":
+      return "bg-primary/15 text-primary"
+    case "pending":
+      return "bg-chart-3/15 text-chart-3"
+    case "banned":
+      return "bg-destructive/15 text-destructive"
+    case "kicked":
+      return "bg-chart-3/15 text-chart-3"
+    default:
+      return "bg-muted text-muted-foreground"
+  }
 }
 
 export function Clients() {
@@ -68,17 +102,26 @@ export function Clients() {
   }
 
   return (
-    <Card className="fade-up">
-      <CardContent className="p-0">
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <UsersIcon className="size-4 text-primary" />
+          Subscriber Devices
+        </CardTitle>
+        <CardDescription>
+          Admission state, usage and per-device service controls
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="pl-4">Device</TableHead>
+              <TableHead>Device</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Location</TableHead>
               <TableHead>Usage</TableHead>
               <TableHead>Seen</TableHead>
-              <TableHead className="text-right pr-4">Actions</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -91,14 +134,14 @@ export function Clients() {
             )}
             {peers.map((p) => (
               <TableRow key={p.token}>
-                <TableCell className="pl-4">
+                <TableCell>
                   <div className="font-medium">{p.device_name || "unknown device"}</div>
                   <div className="font-mono text-xs text-muted-foreground">
                     {p.token.slice(0, 8)}…{p.last_ip ? ` · ${p.last_ip}` : ""}
                   </div>
                 </TableCell>
                 <TableCell>
-                  <Badge variant={statusVariant[p.status] ?? "secondary"} className="capitalize">
+                  <Badge variant="outline" className={`capitalize ${statusTone(p.status)}`}>
                     {p.status}
                   </Badge>
                   {p.status === "kicked" && p.kick_reason && (
@@ -118,15 +161,15 @@ export function Clients() {
                   <br />↓ {formatBytes(p.bytes_down)}
                 </TableCell>
                 <TableCell className="tabular-nums text-sm text-muted-foreground">{timeAgo(p.last_seen)}</TableCell>
-                <TableCell className="pr-4">
+                <TableCell>
                   <div className="flex items-center justify-end gap-1">
                     {p.status === "pending" && (
                       <Button size="icon" variant="ghost" title="Approve" disabled={busy} onClick={() => act(p.token, "approve")}>
-                        <Check className="text-emerald-400" />
+                        <CheckIcon className="text-primary" />
                       </Button>
                     )}
                     <Button size="icon" variant="ghost" title="Schedule & caps" onClick={() => openLimits(p)}>
-                      <Gauge />
+                      <GaugeIcon />
                     </Button>
                     {p.status !== "kicked" && p.status !== "banned" && (
                       <Button
@@ -136,7 +179,7 @@ export function Clients() {
                         disabled={busy}
                         onClick={() => act(p.token, "kick", { reason: "manual kick by admin" })}
                       >
-                        <Footprints />
+                        <FootprintsIcon />
                       </Button>
                     )}
                     {p.status !== "banned" ? (
@@ -147,11 +190,11 @@ export function Clients() {
                         disabled={busy}
                         onClick={() => act(p.token, "ban", { reason: "banned by admin", duration: "permanent" })}
                       >
-                        <Ban className="text-red-400" />
+                        <BanIcon className="text-destructive" />
                       </Button>
                     ) : (
                       <Button size="icon" variant="ghost" title="Unban" disabled={busy} onClick={() => act(p.token, "unban")}>
-                        <RotateCcw className="text-emerald-400" />
+                        <RotateCcwIcon className="text-primary" />
                       </Button>
                     )}
                     <Button
@@ -163,7 +206,7 @@ export function Clients() {
                         if (confirm(`Delete ${p.device_name || p.token.slice(0, 8)}?`)) act(p.token, "delete")
                       }}
                     >
-                      <Trash2 className="text-red-400" />
+                      <Trash2Icon className="text-destructive" />
                     </Button>
                   </div>
                 </TableCell>
@@ -177,8 +220,8 @@ export function Clients() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <Timer className="h-4 w-4 text-emerald-400" />
-              {limitsPeer?.device_name || limitsPeer?.token.slice(0, 8)} — access controls
+              <TimerIcon className="h-4 w-4 text-primary" />
+              {limitsPeer?.device_name || limitsPeer?.token.slice(0, 8)} — service controls
             </DialogTitle>
             <DialogDescription>Schedule, bandwidth cap and data quota for this device.</DialogDescription>
           </DialogHeader>
@@ -219,7 +262,7 @@ export function Clients() {
                 />
               </div>
             </div>
-            {error && <p className="text-sm text-red-400">{error}</p>}
+            {error && <p className="text-sm text-destructive">{error}</p>}
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setLimitsPeer(null)}>

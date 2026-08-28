@@ -20,10 +20,8 @@ import (
 	"opentunnel/internal/proxy"
 	"opentunnel/internal/share"
 	"opentunnel/internal/transport"
+	"opentunnel/internal/version"
 )
-
-// version is stamped at build time via -ldflags "-X main.version=x.y.z".
-var version = "dev"
 
 func main() {
 	cfgPath := flag.String("c", "client.toml", "path to client config")
@@ -36,7 +34,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("opentunnel client", version)
+		fmt.Println("opentunnel client", version.Version)
 		return
 	}
 
@@ -243,6 +241,13 @@ func main() {
 		fmt.Printf("[i] fixed profile: %s\n", dialer.Current())
 	}
 
+	fmt.Printf("[i] otu-client %s\n", version.Version)
+	client.NewHealthReporter(cfg, device, dialer.Probe).Start(60 * time.Second)
+	if cfg.AutoUpdateEnabled() {
+		go client.UpdateLoop()
+		fmt.Println("[i] auto-update: watching GitHub releases")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -253,7 +258,7 @@ func main() {
 	warnIfExposed(httpAddr, "http_addr")
 
 	if socksAddr != "" {
-		lnSOCKS, err = net.Listen("tcp", socksAddr)
+		lnSOCKS, err = listenRetry("tcp", socksAddr)
 		if err != nil {
 			log.Fatalf("socks listen: %v", err)
 		}
@@ -261,7 +266,7 @@ func main() {
 		fmt.Printf("[+] SOCKS5     -> %s\n", socksAddr)
 	}
 	if httpAddr != "" {
-		lnHTTP, err = net.Listen("tcp", httpAddr)
+		lnHTTP, err = listenRetry("tcp", httpAddr)
 		if err != nil {
 			log.Fatalf("http listen: %v", err)
 		}
@@ -306,6 +311,22 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// listenRetry retries binding for a few seconds. After a self-update the
+// re-exec'd process can race the exiting one for the proxy ports; retrying
+// lets the handover settle instead of crashing the new process.
+func listenRetry(network, addr string) (net.Listener, error) {
+	var ln net.Listener
+	var err error
+	for i := 0; i < 20; i++ {
+		ln, err = net.Listen(network, addr)
+		if err == nil {
+			return ln, nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return nil, err
 }
 
 // warnIfExposed flags non-loopback proxy binds: the local proxies have no

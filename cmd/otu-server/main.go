@@ -22,10 +22,8 @@ import (
 	"opentunnel/internal/panel"
 	"opentunnel/internal/server"
 	"opentunnel/internal/transport"
+	"opentunnel/internal/version"
 )
-
-// version is stamped at build time via -ldflags "-X main.version=x.y.z".
-var version = "dev"
 
 func main() {
 	cfgPath := flag.String("c", "server.toml", "path to server config")
@@ -35,7 +33,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("opentunnel server", version)
+		fmt.Println("opentunnel server", version.Version)
 		return
 	}
 

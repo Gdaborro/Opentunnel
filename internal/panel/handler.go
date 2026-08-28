@@ -73,12 +73,16 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.Handle("/admin/api/abuse", h.auth.RequireAuth(http.HandlerFunc(h.apiAbuse)))
 	mux.Handle("/admin/api/events", h.auth.RequireAuth(http.HandlerFunc(h.apiEvents)))
 	mux.Handle("/admin/api/settings", h.auth.RequireAuth(http.HandlerFunc(h.apiSettings)))
+	mux.Handle("/admin/api/alerts", h.auth.RequireAuth(http.HandlerFunc(h.apiAlerts)))
+	mux.Handle("/admin/api/devices", h.auth.RequireAuth(http.HandlerFunc(h.apiDevices)))
+	mux.Handle("/admin/api/server-health", h.auth.RequireAuth(http.HandlerFunc(h.apiServerHealth)))
 	mux.Handle("/admin/", h.auth.RequireAuth(http.HandlerFunc(h.dashboard)))
 
-	// Public token API (no auth)
+	// Public token api (no auth)
 	mux.Handle("/api/token/request", http.HandlerFunc(h.tokenRequest))
 	mux.Handle("/api/token/status", http.HandlerFunc(h.tokenStatus))
 	mux.Handle("/api/token/heartbeat", http.HandlerFunc(h.tokenHeartbeat))
+	mux.Handle("/api/token/health", http.HandlerFunc(h.tokenHealth))
 }
 
 func (h *Handler) Handler() http.Handler {
@@ -225,6 +229,7 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 	case "approve":
 		h.db.Exec(`UPDATE peers SET status='approved', last_seen=datetime('now') WHERE token=?`, token)
 		h.db.RecordEvent("approve", short+" approved")
+		h.db.RecordAlert("info", "nac", "device "+short+" approved for network access")
 	case "kick":
 		var req struct {
 			Reason string `json:"reason"`
@@ -232,6 +237,7 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&req)
 		h.db.Exec(`UPDATE peers SET status='kicked', kick_reason=?, kick_expires=datetime('now','+10 minutes') WHERE token=?`, req.Reason, token)
 		h.db.RecordEvent("kick", short+" kicked: "+req.Reason)
+		h.db.RecordAlert("warning", "nac", "device "+short+" kicked: "+trimReason(req.Reason))
 	case "ban":
 		var req struct {
 			Reason   string `json:"reason"`
@@ -241,10 +247,12 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		h.db.Exec(`UPDATE peers SET status='banned', ban_reason=?, ban_duration=? WHERE token=?`, req.Reason, req.Duration, token)
 		h.db.BanIdentity(token, req.Reason)
 		h.db.RecordEvent("ban", short+" banned: "+req.Reason)
+		h.db.RecordAlert("critical", "security", "device "+short+" BANNED (fingerprint + key): "+trimReason(req.Reason))
 	case "unban":
 		h.db.UnbanIdentity(token)
 		h.db.Exec(`UPDATE peers SET status='pending', ban_reason=NULL, ban_duration=NULL WHERE token=?`, token)
 		h.db.RecordEvent("unban", short+" unbanned (needs re-approval)")
+		h.db.RecordAlert("info", "security", "device "+short+" unbanned — pending re-approval")
 	case "delete":
 		h.db.UnbanIdentity(token)
 		h.db.Exec(`DELETE FROM peers WHERE token=?`, token)
@@ -430,8 +438,10 @@ func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 	h.db.SetKillSwitch(*req.KillSwitch)
 	if *req.KillSwitch {
 		h.db.RecordEvent("kill-switch", "all tunnel traffic suspended")
+		h.db.RecordAlert("critical", "kill-switch", "KILL SWITCH ENGAGED — all tunnel traffic suspended")
 	} else {
 		h.db.RecordEvent("kill-switch", "tunnel traffic resumed")
+		h.db.RecordAlert("info", "kill-switch", "kill switch released — traffic resumed")
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
@@ -498,6 +508,7 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		status = existingStatus
 	} else {
 		h.db.RecordEvent("register", req.DeviceName+" registered ("+status+")")
+		h.db.RecordAlert("info", "nac", "new device "+req.DeviceName+" registered — status: "+status)
 	}
 	json.NewEncoder(w).Encode(map[string]string{"status": status})
 }
@@ -523,4 +534,74 @@ func (h *Handler) tokenHeartbeat(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&req)
 	h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
 	w.Write([]byte(`{"ok":true}`))
+}
+
+// tokenHealth ingests client telemetry (device posture for NAC/inventory).
+// Public but rate-limited per IP; unknown tokens are ignored.
+func (h *Handler) tokenHealth(w http.ResponseWriter, r *http.Request) {
+	if !h.regAllowed(clientIP(r)) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	var req struct {
+		Token        string  `json:"token"`
+		Version      string  `json:"version"`
+		OS           string  `json:"os"`
+		Arch         string  `json:"arch"`
+		CPUPct       float64 `json:"cpu_pct"`
+		MemPct       float64 `json:"mem_pct"`
+		TempC        float64 `json:"temp_c"`
+		UptimeS      int64   `json:"uptime_s"`
+		LatencyMs    float64 `json:"latency_ms"`
+		JitterMs     float64 `json:"jitter_ms"`
+		ProbeLossPct float64 `json:"probe_loss_pct"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	var n int
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE token=?`, req.Token).Scan(&n)
+	if n == 0 {
+		http.Error(w, "not found", 404)
+		return
+	}
+	h.db.RecordHealth(req.Token, req.Version, req.OS, req.Arch, req.CPUPct, req.MemPct, req.TempC, req.UptimeS, req.LatencyMs, req.JitterMs, req.ProbeLossPct)
+	h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
+	w.Write([]byte(`{"ok":true}`))
+}
+
+func (h *Handler) apiAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		var req struct {
+			ID  int64 `json:"id"`
+			Ack bool  `json:"ack"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		if req.Ack {
+			h.db.AckAlert(req.ID)
+		}
+		w.Write([]byte(`{"ok":true}`))
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"alerts": h.db.Alerts(60),
+		"unacked": h.db.UnackedAlertCount(),
+	})
+}
+
+// apiDevices returns the device inventory: peers joined with telemetry.
+func (h *Handler) apiDevices(w http.ResponseWriter, r *http.Request) {
+	devices := h.db.AllHealth()
+	if h.geo != nil {
+		for i := range devices {
+			if devices[i].LastIP != "" {
+				devices[i].Country = h.geo.CountryName(devices[i].LastIP)
+			}
+		}
+	}
+	json.NewEncoder(w).Encode(devices)
 }

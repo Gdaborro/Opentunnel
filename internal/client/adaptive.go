@@ -251,6 +251,15 @@ func (a *Adaptive) Current() string {
 	return a.tierName(a.idx)
 }
 
+// Probe measures tunnel setup latency on the current tier (transport dial +
+// handshake), then tears the connection down. Used for health telemetry.
+func (a *Adaptive) Probe(ctx context.Context) (time.Duration, error) {
+	a.mu.Lock()
+	idx := a.idx
+	a.mu.Unlock()
+	return a.build(idx).ProbeSession(ctx)
+}
+
 // OpenUDPRelay returns a UDP relay stream using the currently selected
 // profile. It implements proxy.UDPDialer.
 func (a *Adaptive) OpenUDPRelay(ctx context.Context) (net.Conn, error) {

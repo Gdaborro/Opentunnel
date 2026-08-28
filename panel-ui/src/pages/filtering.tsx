@@ -1,11 +1,24 @@
 import { useCallback, useEffect, useState } from "react"
 import { api, type BlockEntry, type Category } from "@/lib/api"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Plus, Trash2, Shield } from "lucide-react"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import { PlusIcon, Trash2Icon, ShieldIcon, ListFilterIcon } from "lucide-react"
 
 const categoryLabels: Record<string, string> = {
   social: "Social media",
@@ -48,20 +61,28 @@ export function Filtering() {
   }
 
   return (
-    <div className="grid gap-4 lg:grid-cols-2">
-      <Card className="fade-up">
+    <div className="grid gap-4 @xl/main:grid-cols-2">
+      <Card>
         <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Shield className="h-4 w-4 text-emerald-400" /> Category blocking
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <ShieldIcon className="size-4 text-primary" />
+            Category Blocking
           </CardTitle>
-          <CardDescription>Block whole categories of sites on every device.</CardDescription>
+          <CardDescription>
+            Centrally deployed content policy — enforced at the relay for every
+            subscriber device
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {categories.map((c) => (
             <div key={c.category} className="flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium">{categoryLabels[c.category] ?? c.category}</p>
-                <p className="text-xs text-muted-foreground">{c.domains} known domains, suffix-matched</p>
+                <p className="text-sm font-medium">
+                  {categoryLabels[c.category] ?? c.category}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {c.domains} known domains, suffix-matched
+                </p>
               </div>
               <Switch checked={c.enabled} onCheckedChange={(v) => toggleCat(c, v)} />
             </div>
@@ -69,10 +90,15 @@ export function Filtering() {
         </CardContent>
       </Card>
 
-      <Card className="fade-up">
+      <Card>
         <CardHeader>
-          <CardTitle className="text-base">Custom blocklist</CardTitle>
-          <CardDescription>Extra domains blocked for all devices (subdomains included).</CardDescription>
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <ListFilterIcon className="size-4 text-primary" />
+            Custom Blocklist (ACL)
+          </CardTitle>
+          <CardDescription>
+            Extra domains blocked for all devices — subdomains included
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="flex gap-2">
@@ -89,7 +115,7 @@ export function Filtering() {
               onKeyDown={(e) => e.key === "Enter" && add()}
             />
             <Button onClick={add} disabled={busy || !domain.trim()}>
-              <Plus /> Add
+              <PlusIcon /> Add
             </Button>
           </div>
           <Table>
@@ -119,7 +145,7 @@ export function Filtering() {
                       onClick={() => api.removeBlock(e.domain).then(load)}
                       title="Remove"
                     >
-                      <Trash2 className="text-red-400" />
+                      <Trash2Icon className="text-destructive" />
                     </Button>
                   </TableCell>
                 </TableRow>

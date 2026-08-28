@@ -1,18 +1,35 @@
 import { useEffect, useState } from "react"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Badge } from "@/components/ui/badge"
+import { TooltipProvider } from "@/components/ui/tooltip"
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
+import { AppSidebar, type PageKey } from "@/components/app-sidebar"
+import { SiteHeader } from "@/components/site-header"
 import { Overview } from "@/pages/overview"
+import { Monitoring } from "@/pages/monitoring"
+import { Security } from "@/pages/security"
+import { Devices } from "@/pages/devices"
 import { Clients } from "@/pages/clients"
 import { Filtering } from "@/pages/filtering"
 import { SystemPage } from "@/pages/system"
 import { api } from "@/lib/api"
-import { Network, LogOut } from "lucide-react"
+
+const subtitles: Record<PageKey, string> = {
+  Overview: "Network operations at a glance",
+  Monitoring: "Real-time performance, trends and alerting",
+  Security: "Access control, threats and policy",
+  Devices: "Infrastructure inventory and health",
+  Clients: "Subscriber devices and service limits",
+  Filtering: "Firewall rules and content policy",
+  System: "Relay controls and configuration",
+}
 
 export default function App() {
+  const [page, setPage] = useState<PageKey>("Overview")
   const [pending, setPending] = useState(0)
+  const [unacked, setUnacked] = useState(0)
   const [kill, setKill] = useState(false)
+
   useEffect(() => {
-    const load = () =>
+    const load = () => {
       api
         .stats()
         .then((s) => {
@@ -20,58 +37,43 @@ export default function App() {
           setKill(s.kill_switch)
         })
         .catch(() => {})
+      api
+        .alerts()
+        .then((a) => setUnacked(a.unacked))
+        .catch(() => {})
+    }
     load()
     const id = setInterval(load, 5000)
     return () => clearInterval(id)
   }, [])
 
   return (
-    <div className="min-h-screen">
-      <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4">
-          <div className="flex items-center gap-2">
-            <Network className="h-5 w-5 text-emerald-400" />
-            <span className="font-semibold tracking-tight">Network Control</span>
-            {kill && <Badge variant="destructive">kill switch on</Badge>}
-            {!kill && pending > 0 && (
-              <Badge variant="warning">
-                {pending} pending
-              </Badge>
-            )}
-          </div>
-          <a
-            href="/admin/logout"
-            className="flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <LogOut className="h-4 w-4" /> Sign out
-          </a>
-        </div>
-      </header>
-
-      <main className="mx-auto max-w-7xl px-4 py-6">
-        <Tabs defaultValue="overview">
-          <TabsList className="mb-4">
-            <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="clients">
-              Clients{pending > 0 ? ` (${pending})` : ""}
-            </TabsTrigger>
-            <TabsTrigger value="filtering">Filtering</TabsTrigger>
-            <TabsTrigger value="system">System</TabsTrigger>
-          </TabsList>
-          <TabsContent value="overview">
-            <Overview />
-          </TabsContent>
-          <TabsContent value="clients">
-            <Clients />
-          </TabsContent>
-          <TabsContent value="filtering">
-            <Filtering />
-          </TabsContent>
-          <TabsContent value="system">
-            <SystemPage />
-          </TabsContent>
-        </Tabs>
-      </main>
-    </div>
+    <TooltipProvider>
+      <SidebarProvider>
+        <AppSidebar
+          page={page}
+          pending={pending}
+          unacked={unacked}
+          onNavigate={setPage}
+        />
+        <SidebarInset>
+          <SiteHeader
+            title={page}
+            subtitle={subtitles[page]}
+            killSwitch={kill}
+            pending={pending}
+          />
+          <main className="@container/main flex flex-1 flex-col gap-4 p-4 lg:p-6">
+            {page === "Overview" && <Overview />}
+            {page === "Monitoring" && <Monitoring />}
+            {page === "Security" && <Security />}
+            {page === "Devices" && <Devices />}
+            {page === "Clients" && <Clients />}
+            {page === "Filtering" && <Filtering />}
+            {page === "System" && <SystemPage />}
+          </main>
+        </SidebarInset>
+      </SidebarProvider>
+    </TooltipProvider>
   )
 }

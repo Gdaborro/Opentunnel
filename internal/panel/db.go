@@ -21,8 +21,9 @@ func Open(path string, purgeAfterDays int) (*DB, error) {
 	if err := migrate(db); err != nil {
 		return nil, err
 	}
-	go reaper(db, purgeAfterDays)
-	return &DB{db}, nil
+	wrapped := &DB{db}
+	go reaper(wrapped, purgeAfterDays)
+	return wrapped, nil
 }
 
 func migrate(db *sql.DB) error {
@@ -93,6 +94,22 @@ func migrate(db *sql.DB) error {
 		category TEXT PRIMARY KEY,
 		enabled INTEGER NOT NULL DEFAULT 0
 	);
+	CREATE TABLE IF NOT EXISTS device_health (
+		token TEXT PRIMARY KEY,
+		version TEXT, os TEXT, arch TEXT,
+		cpu_pct REAL, mem_pct REAL, temp_c REAL,
+		uptime_s INTEGER,
+		latency_ms REAL, jitter_ms REAL, probe_loss_pct REAL,
+		at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS alerts (
+		id INTEGER PRIMARY KEY,
+		severity TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		message TEXT,
+		acked INTEGER DEFAULT 0,
+		at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	`)
 	if err != nil {
 		return err
@@ -122,7 +139,7 @@ func migrate(db *sql.DB) error {
 // reaper purges devices that have not connected within purgeAfterDays so
 // stale devices must re-register and be re-approved, and releases expired
 // kicks. Banned peers are kept (their identities stay blocked).
-func reaper(db *sql.DB, purgeAfterDays int) {
+func reaper(db *DB, purgeAfterDays int) {
 	if purgeAfterDays <= 0 {
 		purgeAfterDays = 14
 	}
@@ -132,8 +149,10 @@ func reaper(db *sql.DB, purgeAfterDays int) {
 		db.Exec(`DELETE FROM peers WHERE status IN ('approved','pending','expired','kicked') AND last_seen < datetime('now', ?)`, window)
 		db.Exec(`DELETE FROM visits WHERE token NOT IN (SELECT token FROM peers)`)
 		db.Exec(`DELETE FROM daily_usage WHERE token NOT IN (SELECT token FROM peers)`)
+		db.Exec(`DELETE FROM device_health WHERE token NOT IN (SELECT token FROM peers)`)
 		db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE status='kicked' AND kick_expires IS NOT NULL AND kick_expires < datetime('now')`)
 		db.Exec(`DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 500)`)
+		db.offlineSweep()
 	}
 }
 
@@ -262,16 +281,28 @@ func (db *DB) CheckToken(token string) (status, reason, kickExpires string, err 
 		return "banned", br, "", nil
 	}
 	if s == "kicked" {
-		return "kicked", kr, ke, nil
+		// Expired kicks clear inline so devices aren't locked out until the
+		// hourly reaper happens to tick.
+		if ke != "" {
+			if exp, perr := time.Parse("2006-01-02 15:04:05", ke); perr == nil && time.Now().UTC().After(exp) {
+				db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE token=?`, token)
+				s = "approved"
+			}
+		}
+		if s == "kicked" {
+			return "kicked", kr, ke, nil
+		}
 	}
 	if s == "pending" || s == "expired" {
 		return s, "", "", nil
 	}
 	// approved — ISP controls: data quota, then access schedule.
 	if quota > 0 && up+down >= quota {
+		db.quotaAlert(token)
 		return "kicked", "data quota exceeded", "", nil
 	}
 	if !scheduleAllows(sched, time.Now()) {
+		db.scheduleAlert(token)
 		return "kicked", "outside allowed hours (schedule)", nextScheduleStart(sched, time.Now()).Format("2006-01-02 15:04:05"), nil
 	}
 	db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, token)

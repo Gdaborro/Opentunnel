@@ -113,6 +113,22 @@ func (c *Client) dialAuthenticated(ctx context.Context, timeout time.Duration) (
 	return nil, "", errors.New("client: all auth candidates rejected")
 }
 
+// ProbeSession runs one full transport+handshake round trip and closes it:
+// the setup-latency sample for health telemetry.
+func (c *Client) ProbeSession(ctx context.Context) (time.Duration, error) {
+	timeout := c.opts.DialTimeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	start := time.Now()
+	raw, _, err := c.dialAuthenticated(ctx, timeout)
+	if err != nil {
+		return 0, err
+	}
+	raw.Close()
+	return time.Since(start), nil
+}
+
 // mapAuthError translates handshake rejections into typed client errors.
 // Unknown/expired tokens trigger re-registration: the device re-enters the
 // approval queue instead of failing forever.

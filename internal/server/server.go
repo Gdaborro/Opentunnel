@@ -18,6 +18,7 @@ import (
 	"github.com/xtaci/smux"
 	"golang.org/x/time/rate"
 
+	"opentunnel/internal/metrics"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/server/decoy"
 )
@@ -155,6 +156,8 @@ func (o Options) verifyHandshakeToken(tok string) byte {
 
 func handleSession(stream net.Conn, opt Options) {
 	defer stream.Close()
+	metrics.SessionStarted()
+	defer metrics.SessionEnded()
 
 	_ = stream.SetDeadline(time.Now().Add(15 * time.Second))
 	status, authTok, err := protocol.ReadAndVerifyHandshake(stream, stream, opt.verifyHandshakeToken)

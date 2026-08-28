@@ -51,6 +51,54 @@ export interface PeerLimits {
   quota_bytes: number
 }
 
+export interface DeviceHealth {
+  token: string
+  device_name: string
+  status: string
+  version: string
+  os: string
+  arch: string
+  cpu_pct: number
+  mem_pct: number
+  temp_c: number
+  uptime_s: number
+  latency_ms: number
+  jitter_ms: number
+  probe_loss_pct: number
+  last_ip?: string
+  country?: string
+  at: string
+}
+
+export interface AlertItem {
+  id: number
+  severity: "info" | "warning" | "critical"
+  kind: string
+  message: string
+  acked: boolean
+  at: string
+}
+
+export interface ServerHealth {
+  version: string
+  process_uptime_s: number
+  goroutines: number
+  heap_mb: number
+  active_sessions: number
+  kill_switch: boolean
+  mem_total_mb?: number
+  mem_used_pct?: number
+  load_1m?: number
+  load_5m?: number
+  load_15m?: number
+  cpu_cores?: number
+  cpu_pct?: number
+  host_uptime_s?: number
+  os?: string
+  platform?: string
+  kernel?: string
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { credentials: "same-origin", ...init })
   if (res.status === 401 || res.status === 403) {
@@ -76,6 +124,10 @@ export const api = {
   settings: () => req<{ kill_switch: boolean }>("/admin/api/settings"),
   visits: () => req<{ domain: string; hits: number; last: string }[]>("/admin/api/visits"),
   report: () => req<{ day: string; up: number; down: number }[]>("/admin/api/report"),
+  devices: () => req<DeviceHealth[]>("/admin/api/devices"),
+  alerts: () => req<{ alerts: AlertItem[]; unacked: number }>("/admin/api/alerts"),
+  ackAlert: (id: number) => req<{ ok: boolean }>("/admin/api/alerts", post({ id, ack: true })),
+  serverHealth: () => req<ServerHealth>("/admin/api/server-health"),
   peerAction: (token: string, action: string, body?: unknown) =>
     req<{ ok: boolean }>(`/admin/api/peers/${token}/${action}`, body !== undefined ? post(body) : { method: "POST" }),
   peerLimits: (token: string) => req<PeerLimits>(`/admin/api/peers/${token}/limits`),

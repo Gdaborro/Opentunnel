@@ -1,19 +1,32 @@
 import { useCallback, useEffect, useState } from "react"
-import { api } from "@/lib/api"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { api, type ServerHealth } from "@/lib/api"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import { Switch } from "@/components/ui/switch"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Separator } from "@/components/ui/separator"
-import { Power, Eye, ShieldAlert } from "lucide-react"
+import { Badge } from "@/components/ui/badge"
+import { PowerIcon, ShieldAlertIcon, InfoIcon } from "lucide-react"
+import { formatDuration } from "@/lib/format"
 
 export function SystemPage() {
   const [kill, setKill] = useState(false)
-  const [visits, setVisits] = useState<{ domain: string; hits: number; last: string }[]>([])
+  const [health, setHealth] = useState<ServerHealth | null>(null)
   const [loaded, setLoaded] = useState(false)
 
   const load = useCallback(() => {
-    api.settings().then((s) => { setKill(s.kill_switch); setLoaded(true) }).catch(() => {})
-    api.visits().then(setVisits).catch(() => {})
+    api
+      .settings()
+      .then((s) => {
+        setKill(s.kill_switch)
+        setLoaded(true)
+      })
+      .catch(() => {})
+    api.serverHealth().then(setHealth).catch(() => {})
   }, [])
   useEffect(load, [load])
 
@@ -24,20 +37,24 @@ export function SystemPage() {
 
   return (
     <div className="space-y-4">
-      <Card className="fade-up border-red-500/30">
+      <Card className="border-destructive/30">
         <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Power className="h-4 w-4 text-red-400" /> Global kill switch
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <PowerIcon className="size-4 text-destructive" />
+            Global Kill Switch
           </CardTitle>
           <CardDescription>
-            Suspends all tunnel traffic instantly — new connections are refused and existing streams are blocked.
-            Devices stay registered and approved; flip it off to resume.
+            Suspends all tunnel traffic instantly — new connections are refused
+            and existing streams are blocked. Devices stay registered and
+            approved; flip it off to resume.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <ShieldAlert className={kill ? "h-8 w-8 text-red-400" : "h-8 w-8 text-muted-foreground"} />
-            <p className={kill ? "font-medium text-red-300" : "font-medium text-muted-foreground"}>
+            <ShieldAlertIcon
+              className={kill ? "size-8 text-destructive" : "size-8 text-muted-foreground"}
+            />
+            <p className={kill ? "font-medium text-destructive" : "font-medium text-muted-foreground"}>
               {kill ? "SUSPENDED — all traffic blocked" : "Traffic flowing normally"}
             </p>
           </div>
@@ -45,41 +62,38 @@ export function SystemPage() {
         </CardContent>
       </Card>
 
-      <Card className="fade-up">
+      <Card>
         <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Eye className="h-4 w-4 text-emerald-400" /> Top visited domains
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <InfoIcon className="size-4 text-primary" />
+            Relay Configuration
           </CardTitle>
-          <CardDescription>Aggregated across devices — domain only, no URLs.</CardDescription>
+          <CardDescription>
+            Enforcement is server-side: schedules, quotas, category blocks and
+            the kill switch apply at the relay, so clients cannot bypass them
+            locally
+          </CardDescription>
         </CardHeader>
-        <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Domain</TableHead>
-                <TableHead className="text-right">Hits</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {visits.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={2} className="py-6 text-center text-muted-foreground">
-                    No visits recorded yet.
-                  </TableCell>
-                </TableRow>
-              )}
-              {visits.slice(0, 25).map((v) => (
-                <TableRow key={v.domain}>
-                  <TableCell className="font-mono text-sm">{v.domain}</TableCell>
-                  <TableCell className="text-right tabular-nums">{v.hits.toLocaleString()}</TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          <Separator className="my-4" />
+        <CardContent className="flex flex-col gap-3 text-sm">
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Relay version</span>
+            <Badge variant="secondary">{health?.version ?? "—"}</Badge>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Process uptime</span>
+            <span className="tabular-nums">
+              {health ? formatDuration(health.process_uptime_s) : "—"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Client delivery</span>
+            <span>GitHub Releases (auto-update, sha256-verified)</span>
+          </div>
+          <Separator />
           <p className="text-xs text-muted-foreground">
-            Enforcement is server-side: schedules, quotas, category blocks and the kill switch apply at the relay, so
-            clients cannot bypass them locally.
+            Devices authenticate with per-device credentials; the shared master
+            secret is not present in client binaries. Banned identities
+            (fingerprint + SSH key) are refused at the handshake.
           </p>
         </CardContent>
       </Card>

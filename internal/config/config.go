@@ -55,6 +55,7 @@ type ClientConf struct {
 	SOCKSAddr   string   `toml:"socks_addr"`    // default 127.0.0.1:1080
 	HTTPAddr    string   `toml:"http_addr"`     // default 127.0.0.1:8118
 	BypassList  []string `toml:"bypass_list"`   // extra ProxyOverride entries
+	AutoUpdate  *bool    `toml:"auto_update"`   // default true: self-update from GitHub Releases
 }
 
 // SSHHostKeyPins splits ssh_host_keys into individual pins.
@@ -101,6 +102,9 @@ func (c *ClientConf) MuxEnabled() bool { return c.Mux == nil || *c.Mux }
 
 // UDPEnabled reports the effective UDP relay setting (default true).
 func (c *ClientConf) UDPEnabled() bool { return c.UDP == nil || *c.UDP }
+
+// AutoUpdateEnabled reports the effective auto-update setting (default true).
+func (c *ClientConf) AutoUpdateEnabled() bool { return c.AutoUpdate == nil || *c.AutoUpdate }
 
 func LoadServer(path string) (*Server, error) {
 	var s Server
