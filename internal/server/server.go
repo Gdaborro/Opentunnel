@@ -263,7 +263,7 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 		}(token, target.Domain)
 		// Abuse protection: per-peer rate limit - if same peer hits >100 domains in 10s, temp kick
 		// (handled via Guard, but we also log)
-		opt.logger().Printf("visit %s -> %s", token[:8], target.Domain)
+		opt.logger().Printf("visit %s -> %s", shortToken(token), target.Domain)
 	}
 
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -336,6 +336,15 @@ var (
 	replayOnce    sync.Once
 	defaultReplay *protocol.ReplayCache
 )
+
+// shortToken returns an 8-char log prefix without assuming token length
+// (tokens are client-chosen strings; slicing blindly could panic).
+func shortToken(t string) string {
+	if len(t) > 8 {
+		return t[:8]
+	}
+	return t
+}
 
 const DefaultDecoy = `<!doctype html>
 <html lang="en">

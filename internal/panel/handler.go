@@ -303,6 +303,10 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token and fingerprint required", 400)
 		return
 	}
+	if len(req.Token) < 16 || len(req.Token) > 1024 {
+		http.Error(w, "token must be 16-1024 chars", 400)
+		return
+	}
 	// Check hard ban on fingerprint
 	var banned int
 	h.db.QueryRow(`SELECT COUNT(*) FROM fingerprints_banned WHERE fingerprint=?`, req.Fingerprint).Scan(&banned)
