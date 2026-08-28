@@ -24,8 +24,14 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 	host := cfg.ServerAddr
 	// Try both cdn and vpn hosts for panel (in case one is blocked)
 	panelURL := "https://" + host + "/api/token/request"
+	// Include the device public key: bans bind to the key, not just the
+	// token, so a ban cannot be shed by re-registering on the same device.
+	pub := ""
+	if ts, err := NewTokenStore(); err == nil {
+		pub, _ = ts.EnsureSSHKey()
+	}
 	body, _ := json.Marshal(map[string]string{
-		"token": device.Token, "fingerprint": device.Fingerprint, "device_name": device.DeviceName,
+		"token": device.Token, "fingerprint": device.Fingerprint, "device_name": device.DeviceName, "ssh_pubkey": pub,
 	})
 	resp, err := http.Post(panelURL, "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -74,9 +80,13 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile) {
 	case "pending":
 		fmt.Printf("[*] Token pending approval — waiting for admin (approve at https://%s/admin/)\n", cfg.ServerAddr)
 	case "expired":
-		fmt.Println("[*] Token expired after 10 days inactivity — regenerating...")
-		ts, _ := NewTokenStore()
-		ts.LoadOrCreate() // will generate new if expired
+		fmt.Println("[*] Token expired — re-registering for approval...")
+		_ = doRegister(cfg, device)
+	case "":
+		// Panel no longer knows this token (purged after inactivity):
+		// re-register and wait for re-approval.
+		fmt.Println("[*] Device no longer registered — re-registering for approval...")
+		_ = doRegister(cfg, device)
 	}
 }
 

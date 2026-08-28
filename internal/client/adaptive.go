@@ -75,6 +75,11 @@ type Adaptive struct {
 	// sshFallback, when set, adds a final last-resort tier that tunnels
 	// inside real SSH — used when every ws-tls tier is intercepted.
 	sshFallback func() transport.Transport
+
+	// OnAuthRejected is forwarded to every built client: it fires when the
+	// panel no longer knows the device token (purged/expired) so the device
+	// can re-register and re-enter the approval queue.
+	OnAuthRejected func()
 }
 
 // EnableMux turns on connection multiplexing for every profile's clients.
@@ -130,10 +135,11 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		tr = transport.NewWSTLS(opt)
 	}
 	return NewWithOptions(tr, Options{
-		Token:       a.token,
-		DialTimeout: a.dialTimeout,
-		Profile:     "balanced", // under ssh, mild padding; harmless elsewhere
-		Mux:         a.mux,
+		Token:          a.token,
+		DialTimeout:    a.dialTimeout,
+		Profile:        "balanced", // under ssh, mild padding; harmless elsewhere
+		Mux:            a.mux,
+		OnAuthRejected: a.OnAuthRejected,
 	})
 }
 

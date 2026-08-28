@@ -25,6 +25,15 @@ type Server struct {
 	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
 	// private, link-local/metadata, CGNAT). Default false.
 	AllowRestrictedTargets bool `toml:"allow_restricted_targets"`
+	// AllowLegacyMaster accepts the shared token at the handshake while
+	// clients migrate to per-device tokens. Default false.
+	AllowLegacyMaster bool `toml:"allow_legacy_master"`
+	// PurgeAfterDays deletes devices unseen for this many days; they must
+	// re-register and be re-approved. Default 14.
+	PurgeAfterDays int `toml:"purge_after_days"`
+	// GeoIPDB is the path to an offline MaxMind country mmdb used by the
+	// panel map. Empty = no country resolution.
+	GeoIPDB string `toml:"geoip_db"`
 }
 
 type ClientConf struct {
@@ -112,9 +121,11 @@ func LoadClient(path string) (*ClientConf, error) {
 	if _, err := toml.DecodeFile(path, &c); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-	if c.ServerAddr == "" || c.Token == "" {
-		return nil, fmt.Errorf("config: client needs server_addr and token")
+	if c.ServerAddr == "" {
+		return nil, fmt.Errorf("config: client needs server_addr")
 	}
+	// token is optional: panel mode authenticates with a per-device token
+	// generated on first run; token only matters for legacy/no-panel servers.
 	if c.Profile == "" {
 		c.Profile = "auto"
 	}
@@ -146,6 +157,14 @@ key_file  = ""
 	# When true, clients may dial loopback/private/link-local/metadata
 	# targets through the relay (SSRF filter off). Default false.
 	allow_restricted_targets = false
+	# When true, the shared token above is still accepted at the handshake
+	# (migration window while clients move to per-device tokens).
+	allow_legacy_master = false
+	# Devices unseen for this many days are purged and must re-register /
+	# be re-approved. Default 14.
+	purge_after_days = 14
+	# Offline MaxMind country mmdb for the panel map (empty = disabled).
+	geoip_db = ""
 	`
 	return writeFile(path, t)
 }
@@ -154,7 +173,6 @@ key_file  = ""
 // no config file exists, so the client works as a standalone executable.
 const DefaultClientTOML = `# opentunnel client — default configuration (auto-generated on first run)
 server_addr = "cdn.aborro.dev:443"
-token = "497bb6b977cfb87c439a088687d0b640edd741d828c50aa6fecfba7f5854400f"
 fingerprint = "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"
 insecure = false
 ws_path = "/ws"

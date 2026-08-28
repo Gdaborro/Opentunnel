@@ -48,6 +48,10 @@ func serveUDPStream(rw io.ReadWriteCloser, opt Options) {
 		if err != nil {
 			return
 		}
+		// Kill switch drops datagrams while suspended.
+		if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
+			continue
+		}
 		// Blocklist applies to domains and IP literals alike.
 		if opt.PanelDB != nil {
 			name := dst.Domain

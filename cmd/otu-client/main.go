@@ -105,9 +105,10 @@ func main() {
 		cfg.SSHKey = filepath.Join(filepath.Dir(*cfgPath), cfg.SSHKey)
 	}
 
-	// Per-device token (10-day inactivity expiry, hard ban persistence)
-	// This token is *separate* from cfg.Token (the static outer secret).
-	// cfg.Token stays as the outer AEAD key; device.Token is the panel identity.
+	// Per-device token: the device's tunnel credential. It authenticates the
+	// handshake and seeds the per-session AEAD keys; no shared secret ships
+	// in the binary. The panel gates it via approval, and purges it after
+	// extended inactivity (re-register → re-approve).
 	tokenStore, err := client.NewTokenStore()
 	if err != nil {
 		log.Fatalf("token store: %v", err)
@@ -163,6 +164,9 @@ func main() {
 	}
 	dialer := client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
 	dialer.Logger = log.Default()
+	// If the panel no longer knows our device token (purged after
+	// inactivity), re-register and wait for approval again.
+	dialer.OnAuthRejected = func() { client.RegisterWithPanel(cfg, device) }
 
 	switch cfg.TransportKind() {
 	case "ssh":

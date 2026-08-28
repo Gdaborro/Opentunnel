@@ -7,7 +7,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	"opentunnel/internal/panel/ui"
 )
 
 var _ = time.Second // peers carry time.Time fields
@@ -17,11 +20,41 @@ type Handler struct {
 	auth        *Auth
 	tmpl        *template.Template
 	autoApprove bool
+	geo         *GeoIP // optional; nil = no country resolution
+
+	rlMu  sync.Mutex
+	rlMap map[string]*regLimit // per-IP registration rate limit
 }
+
+type regLimit struct {
+	count       int
+	windowStart time.Time
+}
+
+const regLimitMax = 10 // registrations per IP per window
+const regLimitWindow = time.Minute
 
 func New(db *DB, auth *Auth, autoApprove bool) *Handler {
 	tmpl := template.Must(template.ParseFS(templateFS, "templates/*.html"))
-	return &Handler{db: db, auth: auth, tmpl: tmpl, autoApprove: autoApprove}
+	return &Handler{db: db, auth: auth, tmpl: tmpl, autoApprove: autoApprove, rlMap: make(map[string]*regLimit)}
+}
+
+// WithGeoIP attaches an offline GeoIP resolver (panel map / countries).
+func (h *Handler) WithGeoIP(g *GeoIP) *Handler { h.geo = g; return h }
+
+// regAllowed enforces a per-IP registration rate limit so a banned device
+// cannot hammer /api/token/request with fresh identities.
+func (h *Handler) regAllowed(ip string) bool {
+	h.rlMu.Lock()
+	defer h.rlMu.Unlock()
+	now := time.Now()
+	r := h.rlMap[ip]
+	if r == nil || now.Sub(r.windowStart) > regLimitWindow {
+		r = &regLimit{windowStart: now}
+		h.rlMap[ip] = r
+	}
+	r.count++
+	return r.count <= regLimitMax
 }
 
 func (h *Handler) Mount(mux *http.ServeMux) {
@@ -33,10 +66,13 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.Handle("/admin/api/peers", h.auth.RequireAuth(http.HandlerFunc(h.apiPeers)))
 	mux.Handle("/admin/api/peers/", h.auth.RequireAuth(http.HandlerFunc(h.apiPeerAction)))
 	mux.Handle("/admin/api/blocklist", h.auth.RequireAuth(http.HandlerFunc(h.apiBlocklist)))
+	mux.Handle("/admin/api/categories", h.auth.RequireAuth(http.HandlerFunc(h.apiCategories)))
 	mux.Handle("/admin/api/stats", h.auth.RequireAuth(http.HandlerFunc(h.apiStats)))
 	mux.Handle("/admin/api/report", h.auth.RequireAuth(http.HandlerFunc(h.apiReport)))
 	mux.Handle("/admin/api/visits", h.auth.RequireAuth(http.HandlerFunc(h.apiVisits)))
 	mux.Handle("/admin/api/abuse", h.auth.RequireAuth(http.HandlerFunc(h.apiAbuse)))
+	mux.Handle("/admin/api/events", h.auth.RequireAuth(http.HandlerFunc(h.apiEvents)))
+	mux.Handle("/admin/api/settings", h.auth.RequireAuth(http.HandlerFunc(h.apiSettings)))
 	mux.Handle("/admin/", h.auth.RequireAuth(http.HandlerFunc(h.dashboard)))
 
 	// Public token API (no auth)
@@ -134,11 +170,22 @@ func clientIP(r *http.Request) string {
 }
 
 func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
-	h.tmpl.ExecuteTemplate(w, "dashboard.html", map[string]string{"User": h.auth.GetUser(r)})
+	// Serve the embedded SPA. Real files under dist/ are served as-is;
+	// any other /admin/* path falls back to index.html (client routing).
+	p := strings.TrimPrefix(r.URL.Path, "/admin/")
+	if p != "" {
+		if f, err := ui.Dist.Open("dist/" + p); err == nil {
+			f.Close()
+			http.ServeFileFS(w, r, ui.Dist, "dist/"+p)
+			return
+		}
+	}
+	w.Header().Set("Cache-Control", "no-cache")
+	http.ServeFileFS(w, r, ui.Dist, "dist/index.html")
 }
 
 func (h *Handler) apiPeers(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.db.Query(`SELECT token,fingerprint,device_name,status,created_at,last_seen,bytes_up,bytes_down,kick_reason,ban_reason FROM peers ORDER BY last_seen DESC`)
+	rows, err := h.db.Query(`SELECT token,fingerprint,device_name,status,created_at,last_seen,bytes_up,bytes_down,kick_reason,ban_reason,COALESCE(last_ip,'') FROM peers ORDER BY last_seen DESC`)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -149,12 +196,15 @@ func (h *Handler) apiPeers(w http.ResponseWriter, r *http.Request) {
 		var p Peer
 		var kickReason, banReason sql.NullString
 		if err := rows.Scan(&p.Token, &p.Fingerprint, &p.DeviceName, &p.Status, &p.CreatedAt, &p.LastSeen,
-			&p.BytesUp, &p.BytesDown, &kickReason, &banReason); err != nil {
+			&p.BytesUp, &p.BytesDown, &kickReason, &banReason, &p.LastIP); err != nil {
 			// Row skipped rather than aborting the whole list
 			continue
 		}
 		p.KickReason = kickReason.String
 		p.BanReason = banReason.String
+		if h.geo != nil && p.LastIP != "" {
+			p.Country = h.geo.CountryName(p.LastIP)
+		}
 		peers = append(peers, p)
 	}
 	json.NewEncoder(w).Encode(peers)
@@ -167,15 +217,21 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, action := parts[0], parts[1]
+	short := token
+	if len(short) > 8 {
+		short = short[:8]
+	}
 	switch action {
 	case "approve":
 		h.db.Exec(`UPDATE peers SET status='approved', last_seen=datetime('now') WHERE token=?`, token)
+		h.db.RecordEvent("approve", short+" approved")
 	case "kick":
 		var req struct {
 			Reason string `json:"reason"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 		h.db.Exec(`UPDATE peers SET status='kicked', kick_reason=?, kick_expires=datetime('now','+10 minutes') WHERE token=?`, req.Reason, token)
+		h.db.RecordEvent("kick", short+" kicked: "+req.Reason)
 	case "ban":
 		var req struct {
 			Reason   string `json:"reason"`
@@ -183,27 +239,50 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 		h.db.Exec(`UPDATE peers SET status='banned', ban_reason=?, ban_duration=? WHERE token=?`, req.Reason, req.Duration, token)
-		var fp string
-		h.db.QueryRow(`SELECT fingerprint FROM peers WHERE token=?`, token).Scan(&fp)
-		h.db.Exec(`INSERT OR REPLACE INTO fingerprints_banned(fingerprint,reason,banned_at) VALUES(?,?,datetime('now'))`, fp, req.Reason)
+		h.db.BanIdentity(token, req.Reason)
+		h.db.RecordEvent("ban", short+" banned: "+req.Reason)
 	case "unban":
-		var fp string
-		h.db.QueryRow(`SELECT fingerprint FROM peers WHERE token=?`, token).Scan(&fp)
-		h.db.Exec(`DELETE FROM fingerprints_banned WHERE fingerprint=?`, fp)
-		h.db.Exec(`UPDATE peers SET status='pending' WHERE token=?`, token)
+		h.db.UnbanIdentity(token)
+		h.db.Exec(`UPDATE peers SET status='pending', ban_reason=NULL, ban_duration=NULL WHERE token=?`, token)
+		h.db.RecordEvent("unban", short+" unbanned (needs re-approval)")
 	case "delete":
-		var fp string
-		h.db.QueryRow(`SELECT fingerprint FROM peers WHERE token=?`, token).Scan(&fp)
+		h.db.UnbanIdentity(token)
 		h.db.Exec(`DELETE FROM peers WHERE token=?`, token)
 		h.db.Exec(`DELETE FROM daily_usage WHERE token=?`, token)
-		if fp != "" {
-			h.db.Exec(`DELETE FROM fingerprints_banned WHERE fingerprint=?`, fp)
-		}
+		h.db.Exec(`DELETE FROM visits WHERE token=?`, token)
+		h.db.RecordEvent("delete", short+" deleted")
 	case "reset":
 		h.db.Exec(`UPDATE peers SET bytes_up=0, bytes_down=0 WHERE token=?`, token)
 		h.db.Exec(`DELETE FROM daily_usage WHERE token=?`, token)
 	case "expire":
 		h.db.Exec(`UPDATE peers SET status='expired' WHERE token=?`, token)
+	case "limits":
+		if r.Method == "GET" {
+			var sched string
+			var maxBps, quota int64
+			h.db.QueryRow(`SELECT COALESCE(schedule,''), COALESCE(max_bps,0), COALESCE(quota_bytes,0) FROM peers WHERE token=?`, token).Scan(&sched, &maxBps, &quota)
+			json.NewEncoder(w).Encode(map[string]any{"schedule": sched, "max_bps": maxBps, "quota_bytes": quota})
+			return
+		}
+		var req struct {
+			Schedule   string `json:"schedule"`
+			MaxBps     int64  `json:"max_bps"`
+			QuotaBytes int64  `json:"quota_bytes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		if !ValidateSchedule(req.Schedule) {
+			http.Error(w, "invalid schedule (e.g. \"Mon-Fri 0800-1800\")", 400)
+			return
+		}
+		if req.MaxBps < 0 || req.QuotaBytes < 0 {
+			http.Error(w, "limits must be >= 0", 400)
+			return
+		}
+		h.db.SetPeerLimits(token, strings.TrimSpace(req.Schedule), req.MaxBps, req.QuotaBytes)
+		h.db.RecordEvent("limits", short+" limits updated")
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
@@ -240,19 +319,23 @@ func (h *Handler) apiBlocklist(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.db.Exec(`INSERT OR REPLACE INTO blocklist(domain,reason) VALUES(?,?)`, req.Domain, req.Reason)
+		h.db.RecordEvent("blocklist", req.Domain+" blocked")
 	} else if r.Method == "DELETE" {
 		if req.Clear || req.Domain == "" {
 			h.db.Exec(`DELETE FROM blocklist`)
+			h.db.RecordEvent("blocklist", "blocklist cleared")
 		} else {
 			h.db.Exec(`DELETE FROM blocklist WHERE domain=?`, req.Domain)
+			h.db.RecordEvent("blocklist", req.Domain+" unblocked")
 		}
 	}
+	invalidateBlockCache()
 	w.Write([]byte(`{"ok":true}`))
 }
 
 func (h *Handler) apiStats(w http.ResponseWriter, r *http.Request) {
 	var totalUp, totalDown int64
-	var active, pending, banned, kicked, expired, blocked, total int
+	var active, pending, banned, kicked, expired, blocked, total, online int
 	h.db.QueryRow(`SELECT COALESCE(SUM(bytes_up),0), COALESCE(SUM(bytes_down),0) FROM peers`).Scan(&totalUp, &totalDown)
 	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='approved'`).Scan(&active)
 	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='pending'`).Scan(&pending)
@@ -261,10 +344,29 @@ func (h *Handler) apiStats(w http.ResponseWriter, r *http.Request) {
 	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='expired'`).Scan(&expired)
 	h.db.QueryRow(`SELECT COUNT(*) FROM peers`).Scan(&total)
 	h.db.QueryRow(`SELECT COUNT(*) FROM blocklist`).Scan(&blocked)
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE last_seen > datetime('now','-5 minutes')`).Scan(&online)
+
+	// Sessions by country (offline GeoIP on last seen source IP).
+	countries := map[string]int{}
+	if h.geo != nil {
+		rows, err := h.db.Query(`SELECT COALESCE(last_ip,'') FROM peers WHERE status='approved' AND last_ip != ''`)
+		if err == nil {
+			for rows.Next() {
+				var ip string
+				if rows.Scan(&ip) == nil {
+					if name := h.geo.CountryName(ip); name != "" {
+						countries[name]++
+					}
+				}
+			}
+			rows.Close()
+		}
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"total_up": totalUp, "total_down": totalDown,
 		"active": active, "pending": pending, "banned": banned,
 		"kicked": kicked, "expired": expired, "total": total, "blocked": blocked,
+		"online": online, "kill_switch": h.db.KillSwitch(), "countries": countries,
 	})
 }
 
@@ -307,7 +409,59 @@ func (h *Handler) apiAbuse(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) apiEvents(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(h.db.RecentEvents(50))
+}
+
+func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		json.NewEncoder(w).Encode(map[string]any{
+			"kill_switch": h.db.KillSwitch(),
+		})
+		return
+	}
+	var req struct {
+		KillSwitch *bool `json:"kill_switch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.KillSwitch == nil {
+		http.Error(w, "kill_switch required", 400)
+		return
+	}
+	h.db.SetKillSwitch(*req.KillSwitch)
+	if *req.KillSwitch {
+		h.db.RecordEvent("kill-switch", "all tunnel traffic suspended")
+	} else {
+		h.db.RecordEvent("kill-switch", "tunnel traffic resumed")
+	}
+	w.Write([]byte(`{"ok":true}`))
+}
+
+func (h *Handler) apiCategories(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		json.NewEncoder(w).Encode(h.db.Categories())
+		return
+	}
+	var req struct {
+		Category string `json:"category"`
+		Enabled  bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !h.db.SetCategoryEnabled(req.Category, req.Enabled) {
+		http.Error(w, "unknown category", 400)
+		return
+	}
+	state := "disabled"
+	if req.Enabled {
+		state = "enabled"
+	}
+	h.db.RecordEvent("category", req.Category+" blocking "+state)
+	w.Write([]byte(`{"ok":true}`))
+}
+
 func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
+	if !h.regAllowed(clientIP(r)) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
 	var req struct {
 		Token       string `json:"token"`
 		Fingerprint string `json:"fingerprint"`
@@ -323,10 +477,9 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token must be 16-1024 chars", 400)
 		return
 	}
-	// Check hard ban on fingerprint
-	var banned int
-	h.db.QueryRow(`SELECT COUNT(*) FROM fingerprints_banned WHERE fingerprint=?`, req.Fingerprint).Scan(&banned)
-	if banned > 0 {
+	// Hard ban on fingerprint OR device public key: a banned device cannot
+	// shed the ban by minting a fresh token.
+	if h.db.IdentityBanned(req.Fingerprint, strings.TrimSpace(req.SSHPubKey)) {
 		http.Error(w, "device banned", 403)
 		return
 	}
@@ -339,10 +492,12 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	res, _ := h.db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen) VALUES(?,?,?, ?, ?, datetime('now'), datetime('now'))`,
 		req.Token, req.Fingerprint, req.DeviceName, req.SSHPubKey, status)
 	if n, _ := res.RowsAffected(); n == 0 {
-		h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=COALESCE(ssh_pubkey,?) WHERE token=?`, req.SSHPubKey, req.Token)
+		h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=COALESCE(NULLIF(ssh_pubkey,''),?) WHERE token=?`, req.SSHPubKey, req.Token)
 		var existingStatus string
 		h.db.QueryRow(`SELECT status FROM peers WHERE token=?`, req.Token).Scan(&existingStatus)
 		status = existingStatus
+	} else {
+		h.db.RecordEvent("register", req.DeviceName+" registered ("+status+")")
 	}
 	json.NewEncoder(w).Encode(map[string]string{"status": status})
 }

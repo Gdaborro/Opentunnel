@@ -37,6 +37,7 @@ const (
 	StatusBanned      = 6
 	StatusKicked      = 7
 	StatusBlocked     = 8
+	StatusExpired     = 9
 
 	MuxMarker byte = 0x4D // 'M'
 	UdpMarker byte = 0x55 // 'U'

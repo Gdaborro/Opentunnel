@@ -15,6 +15,13 @@ var ErrBadToken = errors.New("protocol: authentication failed")
 
 type AuthStatus byte
 
+// AuthError reports a non-OK handshake status (pending, banned, expired…).
+type AuthError struct{ Status byte }
+
+func (e *AuthError) Error() string {
+	return fmt.Sprintf("protocol: server rejected handshake (status=%d)", e.Status)
+}
+
 func writeStatus(w io.Writer, status byte) error {
 	_, err := w.Write([]byte{ProtoVersion, status})
 	return err
@@ -36,48 +43,64 @@ func WriteHandshake(w io.Writer, token string) error {
 	return err
 }
 
+// StaticVerifier returns a verify func that constant-time compares the
+// presented token against one static secret (legacy/no-panel mode).
+func StaticVerifier(expected string) func(string) byte {
+	return func(token string) byte {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1 {
+			return StatusOK
+		}
+		return StatusBadToken
+	}
+}
+
 // ReadAndVerifyHandshake reads the peer handshake and replies with a status.
-// Token comparison is constant-time. It returns the error only for transport
-// problems; auth failures are reported via the returned status as well as
-// written to the wire.
-func ReadAndVerifyHandshake(r io.Reader, w io.Writer, expected string) (status byte, err error) {
+// verify maps the presented token to a response status, so the server can
+// apply policy (e.g. a panel DB lookup) instead of one shared secret.
+// Transport problems come back as errors; policy outcomes as statuses.
+// ErrBadToken is returned (as well as the status) for authentication
+// failures so probes remain distinguishable from pending/banned states.
+func ReadAndVerifyHandshake(r io.Reader, w io.Writer, verify func(token string) byte) (status byte, token string, err error) {
 	magic := make([]byte, len(Magic))
 	if _, err := io.ReadFull(r, magic); err != nil {
-		return StatusBadVersion, err
+		return StatusBadVersion, "", err
 	}
 	if string(magic) != string(Magic[:]) {
 		_ = writeStatus(w, StatusBadVersion)
-		return StatusBadVersion, ErrVersionMismatch
+		return StatusBadVersion, "", ErrVersionMismatch
 	}
 	ver := make([]byte, 1)
 	if _, err := io.ReadFull(r, ver); err != nil {
-		return StatusBadVersion, err
+		return StatusBadVersion, "", err
 	}
 	if ver[0] != ProtoVersion {
 		_ = writeStatus(w, StatusBadVersion)
-		return StatusBadVersion, ErrVersionMismatch
+		return StatusBadVersion, "", ErrVersionMismatch
 	}
 	lenb := make([]byte, 2)
 	if _, err := io.ReadFull(r, lenb); err != nil {
-		return StatusBadToken, err
+		return StatusBadToken, "", err
 	}
 	n := int(binary.BigEndian.Uint16(lenb))
 	if n == 0 || n > maxTokenLen {
 		_ = writeStatus(w, StatusBadToken)
-		return StatusBadToken, ErrBadToken
+		return StatusBadToken, "", ErrBadToken
 	}
-	token := make([]byte, n)
-	if _, err := io.ReadFull(r, token); err != nil {
-		return StatusBadToken, err
+	tok := make([]byte, n)
+	if _, err := io.ReadFull(r, tok); err != nil {
+		return StatusBadToken, "", err
 	}
-	if subtle.ConstantTimeCompare(token, []byte(expected)) != 1 {
-		_ = writeStatus(w, StatusBadToken)
-		return StatusBadToken, ErrBadToken
+	st := verify(string(tok))
+	if err := writeStatus(w, st); err != nil {
+		return st, "", err
 	}
-	if err := writeStatus(w, StatusOK); err != nil {
-		return StatusOK, err
+	if st == StatusBadToken {
+		return st, "", ErrBadToken
 	}
-	return StatusOK, nil
+	if st != StatusOK {
+		return st, "", nil
+	}
+	return StatusOK, string(tok), nil
 }
 
 func ReadAuthResponse(r io.Reader) error {
@@ -92,7 +115,7 @@ func ReadAuthResponse(r io.Reader) error {
 	case StatusOK:
 		return nil
 	default:
-		return fmt.Errorf("protocol: server rejected handshake (status=%d)", resp[1])
+		return &AuthError{Status: resp[1]}
 	}
 }
 

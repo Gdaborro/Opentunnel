@@ -101,7 +101,7 @@ func main() {
 	if stateDirForPanel == "" {
 		stateDirForPanel = "/var/lib/opentunnel"
 	}
-	panelDB, err := panel.Open(filepath.Join(stateDirForPanel, "panel.db"))
+	panelDB, err := panel.Open(filepath.Join(stateDirForPanel, "panel.db"), cfg.PurgeAfterDays)
 	if err != nil {
 		log.Printf("panel db: %v (panel disabled)", err)
 		panelDB = nil
@@ -129,7 +129,15 @@ func main() {
 				return h
 			}())
 		}
-		panelHandler = panel.New(panelDB, auth, cfg.AutoApprove).Handler()
+		geo := panel.OpenGeoIP(cfg.GeoIPDB)
+		if cfg.GeoIPDB != "" {
+			if geo != nil {
+				log.Printf("panel: geoip enabled (%s)", cfg.GeoIPDB)
+			} else {
+				log.Printf("panel: geoip db %s unreadable — country map disabled", cfg.GeoIPDB)
+			}
+		}
+		panelHandler = panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo).Handler()
 		if cfg.AutoApprove {
 			log.Printf("panel: auto_approve enabled — new devices register as approved")
 		}
@@ -148,6 +156,7 @@ func main() {
 		WSPath:                 cfg.WSPath,
 		PanelDB:                panelDB, // nil-safe: legacy mode when panel disabled
 		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
+		AllowLegacyMaster:      cfg.AllowLegacyMaster,
 	})
 	var handler http.Handler = baseHandler
 	if panelHandler != nil {

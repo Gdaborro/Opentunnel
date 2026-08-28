@@ -14,8 +14,11 @@ func TestWriteDefaultClientConfigRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.ServerAddr == "" || c.Token == "" || c.Fingerprint == "" {
+	if c.ServerAddr == "" || c.Fingerprint == "" {
 		t.Fatalf("default config incomplete: %+v", c)
+	}
+	if c.Token != "" {
+		t.Fatal("default config must NOT embed a shared token (per-device auth)")
 	}
 	if !c.FallbackSSHEnabled() {
 		t.Fatal("default config should enable fallback_ssh")

@@ -6,6 +6,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -20,6 +21,9 @@ type Options struct {
 	DialTimeout time.Duration // per-connection budget for handshake+target
 	Profile     string        // fast | balanced | stealth (shaping on our writes)
 	Mux         bool          // multiplex targets over pooled sessions
+	// OnAuthRejected is invoked when the server rejects the device token
+	// (unknown/purged/expired) so the caller can re-register with the panel.
+	OnAuthRejected func()
 }
 
 type Client struct {
@@ -50,6 +54,95 @@ func (c *Client) perDeviceToken() string {
 	return df.Token
 }
 
+// authCandidates orders the credentials to try at the handshake: an
+// explicitly configured shared token first (legacy/no-panel servers), then
+// the per-device token (panel mode). Fresh installs have no configured
+// token, so only the device token is tried — no shared secret in the binary.
+func (c *Client) authCandidates() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, t := range []string{c.opts.Token, c.perDeviceToken()} {
+		if t != "" && !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// dialAndAuth opens one transport connection and runs the handshake with
+// authTok. The caller owns the returned conn on success.
+func (c *Client) dialAndAuth(ctx context.Context, authTok string, timeout time.Duration) (net.Conn, error) {
+	raw, err := c.Transport.Dial(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("client: transport dial: %w", err)
+	}
+	_ = raw.SetDeadline(time.Now().Add(timeout))
+	if err := protocol.WriteHandshake(raw, authTok); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("client: handshake write: %w", err)
+	}
+	if err := protocol.ReadAuthResponse(raw); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	return raw, nil
+}
+
+// dialAuthenticated tries each auth candidate on a fresh connection until
+// one is accepted; a bad-token rejection falls through to the next candidate.
+func (c *Client) dialAuthenticated(ctx context.Context, timeout time.Duration) (net.Conn, string, error) {
+	candidates := c.authCandidates()
+	if len(candidates) == 0 {
+		return nil, "", errors.New("client: no auth token available")
+	}
+	for i, tok := range candidates {
+		raw, err := c.dialAndAuth(ctx, tok, timeout)
+		if err == nil {
+			return raw, tok, nil
+		}
+		var ae *protocol.AuthError
+		if !errors.As(err, &ae) {
+			return nil, "", err // transport/IO failure — surface unchanged
+		}
+		if ae.Status == protocol.StatusBadToken && i < len(candidates)-1 {
+			continue
+		}
+		return nil, "", c.mapAuthError(err)
+	}
+	return nil, "", errors.New("client: all auth candidates rejected")
+}
+
+// mapAuthError translates handshake rejections into typed client errors.
+// Unknown/expired tokens trigger re-registration: the device re-enters the
+// approval queue instead of failing forever.
+func (c *Client) mapAuthError(err error) error {
+	var ae *protocol.AuthError
+	if !errors.As(err, &ae) {
+		return fmt.Errorf("client: auth: %w", err)
+	}
+	switch ae.Status {
+	case protocol.StatusPending:
+		return &PendingError{Status: "pending"}
+	case protocol.StatusExpired:
+		if c.opts.OnAuthRejected != nil {
+			c.opts.OnAuthRejected()
+		}
+		return &PendingError{Status: "expired"}
+	case protocol.StatusBanned:
+		return &BlockedError{Kind: "banned", Reason: "device banned"}
+	case protocol.StatusBadToken:
+		// Token unknown to the panel (e.g. purged after inactivity):
+		// re-register and wait for approval.
+		if c.opts.OnAuthRejected != nil {
+			c.opts.OnAuthRejected()
+		}
+		return &PendingError{Status: "pending"}
+	default:
+		return fmt.Errorf("client: auth: %w", err)
+	}
+}
+
 // BlockedError is returned when the server blocks a domain or the peer is banned/kicked.
 // The proxy can serve a local block page instead of piping.
 type BlockedError struct {
@@ -72,30 +165,22 @@ func (e *PendingError) Error() string {
 // the resulting secure stream into mux mode; the returned conn is handed to
 // smux.Client.
 func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
-	raw, err := c.Transport.Dial(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("client: transport dial: %w", err)
-	}
 	timeout := c.opts.DialTimeout
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
+	raw, authTok, err := c.dialAuthenticated(ctx, timeout)
+	if err != nil {
+		return nil, err
+	}
 	_ = raw.SetDeadline(time.Now().Add(timeout))
 
-	if err := protocol.WriteHandshake(raw, c.opts.Token); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("client: handshake write: %w", err)
-	}
-	if err := protocol.ReadAuthResponse(raw); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("client: auth: %w", err)
-	}
 	salt := protocol.RandomSalt()
 	if err := protocol.WriteSalt(raw, salt); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: salt write: %w", err)
 	}
-	sec, err := protocol.ClientSideSecureStream(raw, c.opts.Token, salt, protocol.ProfileFor(c.opts.Profile))
+	sec, err := protocol.ClientSideSecureStream(raw, authTok, salt, protocol.ProfileFor(c.opts.Profile))
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: secure stream: %w", err)
@@ -236,30 +321,22 @@ func (c *Client) DialTunnel(ctx context.Context, target *protocol.Address) (net.
 // legacyConnect runs the v1-style flow: one transport connection per target;
 // the ATYP byte of the target request doubles as the implicit mode marker.
 func (c *Client) legacyConnect(ctx context.Context) (*protocol.SecureStream, error) {
-	raw, err := c.Transport.Dial(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("client: transport dial: %w", err)
-	}
 	timeout := c.opts.DialTimeout
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
+	raw, authTok, err := c.dialAuthenticated(ctx, timeout)
+	if err != nil {
+		return nil, err
+	}
 	_ = raw.SetDeadline(time.Now().Add(timeout))
 
-	if err := protocol.WriteHandshake(raw, c.opts.Token); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("client: handshake write: %w", err)
-	}
-	if err := protocol.ReadAuthResponse(raw); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("client: auth: %w", err)
-	}
 	salt := protocol.RandomSalt()
 	if err := protocol.WriteSalt(raw, salt); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: salt write: %w", err)
 	}
-	sec, err := protocol.ClientSideSecureStream(raw, c.opts.Token, salt, protocol.ProfileFor(c.opts.Profile))
+	sec, err := protocol.ClientSideSecureStream(raw, authTok, salt, protocol.ProfileFor(c.opts.Profile))
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: secure stream: %w", err)

@@ -102,7 +102,7 @@ func TestHandshakeRoundtrip(t *testing.T) {
 	var status byte
 	var err error
 	runWithTimeout(t, func() {
-		status, err = ReadAndVerifyHandshake(serverConn, serverConn, "secret-token")
+		status, _, err = ReadAndVerifyHandshake(serverConn, serverConn, StaticVerifier("secret-token"))
 	})
 	if err != nil || status != StatusOK {
 		t.Fatalf("handshake failed: status=%d err=%v", status, err)
@@ -130,10 +130,53 @@ func TestHandshakeRejectsWrongToken(t *testing.T) {
 	var status byte
 	var err error
 	runWithTimeout(t, func() {
-		status, err = ReadAndVerifyHandshake(serverConn, serverConn, "right")
+		status, _, err = ReadAndVerifyHandshake(serverConn, serverConn, StaticVerifier("right"))
 	})
 	if status != StatusBadToken || !errors.Is(err, ErrBadToken) {
 		t.Fatalf("expected bad-token rejection, got status=%d err=%v", status, err)
+	}
+}
+
+func TestHandshakePolicyStatuses(t *testing.T) {
+	cases := []struct {
+		name   string
+		verify func(string) byte
+		status byte
+	}{
+		{"pending", func(string) byte { return StatusPending }, StatusPending},
+		{"banned", func(string) byte { return StatusBanned }, StatusBanned},
+		{"expired", func(string) byte { return StatusExpired }, StatusExpired},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			clientConn, serverConn := tcpPipe(t)
+			defer clientConn.Close()
+			defer serverConn.Close()
+
+			clientErr := make(chan error, 1)
+			go func() {
+				_ = WriteHandshake(clientConn, "device-token")
+				clientErr <- ReadAuthResponse(clientConn)
+			}()
+
+			var status byte
+			var err error
+			runWithTimeout(t, func() {
+				status, _, err = ReadAndVerifyHandshake(serverConn, serverConn, c.verify)
+			})
+			if err != nil || status != c.status {
+				t.Fatalf("server side: status=%d err=%v, want %d", status, err, c.status)
+			}
+			select {
+			case cerr := <-clientErr:
+				var ae *AuthError
+				if !errors.As(cerr, &ae) || ae.Status != c.status {
+					t.Fatalf("client side: %v, want AuthError status=%d", cerr, c.status)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("client never saw rejection")
+			}
+		})
 	}
 }
 
@@ -155,7 +198,7 @@ func TestHandshakeRejectsBadMagic(t *testing.T) {
 	var status byte
 	var err error
 	runWithTimeout(t, func() {
-		status, err = ReadAndVerifyHandshake(serverConn, serverConn, "tok")
+		status, _, err = ReadAndVerifyHandshake(serverConn, serverConn, StaticVerifier("tok"))
 	})
 	if status != StatusBadVersion || !errors.Is(err, ErrVersionMismatch) {
 		t.Fatalf("expected version rejection, got status=%d err=%v", status, err)

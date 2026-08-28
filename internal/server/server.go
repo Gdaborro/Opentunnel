@@ -4,6 +4,8 @@
 package server
 
 import (
+	"context"
+	"crypto/subtle"
 	"io"
 	"log"
 	"net"
@@ -14,8 +16,10 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/xtaci/smux"
+	"golang.org/x/time/rate"
 
 	"opentunnel/internal/protocol"
+	"opentunnel/internal/server/decoy"
 )
 
 // deadlineRW is the read-write stream contract for target relaying.
@@ -32,7 +36,7 @@ func isWebSocketUpgrade(r *http.Request) bool {
 }
 
 type Options struct {
-	Token       string                // shared secret (fallback, also inner AEAD key)
+	Token       string                // shared secret (no-panel mode; legacy fallback when AllowLegacyMaster)
 	WSPath      string                // websocket endpoint path (default /ws)
 	Logger      *log.Logger           // nil = std log
 	DecoyHTML   []byte                // served to non-tunnel requests
@@ -41,10 +45,17 @@ type Options struct {
 	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
 	// private, link-local/metadata, CGNAT ranges). Off by default.
 	AllowRestrictedTargets bool
-	PanelDB                interface { // optional panel DB for per-token checks
+	// AllowLegacyMaster accepts the shared master token at the handshake
+	// (migration aid while clients move to per-device tokens). The token is
+	// never shipped in client binaries.
+	AllowLegacyMaster bool
+	PanelDB           interface { // optional panel DB for per-token checks
 		CheckToken(token string) (status, reason, kickExpires string, err error)
 		RecordTraffic(token string, up, down int64)
 		IsBlocked(domain string) bool
+		KillSwitch() bool
+		PeerLimits(token string) (maxBps, quotaBytes int64)
+		SetPeerIP(token, ip string)
 	}
 }
 
@@ -83,30 +94,24 @@ func Handler(opt Options) http.Handler {
 	if path[0] != '/' {
 		path = "/" + path
 	}
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		page := opt.DecoyHTML
-		if page == nil {
-			page = []byte(DefaultDecoy)
-		}
-		_, _ = w.Write(page)
-	})
+	decoyHandler := decoy.Handler(opt.DecoyHTML)
+	mux.Handle("/", decoyHandler)
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 		release := opt.guard().Acquire(addrHost(r.RemoteAddr))
 		if release == nil {
 			// Over limit or banned: indistinguishable from the normal site.
-			page := opt.DecoyHTML
-			if page == nil {
-				page = []byte(DefaultDecoy)
-			}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write(page)
+			decoyHandler.ServeHTTP(w, r)
 			return
 		}
 		defer release()
 
 		if !isWebSocketUpgrade(r) {
 			http.NotFound(w, r)
+			return
+		}
+		// Global kill switch: refuse new tunnels outright.
+		if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -122,14 +127,46 @@ func Handler(opt Options) http.Handler {
 	return mux
 }
 
+// verifyHandshakeToken maps a presented handshake token to a protocol
+// status. With a panel DB the token is the client's per-device token and is
+// validated against the panel (approval is the gate â€” no shared secret in
+// the client binary). Without a panel, the static shared token is used.
+func (o Options) verifyHandshakeToken(tok string) byte {
+	if o.PanelDB == nil {
+		return protocol.StaticVerifier(o.Token)(tok)
+	}
+	if o.AllowLegacyMaster && subtle.ConstantTimeCompare([]byte(tok), []byte(o.Token)) == 1 {
+		return protocol.StatusOK // migration window for pre-device-token clients
+	}
+	status, _, _, _ := o.PanelDB.CheckToken(tok)
+	switch status {
+	case "approved", "kicked": // kicked: grace + block page handled in-channel
+		return protocol.StatusOK
+	case "pending":
+		return protocol.StatusPending
+	case "expired":
+		return protocol.StatusExpired
+	case "banned":
+		return protocol.StatusBanned
+	default:
+		return protocol.StatusBadToken
+	}
+}
+
 func handleSession(stream net.Conn, opt Options) {
 	defer stream.Close()
 
 	_ = stream.SetDeadline(time.Now().Add(15 * time.Second))
-	status, err := protocol.ReadAndVerifyHandshake(stream, stream, opt.Token)
+	status, authTok, err := protocol.ReadAndVerifyHandshake(stream, stream, opt.verifyHandshakeToken)
 	if err != nil || status != protocol.StatusOK {
-		opt.guard().Punish(addrHost(stream.RemoteAddr()))
-		opt.logger().Printf("server: handshake rejected: %v", err)
+		// Punish only genuine auth failures: pending/banned/expired peers
+		// retry as part of normal flow and must not trip IP bans.
+		if status == protocol.StatusBadToken || status == protocol.StatusBadVersion || err != nil {
+			opt.guard().Punish(addrHost(stream.RemoteAddr()))
+		}
+		if err != nil {
+			opt.logger().Printf("server: handshake rejected: %v", err)
+		}
 		return
 	}
 
@@ -147,7 +184,9 @@ func handleSession(stream net.Conn, opt Options) {
 		return
 	}
 
-	sec, err := protocol.ServerSideSecureStream(stream, opt.Token, salt)
+	// AEAD keys derive from the handshake token: the per-device token in
+	// panel mode (per-device keys), the master token in legacy mode.
+	sec, err := protocol.ServerSideSecureStream(stream, authTok, salt)
 	if err != nil {
 		return
 	}
@@ -157,6 +196,12 @@ func handleSession(stream net.Conn, opt Options) {
 	if err != nil {
 		opt.logger().Printf("server: bad client token: %v", err)
 		return
+	}
+	if clientToken == "" {
+		clientToken = authTok // very old clients: handshake token doubles as panel token
+	}
+	if opt.PanelDB != nil {
+		go opt.PanelDB.SetPeerIP(clientToken, addrHost(stream.RemoteAddr()))
 	}
 	var peerStatus = "approved"
 	var peerReason string
@@ -218,6 +263,12 @@ func handleSession(stream net.Conn, opt Options) {
 // sessions and by every multiplexed stream. Traffic is recorded per-token.
 func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string) {
 	defer rw.Close()
+	// Global kill switch: block every new stream while suspended.
+	if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
+		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteToken(rw, "blocked:service suspended (kill switch)")
+		return
+	}
 	// ISP-level ban/kick handling
 	if peerStatus == "banned" {
 		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
@@ -293,14 +344,30 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	// high-BDP paths; both directions must finish before teardown.
 	buf1 := make([]byte, 256*1024)
 	buf2 := make([]byte, 256*1024)
+
+	// Per-device bandwidth cap (QoS): one shared token bucket paces both
+	// directions of this stream. 0 = unlimited.
+	var dst1, dst2 io.Writer = upstream, rw
+	if opt.PanelDB != nil && token != "" {
+		if maxBps, _ := opt.PanelDB.PeerLimits(token); maxBps > 0 {
+			burst := int(maxBps)
+			if burst < len(buf1) {
+				burst = len(buf1)
+			}
+			lim := rate.NewLimiter(rate.Limit(maxBps), burst)
+			dst1 = &limitedWriter{w: upstream, lim: lim}
+			dst2 = &limitedWriter{w: rw, lim: lim}
+		}
+	}
+
 	var n1, n2 int64
 	done := make(chan struct{}, 2)
 	go func() {
-		n1, _ = io.CopyBuffer(upstream, rw, buf1)
+		n1, _ = io.CopyBuffer(dst1, rw, buf1)
 		done <- struct{}{}
 	}()
 	go func() {
-		n2, _ = io.CopyBuffer(rw, upstream, buf2)
+		n2, _ = io.CopyBuffer(dst2, upstream, buf2)
 		done <- struct{}{}
 	}()
 	<-done
@@ -313,6 +380,21 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 // maxStreamsPerSession bounds concurrent smux streams on one tunnel session
 // so an authenticated client cannot exhaust memory/fds by opening streams.
 const maxStreamsPerSession = 256
+
+// limitedWriter paces writes through a shared token bucket (per-device QoS).
+type limitedWriter struct {
+	w   io.Writer
+	lim *rate.Limiter
+}
+
+func (l *limitedWriter) Write(p []byte) (int, error) {
+	if n := len(p); n > 0 {
+		if err := l.lim.WaitN(context.Background(), n); err != nil {
+			return 0, err
+		}
+	}
+	return l.w.Write(p)
+}
 
 // serveMuxSession upgrades an authenticated secure stream into a smux
 // session; every stream inside carries one relayTarget exchange.
@@ -332,7 +414,7 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 		select {
 		case sem <- struct{}{}:
 		default:
-			o.logger().Printf("server: stream cap (%d) reached — dropping stream", maxStreamsPerSession)
+			o.logger().Printf("server: stream cap (%d) reached â€” dropping stream", maxStreamsPerSession)
 			stream.Close()
 			continue
 		}
@@ -364,40 +446,3 @@ func shortToken(t string) string {
 	}
 	return t
 }
-
-const DefaultDecoy = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Aborro — Systems &amp; Cloud</title>
-<meta name="description" content="Aborro Systems — small team, cloud infrastructure, private networking, Oracle Cloud specialist.">
-<style>
-:root{--bg:#f8fafc;--card:#ffffff;--text:#0f172a;--muted:#64748b;--line:#e2e8f0}
-*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.6}
-header{max-width:960px;margin:0 auto;padding:28px 20px;display:flex;justify-content:space-between;align-items:center}
-nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:0.9rem}
-nav a:hover{color:var(--text)}
-.hero{max-width:960px;margin:24px auto;padding:28px 20px;display:grid;grid-template-columns:1.2fr 0.8fr;gap:24px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(15,23,42,0.04)}
-h1{margin:0 0 8px;font-size:1.8rem;letter-spacing:-0.02em}p{margin:0;color:var(--muted)}
-.grid{max-width:960px;margin:0 auto;padding:0 20px;display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
-.footer{max-width:960px;margin:32px auto;padding:0 20px;color:var(--muted);font-size:0.85em}
-@media(max-width:800px){.hero{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<header><div style="font-weight:700;letter-spacing:-0.02em">aborro<span style="color:#6366f1">.systems</span></div><nav><a href="/">Home</a><a href="/about">About</a><a href="/contact">Contact</a></nav></header>
-<section class="hero">
-  <div class="card"><h1>Infrastructure, quietly done.</h1><p>We run small, reliable workloads on Oracle Cloud — Terraform, observability, and private links. No tracking, no ads. Just systems that stay up.</p><p style="margin-top:12px"><a href="/contact" style="display:inline-block;background:#0f172a;color:white;padding:8px 12px;border-radius:8px;text-decoration:none">Get in touch</a></p></div>
-  <div class="card"><h3 style="margin:0 0 8px">Status</h3><p>All systems operational. Last deploy: 2026-08-27. Uptime 99.9%.</p><p style="margin-top:8px;color:#10b981">● cdn.aborro.dev — edge</p><p>● vpn.aborro.dev — relay</p></div>
-</section>
-<section class="grid">
-  <div class="card"><h3>Cloud</h3><p>Oracle Cloud, region ap-sydney-1. Minimal foot print, auto-patched, log-rotated.</p></div>
-  <div class="card"><h3>Security</h3><p>ACME TLS, strict headers, daily apt upgrades, unattended reboots.</p></div>
-  <div class="card"><h3>Contact</h3><p>hello@aborro.dev — Sydney, AU. We reply within a day.</p></div>
-</section>
-<footer class="footer">© 2026 Aborro Systems Pty Ltd · ABN 12 345 678 901 · Sydney</footer>
-</body>
-</html>
-`

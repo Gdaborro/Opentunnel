@@ -2,6 +2,7 @@ package panel
 
 import (
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 
@@ -12,7 +13,7 @@ type DB struct {
 	*sql.DB
 }
 
-func Open(path string) (*DB, error) {
+func Open(path string, purgeAfterDays int) (*DB, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
@@ -20,7 +21,7 @@ func Open(path string) (*DB, error) {
 	if err := migrate(db); err != nil {
 		return nil, err
 	}
-	go reaper(db)
+	go reaper(db, purgeAfterDays)
 	return &DB{db}, nil
 }
 
@@ -56,6 +57,17 @@ func migrate(db *sql.DB) error {
 		reason TEXT,
 		banned_at DATETIME NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS pubkeys_banned (
+		pubkey TEXT PRIMARY KEY,
+		reason TEXT,
+		banned_at DATETIME NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS events (
+		id INTEGER PRIMARY KEY,
+		kind TEXT NOT NULL,
+		detail TEXT,
+		at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	CREATE TABLE IF NOT EXISTS visits (
 		token TEXT NOT NULL,
 		domain TEXT NOT NULL,
@@ -73,39 +85,178 @@ func migrate(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_peers_status ON peers(status);
 	CREATE INDEX IF NOT EXISTS idx_peers_fingerprint ON peers(fingerprint);
 	CREATE INDEX IF NOT EXISTS idx_visits_domain ON visits(domain);
+	CREATE TABLE IF NOT EXISTS settings (
+		key TEXT PRIMARY KEY,
+		value TEXT
+	);
+	CREATE TABLE IF NOT EXISTS blocked_categories (
+		category TEXT PRIMARY KEY,
+		enabled INTEGER NOT NULL DEFAULT 0
+	);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Idempotent column additions (SQLite has no ALTER … IF NOT EXISTS).
+	for _, col := range []struct{ name, def string }{
+		{"schedule", "TEXT DEFAULT ''"},
+		{"max_bps", "INTEGER DEFAULT 0"},
+		{"quota_bytes", "INTEGER DEFAULT 0"},
+		{"last_ip", "TEXT DEFAULT ''"},
+	} {
+		var n int
+		db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name=?`, col.name).Scan(&n)
+		if n == 0 {
+			if _, err := db.Exec(`ALTER TABLE peers ADD COLUMN ` + col.name + ` ` + col.def); err != nil {
+				return err
+			}
+		}
+	}
+	// Seed the built-in categories (disabled until an admin enables them).
+	for cat := range categoryLists {
+		db.Exec(`INSERT OR IGNORE INTO blocked_categories(category,enabled) VALUES(?,0)`, cat)
+	}
+	return nil
 }
 
-func reaper(db *sql.DB) {
+// reaper purges devices that have not connected within purgeAfterDays so
+// stale devices must re-register and be re-approved, and releases expired
+// kicks. Banned peers are kept (their identities stay blocked).
+func reaper(db *sql.DB, purgeAfterDays int) {
+	if purgeAfterDays <= 0 {
+		purgeAfterDays = 14
+	}
+	window := fmt.Sprintf("-%d days", purgeAfterDays)
 	ticker := time.NewTicker(1 * time.Hour)
 	for range ticker.C {
-		db.Exec(`UPDATE peers SET status='expired' WHERE status='approved' AND last_seen < datetime('now', '-10 days')`)
-		db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE status='kicked' AND kick_expires < datetime('now')`)
+		db.Exec(`DELETE FROM peers WHERE status IN ('approved','pending','expired','kicked') AND last_seen < datetime('now', ?)`, window)
+		db.Exec(`DELETE FROM visits WHERE token NOT IN (SELECT token FROM peers)`)
+		db.Exec(`DELETE FROM daily_usage WHERE token NOT IN (SELECT token FROM peers)`)
+		db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE status='kicked' AND kick_expires IS NOT NULL AND kick_expires < datetime('now')`)
+		db.Exec(`DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 500)`)
 	}
 }
 
+// RecordEvent appends to the panel event feed (pruned by the reaper).
+func (db *DB) RecordEvent(kind, detail string) {
+	db.Exec(`INSERT INTO events(kind,detail,at) VALUES(?,?,datetime('now'))`, kind, detail)
+}
+
+// RecentEvents returns the newest events for the panel feed.
+func (db *DB) RecentEvents(limit int) []map[string]string {
+	if limit <= 0 {
+		limit = 30
+	}
+	rows, err := db.Query(`SELECT kind, detail, at FROM events ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := []map[string]string{}
+	for rows.Next() {
+		var k, d, at string
+		if rows.Scan(&k, &d, &at) == nil {
+			out = append(out, map[string]string{"kind": k, "detail": d, "at": at})
+		}
+	}
+	return out
+}
+
+// BanIdentity blocks the peer's fingerprint and device public key so a ban
+// cannot be shed by re-registering with a fresh token on the same device.
+func (db *DB) BanIdentity(token, reason string) {
+	var fp, pub string
+	if err := db.QueryRow(`SELECT fingerprint, COALESCE(ssh_pubkey,'') FROM peers WHERE token=?`, token).Scan(&fp, &pub); err != nil {
+		return
+	}
+	if fp != "" {
+		db.Exec(`INSERT OR REPLACE INTO fingerprints_banned(fingerprint,reason,banned_at) VALUES(?,?,datetime('now'))`, fp, reason)
+	}
+	if pub != "" {
+		db.Exec(`INSERT OR REPLACE INTO pubkeys_banned(pubkey,reason,banned_at) VALUES(?,?,datetime('now'))`, pub, reason)
+	}
+}
+
+// UnbanIdentity clears the identity blocks for a peer (fingerprint + key).
+func (db *DB) UnbanIdentity(token string) {
+	var fp, pub string
+	if err := db.QueryRow(`SELECT fingerprint, COALESCE(ssh_pubkey,'') FROM peers WHERE token=?`, token).Scan(&fp, &pub); err != nil {
+		return
+	}
+	if fp != "" {
+		db.Exec(`DELETE FROM fingerprints_banned WHERE fingerprint=?`, fp)
+	}
+	if pub != "" {
+		db.Exec(`DELETE FROM pubkeys_banned WHERE pubkey=?`, pub)
+	}
+}
+
+// IdentityBanned reports whether a fingerprint or device public key is banned.
+func (db *DB) IdentityBanned(fingerprint, pubkey string) bool {
+	var n int
+	if fingerprint != "" {
+		db.QueryRow(`SELECT COUNT(*) FROM fingerprints_banned WHERE fingerprint=?`, fingerprint).Scan(&n)
+		if n > 0 {
+			return true
+		}
+	}
+	if pubkey != "" {
+		db.QueryRow(`SELECT COUNT(*) FROM pubkeys_banned WHERE pubkey=?`, pubkey).Scan(&n)
+		if n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// identityBanReason returns the stored reason for an identity ban.
+func (db *DB) identityBanReason(fingerprint, pubkey string) string {
+	var r string
+	if fingerprint != "" {
+		if db.QueryRow(`SELECT COALESCE(reason,'') FROM fingerprints_banned WHERE fingerprint=?`, fingerprint).Scan(&r) == nil && r != "" {
+			return r
+		}
+	}
+	if pubkey != "" {
+		if db.QueryRow(`SELECT COALESCE(reason,'') FROM pubkeys_banned WHERE pubkey=?`, pubkey).Scan(&r) == nil && r != "" {
+			return r
+		}
+	}
+	return "device identity banned"
+}
+
 type Peer struct {
-	Token       string
-	Fingerprint string
-	DeviceName  string
-	Status      string
-	CreatedAt   time.Time
-	LastSeen    time.Time
-	ExpiresAt   *time.Time
-	BytesUp     int64
-	BytesDown   int64
-	KickExpires *time.Time
-	KickReason  string
-	BanReason   string
-	BanDuration string
+	Token       string     `json:"token"`
+	Fingerprint string     `json:"fingerprint"`
+	DeviceName  string     `json:"device_name"`
+	Status      string     `json:"status"`
+	CreatedAt   time.Time  `json:"created_at"`
+	LastSeen    time.Time  `json:"last_seen"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	BytesUp     int64      `json:"bytes_up"`
+	BytesDown   int64      `json:"bytes_down"`
+	KickExpires *time.Time `json:"kick_expires,omitempty"`
+	KickReason  string     `json:"kick_reason,omitempty"`
+	BanReason   string     `json:"ban_reason,omitempty"`
+	BanDuration string     `json:"ban_duration,omitempty"`
+	LastIP      string     `json:"last_ip,omitempty"`
+	Country     string     `json:"country,omitempty"`
 }
 
 func (db *DB) CheckToken(token string) (status, reason, kickExpires string, err error) {
-	var s, kr, br, ke string
-	err = db.QueryRow(`SELECT status, COALESCE(kick_reason,''), COALESCE(ban_reason,''), COALESCE(kick_expires,'') FROM peers WHERE token=?`, token).Scan(&s, &kr, &br, &ke)
+	var s, kr, br, ke, fp, pub, sched string
+	var quota, up, down int64
+	err = db.QueryRow(`SELECT status, COALESCE(kick_reason,''), COALESCE(ban_reason,''), COALESCE(kick_expires,''), fingerprint, COALESCE(ssh_pubkey,''), COALESCE(schedule,''), COALESCE(quota_bytes,0), COALESCE(bytes_up,0), COALESCE(bytes_down,0) FROM peers WHERE token=?`, token).Scan(&s, &kr, &br, &ke, &fp, &pub, &sched, &quota, &up, &down)
 	if err != nil {
 		return "pending", "", "", nil
+	}
+	// Identity bans trump peer status: a banned device stays banned even if
+	// its row was manipulated back to approved.
+	if db.IdentityBanned(fp, pub) {
+		if br == "" {
+			br = db.identityBanReason(fp, pub)
+		}
+		return "banned", br, "", nil
 	}
 	if s == "banned" {
 		return "banned", br, "", nil
@@ -116,7 +267,13 @@ func (db *DB) CheckToken(token string) (status, reason, kickExpires string, err 
 	if s == "pending" || s == "expired" {
 		return s, "", "", nil
 	}
-	// approved — update last_seen
+	// approved — ISP controls: data quota, then access schedule.
+	if quota > 0 && up+down >= quota {
+		return "kicked", "data quota exceeded", "", nil
+	}
+	if !scheduleAllows(sched, time.Now()) {
+		return "kicked", "outside allowed hours (schedule)", nextScheduleStart(sched, time.Now()).Format("2006-01-02 15:04:05"), nil
+	}
 	db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, token)
 	return "approved", "", "", nil
 }
@@ -157,20 +314,7 @@ func (db *DB) IsBlocked(domain string) bool {
 	if domain == "" {
 		return false
 	}
-	rows, err := db.Query(`SELECT domain FROM blocklist`)
-	if err != nil {
-		return false
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var d string
-		if err := rows.Scan(&d); err != nil {
-			continue
-		}
-		d = strings.ToLower(strings.TrimSpace(d))
-		if d == "" {
-			continue
-		}
+	for _, d := range db.blockedSuffixes() {
 		if domain == d || strings.HasSuffix(domain, "."+d) {
 			return true
 		}
