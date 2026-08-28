@@ -129,7 +129,10 @@ func main() {
 				return h
 			}())
 		}
-		panelHandler = panel.New(panelDB, auth).Handler()
+		panelHandler = panel.New(panelDB, auth, cfg.AutoApprove).Handler()
+		if cfg.AutoApprove {
+			log.Printf("panel: auto_approve enabled — new devices register as approved")
+		}
 		panelHost := cfg.Host
 		if len(acmeDomains) > 0 {
 			panelHost = acmeDomains[0]

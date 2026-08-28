@@ -20,6 +20,7 @@ type Server struct {
 	AcmeDomain     string `toml:"acme_domain"` // optional: obtain/renew a public LE cert (TLS-ALPN)
 	WSPath         string `toml:"ws_path"`     // default "/ws"
 	Host           string `toml:"host"`        // public hostname, used for self-signed CN
+	AutoApprove    bool   `toml:"auto_approve"` // new device registrations start approved (no manual gate)
 }
 
 type ClientConf struct {
@@ -121,9 +122,12 @@ token = "CHANGE_ME_LONG_RANDOM_SECRET"
 cert_file = ""
 key_file  = ""
 # Public hostname clients will connect to (used for self-signed cert CN):
-host = "example.com"
-ws_path = "/ws"
-`
+	host = "example.com"
+	ws_path = "/ws"
+	# When true, newly registering devices start approved (no manual gate).
+	# Default false: every new device waits for admin approval.
+	auto_approve = false
+	`
 	return writeFile(path, t)
 }
 

@@ -12,14 +12,15 @@ import (
 var _ = time.Second // peers carry time.Time fields
 
 type Handler struct {
-	db   *DB
-	auth *Auth
-	tmpl *template.Template
+	db          *DB
+	auth        *Auth
+	tmpl        *template.Template
+	autoApprove bool
 }
 
-func New(db *DB, auth *Auth) *Handler {
+func New(db *DB, auth *Auth, autoApprove bool) *Handler {
 	tmpl := template.Must(template.ParseFS(templateFS, "templates/*.html"))
-	return &Handler{db: db, auth: auth, tmpl: tmpl}
+	return &Handler{db: db, auth: auth, tmpl: tmpl, autoApprove: autoApprove}
 }
 
 func (h *Handler) Mount(mux *http.ServeMux) {
@@ -311,6 +312,9 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	// Check if admin key matches (insta-approve)
 	status := "pending"
+	if h.autoApprove {
+		status = "approved"
+	}
 	if req.AdminKey != "" && isAdminKey(req.AdminKey) {
 		status = "approved"
 	}
