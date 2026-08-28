@@ -161,27 +161,32 @@ func main() {
 	default:
 		fmt.Println("[i] transport: ws-tls")
 		// Optional last-resort tier: if every ws-tls tier is intercepted,
-		// try tunneling inside real SSH before giving up.
+		// try tunneling inside real SSH before giving up. New devices do not
+		// have the key — only add the tier when the key file actually exists.
 		if cfg.FallbackSSHEnabled() && cfg.SSHKey != "" {
-			internal := cfg.SSHInternal
-			if internal == "" {
-				internal = "127.0.0.1:8081"
-			}
-			user := cfg.SSHUser
-			if user == "" {
-				user = "ubuntu"
-			}
-			sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
-			dialer.EnableSSHFallback(func() transport.Transport {
-				return transport.NewSSH(transport.SSHOptions{
-					Host:       sshAddr,
-					User:       user,
-					KeyFile:    cfg.SSHKey,
-					InternalWS: internal,
-					WSPath:     cfg.WSPath,
+			if _, err := os.Stat(cfg.SSHKey); err != nil {
+				fmt.Printf("[i] ssh_key %q not found — skipping ssh fallback tier (ws-tls only)\n", cfg.SSHKey)
+			} else {
+				internal := cfg.SSHInternal
+				if internal == "" {
+					internal = "127.0.0.1:8081"
+				}
+				user := cfg.SSHUser
+				if user == "" {
+					user = "ubuntu"
+				}
+				sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
+				dialer.EnableSSHFallback(func() transport.Transport {
+					return transport.NewSSH(transport.SSHOptions{
+						Host:       sshAddr,
+						User:       user,
+						KeyFile:    cfg.SSHKey,
+						InternalWS: internal,
+						WSPath:     cfg.WSPath,
+					})
 				})
-			})
-			fmt.Println("[i] ssh fallback tier enabled (last resort)")
+				fmt.Println("[i] ssh fallback tier enabled (last resort)")
+			}
 		}
 	}
 

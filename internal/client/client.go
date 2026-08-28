@@ -59,6 +59,15 @@ type BlockedError struct {
 
 func (e *BlockedError) Error() string { return e.Kind + ": " + e.Reason }
 
+// PendingError means the device token is registered but not yet approved
+// (or expired). It is terminal for the adaptive ladder: no other transport
+// tier can help, so callers must not escalate.
+type PendingError struct{ Status string }
+
+func (e *PendingError) Error() string {
+	return "client: device " + e.Status + " — waiting for approval at the panel"
+}
+
 // muxSessionFactory performs the full authenticated handshake and switches
 // the resulting secure stream into mux mode; the returned conn is handed to
 // smux.Client.
@@ -101,20 +110,16 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 		sec.Close()
 		return nil, fmt.Errorf("client: token response: %w", err)
 	} else if resp != "ok" {
-		// Handle ISP-level states: banned/kicked should still establish session but every request will be blocked with page
+		// Handle ISP-level states: banned/kicked still establish the session but every request will be blocked with a page
 		if resp == "pending" || resp == "expired" {
 			sec.Close()
-			return nil, fmt.Errorf("client: token %s", resp)
+			return nil, &PendingError{Status: resp}
 		}
-		if len(resp) > 7 && (resp[:7] == "banned:" || resp[:7] == "kicked:") {
+		if len(resp) >= 7 && (resp[:7] == "banned:" || resp[:7] == "kicked:") {
 			c.mu.Lock()
 			c.banInfo = resp
 			c.mu.Unlock()
 			// Still establish mux session, but future dials will be blocked until unban
-		} else if resp[:8] == "kicked:" {
-			c.mu.Lock()
-			c.banInfo = resp
-			c.mu.Unlock()
 		} else {
 			sec.Close()
 			return nil, fmt.Errorf("client: token %s", resp)
@@ -270,7 +275,7 @@ func (c *Client) legacyConnect(ctx context.Context) (*protocol.SecureStream, err
 	} else if resp != "ok" {
 		if resp == "pending" || resp == "expired" {
 			sec.Close()
-			return nil, fmt.Errorf("client: token %s", resp)
+			return nil, &PendingError{Status: resp}
 		}
 		if len(resp) >= 7 && (resp[:7] == "banned:" || resp[:7] == "kicked:") {
 			c.mu.Lock()

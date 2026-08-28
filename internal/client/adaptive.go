@@ -140,12 +140,21 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 func (a *Adaptive) build(idx int) *Client { return a.factory(a, idx) }
 
 // fatalUpstream reports errors that indicate the tunnel works but the target
-// is unreachable — escalating profiles cannot help.
+// is unreachable — escalating profiles cannot help. Pending/expired device
+// tokens and ISP blocks are also terminal: no transport tier can fix them.
 func fatalUpstream(err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var pend *PendingError
+	if errors.As(err, &pend) {
+		return true
+	}
+	var be *BlockedError
+	if errors.As(err, &be) {
 		return true
 	}
 	var pe *protocol.StatusError

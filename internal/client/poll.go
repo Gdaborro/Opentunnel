@@ -39,36 +39,44 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 }
 
 func PollTokenStatus(cfg *config.ClientConf, device *deviceFile) {
+	// Give the fire-and-forget registration a moment to land, then check
+	// immediately so a fresh device sees its pending notice right away.
+	time.Sleep(3 * time.Second)
+	checkOnce(cfg, device)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		status, kickReason, banReason, kickExpires, err := checkTokenStatus(cfg, device.Token)
-		if err != nil {
-			continue
-		}
-		switch status {
-		case "kicked":
-			fmt.Printf("\n[NOTICE] You have been kicked: %s — disconnecting in 10 minutes (until %s)\n", kickReason, kickExpires)
-			time.AfterFunc(10*time.Minute, func() {
-				fmt.Println("Kick grace period ended — disconnecting.")
-				// Hard exit after grace
-				// Note: main context will be cancelled via signal, but we force
-				panic("kicked")
-			})
-		case "banned":
-			fmt.Printf("\n[BANNED] %s\n", banReason)
-			// Persist hard ban
-			ts, _ := NewTokenStore()
-			ts.WriteHardBan(banReason, "permanent")
-			// Serve ban page locally and exit
-			serveBanPage(banReason)
-		case "pending":
-			fmt.Println("[*] Token pending approval — waiting for admin...")
-		case "expired":
-			fmt.Println("[*] Token expired after 10 days inactivity — regenerating...")
-			ts, _ := NewTokenStore()
-			ts.LoadOrCreate() // will generate new if expired
-		}
+		checkOnce(cfg, device)
+	}
+}
+
+func checkOnce(cfg *config.ClientConf, device *deviceFile) {
+	status, kickReason, banReason, kickExpires, err := checkTokenStatus(cfg, device.Token)
+	if err != nil {
+		return
+	}
+	switch status {
+	case "kicked":
+		fmt.Printf("\n[NOTICE] You have been kicked: %s — disconnecting in 10 minutes (until %s)\n", kickReason, kickExpires)
+		time.AfterFunc(10*time.Minute, func() {
+			fmt.Println("Kick grace period ended — disconnecting.")
+			// Hard exit after grace
+			// Note: main context will be cancelled via signal, but we force
+			panic("kicked")
+		})
+	case "banned":
+		fmt.Printf("\n[BANNED] %s\n", banReason)
+		// Persist hard ban
+		ts, _ := NewTokenStore()
+		ts.WriteHardBan(banReason, "permanent")
+		// Serve ban page locally and exit
+		serveBanPage(banReason)
+	case "pending":
+		fmt.Printf("[*] Token pending approval — waiting for admin (approve at https://%s/admin/)\n", cfg.ServerAddr)
+	case "expired":
+		fmt.Println("[*] Token expired after 10 days inactivity — regenerating...")
+		ts, _ := NewTokenStore()
+		ts.LoadOrCreate() // will generate new if expired
 	}
 }
 
