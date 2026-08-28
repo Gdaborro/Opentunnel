@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"time"
 
 	"opentunnel/internal/client"
@@ -39,12 +40,37 @@ func main() {
 		return
 	}
 
+	// Standalone mode: when -c is not given explicitly, look for client.toml
+	// next to the executable (not the working directory) and create it from
+	// built-in defaults on first run.
+	cfgExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "c" {
+			cfgExplicit = true
+		}
+	})
+	if !cfgExplicit {
+		if exe, err := os.Executable(); err == nil {
+			if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+				exe = resolved
+			}
+			*cfgPath = filepath.Join(filepath.Dir(exe), *cfgPath)
+		}
+	}
+
 	if *genConfig {
 		if err := config.WriteClientTemplate(*cfgPath); err != nil {
 			log.Fatal(err)
 		}
 		fmt.Printf("template written to %s\n", *cfgPath)
 		return
+	}
+
+	if _, err := os.Stat(*cfgPath); os.IsNotExist(err) {
+		if werr := config.WriteDefaultClientConfig(*cfgPath); werr != nil {
+			log.Fatalf("write default config: %v", werr)
+		}
+		fmt.Printf("[i] no config found — wrote default settings to %s\n", *cfgPath)
 	}
 
 	mgr, mgrErr := netenv.NewManager()
@@ -72,6 +98,11 @@ func main() {
 	cfg, err := config.LoadClient(*cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+	// Relative ssh_key paths are resolved against the config file's
+	// directory, so a key dropped next to the exe/config just works.
+	if cfg.SSHKey != "" && !filepath.IsAbs(cfg.SSHKey) {
+		cfg.SSHKey = filepath.Join(filepath.Dir(*cfgPath), cfg.SSHKey)
 	}
 
 	// Per-device token (10-day inactivity expiry, hard ban persistence)

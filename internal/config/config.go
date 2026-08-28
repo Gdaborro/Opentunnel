@@ -127,6 +127,34 @@ ws_path = "/ws"
 	return writeFile(path, t)
 }
 
+// DefaultClientTOML is the built-in configuration written on first run when
+// no config file exists, so the client works as a standalone executable.
+const DefaultClientTOML = `# opentunnel client — default configuration (auto-generated on first run)
+server_addr = "cdn.aborro.dev:443"
+token = "497bb6b977cfb87c439a088687d0b640edd741d828c50aa6fecfba7f5854400f"
+fingerprint = "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"
+insecure = false
+ws_path = "/ws"
+profile = "auto"
+mux = true
+udp = true
+# Last-resort tier for networks that intercept TLS: tunnel inside real SSH.
+# Drop tun.key next to this config to enable it (skipped when missing).
+fallback_ssh = true
+ssh_port = "22"
+ssh_user = "tun"
+ssh_key = "tun.key"
+ssh_internal = "127.0.0.1:8081"
+socks_addr = "127.0.0.1:1080"
+http_addr = "127.0.0.1:18080"
+bypass_list = ["cdn.aborro.dev", "vpn.aborro.dev", "*.aborro.dev", "localhost", "127.0.0.1"]
+`
+
+// WriteDefaultClientConfig writes DefaultClientTOML to path (0600).
+func WriteDefaultClientConfig(path string) error {
+	return writeFile(path, DefaultClientTOML)
+}
+
 func WriteClientTemplate(path string) error {
 	t := `# opentunnel client configuration
 server_addr = "example.com:443"
