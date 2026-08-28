@@ -7,11 +7,15 @@ package transport
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -28,6 +32,10 @@ type SSHOptions struct {
 	InternalWS  string // websocket target reachable from the VPS loopback, e.g. 127.0.0.1:8081
 	WSPath      string // defaults to /ws
 	DialTimeout time.Duration
+	// HostKeyPins pins the server host key(s) as ssh-keygen-style
+	// "SHA256:<base64>" fingerprints. Empty = accept any host key (NOT
+	// recommended: an active attacker could steal the tunnel token).
+	HostKeyPins []string
 }
 
 type sshTransport struct{ opt SSHOptions }
@@ -69,11 +77,9 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 	}
 
 	cfg := &ssh.ClientConfig{
-		User: t.opt.User,
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		// The inner AEAD layer provides authentication of the relay; SSH
-		// host-key pinning can be added later without weakening anything.
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		User:            t.opt.User,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: t.hostKeyCallback(),
 		Timeout:         timeout,
 	}
 	client, err := ssh.Dial("tcp", hostPort, cfg)
@@ -127,6 +133,26 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 		Conn:   stream,
 		closer: func() { _ = wsConn.Close(websocket.StatusNormalClosure, ""); _ = client.Close() },
 	}, nil
+}
+
+// hostKeyCallback returns a pin-verifying callback, or the insecure fallback
+// when no pins are configured (the client main warns loudly in that case).
+func (t *sshTransport) hostKeyCallback() ssh.HostKeyCallback {
+	if len(t.opt.HostKeyPins) == 0 {
+		return ssh.InsecureIgnoreHostKey()
+	}
+	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
+		sum := sha256.Sum256(key.Marshal())
+		// ssh-keygen -lf prints SHA256 pins without base64 padding.
+		got := "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:])
+		for _, p := range t.opt.HostKeyPins {
+			pin := strings.TrimRight(strings.TrimSpace(p), "=")
+			if subtle.ConstantTimeCompare([]byte(pin), []byte(got)) == 1 {
+				return nil
+			}
+		}
+		return fmt.Errorf("transport: ssh host key %s does not match ssh_host_keys pins", got)
+	}
 }
 
 // openDirectTCPIP asks sshd to connect to target (from the VPS side) and

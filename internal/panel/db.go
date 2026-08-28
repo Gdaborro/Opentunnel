@@ -128,13 +128,6 @@ func (db *DB) RecordTraffic(token string, up, down int64) {
 	}
 }
 
-// CreateLegacyPeer registers IP-derived clients so they show in the UI.
-func (db *DB) CreateLegacyPeer(token string) {
-	db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,status,created_at,last_seen,ssh_pubkey) VALUES(?,?,?,'approved',datetime('now'),datetime('now'),NULL)`,
-		token, token, token)
-	db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, token)
-}
-
 // TrackDaily upserts today's cumulative traffic per token.
 func (db *DB) TrackDaily(token string, up, down int64) {
 	db.Exec(`CREATE TABLE IF NOT EXISTS daily_usage(token TEXT, day TEXT, up INTEGER DEFAULT 0, down INTEGER DEFAULT 0, PRIMARY KEY(token, day))`)

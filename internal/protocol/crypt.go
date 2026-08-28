@@ -291,7 +291,15 @@ func (rc *ReplayCache) CheckAndAdd(salt []byte) bool {
 			}
 		}
 		if len(rc.m) >= rc.cap {
-			rc.m = make(map[string]time.Time)
+			// Still full: evict a random 10% (map order is randomized) so
+			// recent salts mostly survive instead of wiping the whole cache,
+			// which would open a replay window under a salt flood.
+			for k := range rc.m {
+				delete(rc.m, k)
+				if len(rc.m) <= rc.cap-rc.cap/10 {
+					break
+				}
+			}
 		}
 	}
 	if ts, ok := rc.m[key]; ok && now.Sub(ts) <= rc.ttl {

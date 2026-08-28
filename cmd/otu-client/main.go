@@ -181,14 +181,18 @@ func main() {
 		sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
 		dialer.UseTransportBuilder(func(profile string) transport.Transport {
 			return transport.NewSSH(transport.SSHOptions{
-				Host:       sshAddr,
-				User:       user,
-				KeyFile:    key,
-				InternalWS: internal,
-				WSPath:     cfg.WSPath,
+				Host:        sshAddr,
+				User:        user,
+				KeyFile:     key,
+				InternalWS:  internal,
+				WSPath:      cfg.WSPath,
+				HostKeyPins: cfg.SSHHostKeyPins(),
 			})
 		})
 		fmt.Println("[i] transport: ssh (tunnel inside SSH; AEAD still end-to-end)")
+		if len(cfg.SSHHostKeyPins()) == 0 {
+			fmt.Println("[!] WARNING: no ssh_host_keys pinned — the ssh tier will accept any host key")
+		}
 	default:
 		fmt.Println("[i] transport: ws-tls")
 		// Optional last-resort tier: if every ws-tls tier is intercepted,
@@ -207,16 +211,21 @@ func main() {
 					user = "ubuntu"
 				}
 				sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
+				pins := cfg.SSHHostKeyPins()
 				dialer.EnableSSHFallback(func() transport.Transport {
 					return transport.NewSSH(transport.SSHOptions{
-						Host:       sshAddr,
-						User:       user,
-						KeyFile:    cfg.SSHKey,
-						InternalWS: internal,
-						WSPath:     cfg.WSPath,
+						Host:        sshAddr,
+						User:        user,
+						KeyFile:     cfg.SSHKey,
+						InternalWS:  internal,
+						WSPath:      cfg.WSPath,
+						HostKeyPins: pins,
 					})
 				})
 				fmt.Println("[i] ssh fallback tier enabled (last resort)")
+				if len(pins) == 0 {
+					fmt.Println("[!] WARNING: no ssh_host_keys pinned — the ssh tier will accept any host key")
+				}
 			}
 		}
 	}
@@ -236,6 +245,8 @@ func main() {
 	httpAddr := cfg.HTTPAddr
 	socksAddr := cfg.SOCKSAddr
 	var lnHTTP, lnSOCKS net.Listener
+	warnIfExposed(socksAddr, "socks_addr")
+	warnIfExposed(httpAddr, "http_addr")
 
 	if socksAddr != "" {
 		lnSOCKS, err = net.Listen("tcp", socksAddr)
@@ -291,6 +302,23 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// warnIfExposed flags non-loopback proxy binds: the local proxies have no
+// authentication, so exposing them makes the machine an open proxy.
+func warnIfExposed(addr, name string) {
+	if addr == "" {
+		return
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsLoopback() {
+		return
+	}
+	fmt.Printf("[!] WARNING: %s = %s is not loopback — the proxy has NO authentication; anyone who can reach it can use your tunnel\n", name, addr)
 }
 
 func boolPtr(b bool) *bool { return &b }

@@ -4,20 +4,12 @@ package proxy
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"strings"
-	"time"
 
 	"opentunnel/internal/protocol"
 )
@@ -241,47 +233,6 @@ func serveSocksBlockPage(conn net.Conn, addr *protocol.Address, err error) {
 		return
 	}
 	_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page))
-}
-
-var blockCertCache = make(map[string]tls.Certificate)
-var blockCertKey *rsa.PrivateKey
-
-func generateBlockCert(domain string) (tls.Certificate, error) {
-	if c, ok := blockCertCache[domain]; ok {
-		return c, nil
-	}
-	if blockCertKey == nil {
-		k, err := rsa.GenerateKey(rand.Reader, 2048)
-		if err != nil {
-			return tls.Certificate{}, err
-		}
-		blockCertKey = k
-	}
-	serial, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
-	template := x509.Certificate{
-		SerialNumber: serial,
-		Subject: pkix.Name{CommonName: domain, Organization: []string{"opentunnel ISP"}},
-		NotBefore: time.Now().Add(-time.Hour),
-		NotAfter:  time.Now().Add(24 * time.Hour),
-		KeyUsage:  x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames: []string{domain},
-	}
-	if ip := net.ParseIP(domain); ip != nil {
-		template.IPAddresses = []net.IP{ip}
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &blockCertKey.PublicKey, blockCertKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(blockCertKey)})
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	blockCertCache[domain] = cert
-	return cert, nil
 }
 
 func serveHTTPBlockPage(conn net.Conn, addr *protocol.Address, err error) {

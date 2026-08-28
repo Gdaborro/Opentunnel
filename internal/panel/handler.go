@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"html/template"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -93,6 +94,11 @@ func (h *Handler) apiSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiLogin(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if h.auth.LoginLocked(ip) {
+		http.Error(w, "too many failed attempts — try again later", http.StatusTooManyRequests)
+		return
+	}
 	var creds struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -100,17 +106,31 @@ func (h *Handler) apiLogin(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&creds)
 	ok, _ := h.auth.Login(creds.Username, creds.Password)
 	if !ok {
+		h.auth.RecordLoginFail(ip)
 		http.Error(w, "invalid credentials", 401)
 		return
 	}
+	h.auth.ClearLoginFail(ip)
 	sid := h.auth.CreateSession(creds.Username)
 	h.auth.SetSessionCookie(w, sid)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie("panel_session"); err == nil {
+		h.auth.DestroySession(c.Value)
+	}
 	http.SetCookie(w, &http.Cookie{Name: "panel_session", MaxAge: -1, Path: "/admin"})
 	http.Redirect(w, r, "/admin/login", 302)
+}
+
+// clientIP extracts the IP portion of the request's remote address.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -150,13 +170,10 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "approve":
 		h.db.Exec(`UPDATE peers SET status='approved', last_seen=datetime('now') WHERE token=?`, token)
-		var pub string
-		h.db.QueryRow(`SELECT COALESCE(ssh_pubkey,'') FROM peers WHERE token=?`, token).Scan(&pub)
-		if pub != "" {
-			_ = addTunPubkey(pub)
-		}
 	case "kick":
-		var req struct{ Reason string `json:"reason"` }
+		var req struct {
+			Reason string `json:"reason"`
+		}
 		json.NewDecoder(r.Body).Decode(&req)
 		h.db.Exec(`UPDATE peers SET status='kicked', kick_reason=?, kick_expires=datetime('now','+10 minutes') WHERE token=?`, req.Reason, token)
 	case "ban":
@@ -284,19 +301,18 @@ func (h *Handler) apiAbuse(w http.ResponseWriter, r *http.Request) {
 	// Guard stats if available (approx)
 	rateLimited = 0
 	json.NewEncoder(w).Encode(map[string]any{
-		"banned": bannedFP,
+		"banned":       bannedFP,
 		"rate_limited": rateLimited,
-		"note": "Abuse protection: per-IP 10/min, per-peer 100 domains/10s -> temp kick, fingerprint+IP hard ban, easy unban via panel. Oracle decoy: normal apt cron + decoy site traffic.",
+		"note":         "Abuse protection: per-IP 10/min, per-peer 100 domains/10s -> temp kick, fingerprint+IP hard ban, easy unban via panel. Oracle decoy: normal apt cron + decoy site traffic.",
 	})
 }
 
 func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Token      string `json:"token"`
+		Token       string `json:"token"`
 		Fingerprint string `json:"fingerprint"`
-		DeviceName string `json:"device_name"`
-		AdminKey   string `json:"admin_key"`
-		SSHPubKey  string `json:"ssh_pubkey"`
+		DeviceName  string `json:"device_name"`
+		SSHPubKey   string `json:"ssh_pubkey"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 	if req.Token == "" || req.Fingerprint == "" {
@@ -314,12 +330,9 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "device banned", 403)
 		return
 	}
-	// Check if admin key matches (insta-approve)
+	// New devices start pending unless auto-approve is enabled.
 	status := "pending"
 	if h.autoApprove {
-		status = "approved"
-	}
-	if req.AdminKey != "" && isAdminKey(req.AdminKey) {
 		status = "approved"
 	}
 	// Only set status on first insert; existing peers keep their current status
@@ -349,24 +362,10 @@ func (h *Handler) tokenStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenHeartbeat(w http.ResponseWriter, r *http.Request) {
-	var req struct{ Token string `json:"token"` }
+	var req struct {
+		Token string `json:"token"`
+	}
 	json.NewDecoder(r.Body).Decode(&req)
 	h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
 	w.Write([]byte(`{"ok":true}`))
-}
-
-func addTunPubkey(pub string) error {
-	pub = strings.TrimSpace(pub)
-	if pub == "" {
-		return nil
-	}
-	// For MVP, just log — the VPS poller or manual admin can handle the actual file write
-	// Full impl would: exec.Command("sh","-c", "grep -qF ... || echo ... | sudo -u tun tee -a ...")
-	return nil
-}
-
-func isAdminKey(key string) bool {
-	// Compare against env ADMIN_SSH_PUB fingerprint – simplified for MVP
-	// In production, verify signature, not just string compare
-	return key == "main-ssh-key-placeholder"
 }

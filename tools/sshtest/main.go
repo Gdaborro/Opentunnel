@@ -23,7 +23,10 @@ func main() {
 	signer, _ := ssh.ParsePrivateKey(keyRaw)
 	cfg := &ssh.ClientConfig{User: user, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: ssh.InsecureIgnoreHostKey()}
 	client, err := ssh.Dial("tcp", host, cfg)
-	if err != nil { fmt.Println("ssh dial:", err); return }
+	if err != nil {
+		fmt.Println("ssh dial:", err)
+		return
+	}
 	defer client.Close()
 	fmt.Println("ssh connected")
 
@@ -40,9 +43,17 @@ func rawHTTPTest(client *ssh.Client, target string) {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint32
 	fmt.Sscanf(portStr, "%d", &port)
-	payload := ssh.Marshal(struct{ ListenAddr string; ListenPort uint32; OriginAddr string; OriginPort uint32 }{host, port, "127.0.0.1", 0})
+	payload := ssh.Marshal(struct {
+		ListenAddr string
+		ListenPort uint32
+		OriginAddr string
+		OriginPort uint32
+	}{host, port, "127.0.0.1", 0})
 	ch, reqs, err := client.OpenChannel("direct-tcpip", payload)
-	if err != nil { fmt.Println("open:", err); return }
+	if err != nil {
+		fmt.Println("open:", err)
+		return
+	}
 	go ssh.DiscardRequests(reqs)
 	defer ch.Close()
 	fmt.Fprintf(ch, "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:8081\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: otu1\r\n\r\n")
@@ -55,17 +66,25 @@ func wsTest(client *ssh.Client, target string) {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint32
 	fmt.Sscanf(portStr, "%d", &port)
-	payload := ssh.Marshal(struct{ ListenAddr string; ListenPort uint32; OriginAddr string; OriginPort uint32 }{host, port, "127.0.0.1", 0})
+	payload := ssh.Marshal(struct {
+		ListenAddr string
+		ListenPort uint32
+		OriginAddr string
+		OriginPort uint32
+	}{host, port, "127.0.0.1", 0})
 	ch, reqs, err := client.OpenChannel("direct-tcpip", payload)
-	if err != nil { fmt.Println("open ws:", err); return }
+	if err != nil {
+		fmt.Println("open ws:", err)
+		return
+	}
 	go ssh.DiscardRequests(reqs)
 	defer ch.Close()
 
 	// mimic sshTransport's http client
 	url := fmt.Sprintf("ws://%s/ws", target)
-		hc := &http.Client{
+	hc := &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return &chanConn{Channel: ch}, nil },
+			DialContext:       func(ctx context.Context, _, _ string) (net.Conn, error) { return &chanConn{Channel: ch}, nil },
 			ForceAttemptHTTP2: false,
 		},
 	}
@@ -84,11 +103,14 @@ func wsTest(client *ssh.Client, target string) {
 }
 
 type chanConn struct{ ssh.Channel }
-func (c *chanConn) LocalAddr() net.Addr { return dummyAddr{} }
-func (c *chanConn) RemoteAddr() net.Addr { return dummyAddr{} }
-func (c *chanConn) SetDeadline(t time.Time) error { return nil }
-func (c *chanConn) SetReadDeadline(t time.Time) error { return nil }
+
+func (c *chanConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (c *chanConn) RemoteAddr() net.Addr               { return dummyAddr{} }
+func (c *chanConn) SetDeadline(t time.Time) error      { return nil }
+func (c *chanConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *chanConn) SetWriteDeadline(t time.Time) error { return nil }
+
 type dummyAddr struct{}
+
 func (dummyAddr) Network() string { return "ssh" }
-func (dummyAddr) String() string { return "ssh" }
+func (dummyAddr) String() string  { return "ssh" }

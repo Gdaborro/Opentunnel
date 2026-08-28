@@ -17,7 +17,7 @@ import (
 )
 
 func newServerHandler(token string) http.Handler {
-	return server.Handler(server.Options{Token: token})
+	return server.Handler(server.Options{Token: token, AllowRestrictedTargets: true})
 }
 
 type failTransport struct{ calls *int }

@@ -15,5 +15,5 @@ func deviceFingerprint() string {
 	return fmt.Sprintf("%x", sum[:16])
 }
 
-func isRegistryBanned() bool { return false }
+func isRegistryBanned() bool                   { return false }
 func writeRegistryBan(reason, duration string) {}

@@ -38,11 +38,13 @@ type Options struct {
 	DecoyHTML   []byte                // served to non-tunnel requests
 	ReplayCache *protocol.ReplayCache // nil = default (10 min TTL, 100k salts)
 	Guard       *Guard                // nil = DefaultGuard()
-	PanelDB     interface { // optional panel DB for per-token checks
+	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
+	// private, link-local/metadata, CGNAT ranges). Off by default.
+	AllowRestrictedTargets bool
+	PanelDB                interface { // optional panel DB for per-token checks
 		CheckToken(token string) (status, reason, kickExpires string, err error)
 		RecordTraffic(token string, up, down int64)
 		IsBlocked(domain string) bool
-		CreateLegacyPeer(ip string)
 	}
 }
 
@@ -159,34 +161,27 @@ func handleSession(stream net.Conn, opt Options) {
 	var peerStatus = "approved"
 	var peerReason string
 	if opt.PanelDB != nil {
-		if clientToken == "" {
-			clientToken = "legacy-" + addrHost(stream.RemoteAddr())
-			opt.PanelDB.CreateLegacyPeer(clientToken)
+		status, reason, kickExpires, _ := opt.PanelDB.CheckToken(clientToken)
+		switch status {
+		case "banned":
+			_ = protocol.WriteToken(sec, "banned:"+reason)
+			peerStatus = "banned"
+			peerReason = reason
+		case "pending", "expired":
+			_ = protocol.WriteToken(sec, status)
+			return
+		case "kicked":
+			_ = protocol.WriteToken(sec, "kicked:"+reason+":"+kickExpires)
+			peerStatus = "kicked"
+			peerReason = reason
+			if strings.HasPrefix(reason, "silent:") {
+				peerStatus = "kicked-silent"
+			}
+		default:
 			_ = protocol.WriteToken(sec, "ok")
 			peerStatus = "approved"
-		} else {
-			status, reason, kickExpires, _ := opt.PanelDB.CheckToken(clientToken)
-			switch status {
-			case "banned":
-				_ = protocol.WriteToken(sec, "banned:"+reason)
-				peerStatus = "banned"
-				peerReason = reason
-			case "pending", "expired":
-				_ = protocol.WriteToken(sec, status)
-				return
-			case "kicked":
-				_ = protocol.WriteToken(sec, "kicked:"+reason+":"+kickExpires)
-				peerStatus = "kicked"
-				peerReason = reason
-				if strings.HasPrefix(reason, "silent:") {
-					peerStatus = "kicked-silent"
-				}
-			default:
-				_ = protocol.WriteToken(sec, "ok")
-				peerStatus = "approved"
-			}
-			go opt.PanelDB.RecordTraffic(clientToken, 0, 0)
 		}
+		go opt.PanelDB.RecordTraffic(clientToken, 0, 0)
 	} else {
 		_ = protocol.WriteToken(sec, "ok")
 		peerStatus = "approved"
@@ -212,7 +207,7 @@ func handleSession(stream net.Conn, opt Options) {
 	case protocol.MuxMarker:
 		opt.serveMuxSession(sec, clientToken, peerStatus, peerReason)
 	case protocol.UdpMarker:
-		serveUDPStream(sec, opt.logger())
+		serveUDPStream(sec, opt)
 	default:
 		relayTarget(mode[0], sec, opt, clientToken, peerStatus, peerReason)
 	}
@@ -246,17 +241,26 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 		return
 	}
 
-	// Site blocklist enforcement - ISP level domain blocking with proper status
-	if opt.PanelDB != nil && target.Domain != "" && opt.PanelDB.IsBlocked(target.Domain) {
-		opt.logger().Printf("blocked %s for %s", target.Domain, token)
-		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
-		_ = protocol.WriteToken(rw, "blocked:"+target.Domain)
-		return
+	// Site blocklist enforcement - ISP level domain blocking with proper status.
+	// IP-literal targets are matched too so blocklist entries can be IPs.
+	if opt.PanelDB != nil {
+		name := target.Domain
+		if name == "" && target.IP != nil {
+			name = target.IP.String()
+		}
+		if name != "" && opt.PanelDB.IsBlocked(name) {
+			opt.logger().Printf("blocked %s for %s", name, shortToken(token))
+			_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+			_ = protocol.WriteToken(rw, "blocked:"+name)
+			return
+		}
 	}
 	// Record aggregated visited site (privacy: domain only, no URL, count per peer)
 	if opt.PanelDB != nil && token != "" && target.Domain != "" {
 		go func(tok, dom string) {
-			if db, ok := opt.PanelDB.(interface{ Exec(string, ...interface{}) (interface{}, error) }); ok {
+			if db, ok := opt.PanelDB.(interface {
+				Exec(string, ...interface{}) (interface{}, error)
+			}); ok {
 				_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS visits(token TEXT, domain TEXT, hits INTEGER DEFAULT 1, last_seen DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(token, domain))`)
 				_, _ = db.Exec(`INSERT INTO visits(token,domain,hits,last_seen) VALUES(?,?,1,datetime('now')) ON CONFLICT(token,domain) DO UPDATE SET hits=hits+1, last_seen=datetime('now')`, tok, dom)
 			}
@@ -267,6 +271,9 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	}
 
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if !opt.AllowRestrictedTargets {
+		dialer.Control = safeControl
+	}
 	upstream, err := dialer.Dial("tcp", target.HostPort())
 	if err != nil {
 		_ = protocol.WriteTargetResponse(rw, protocol.StatusDialFailed)
@@ -303,6 +310,10 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	}
 }
 
+// maxStreamsPerSession bounds concurrent smux streams on one tunnel session
+// so an authenticated client cannot exhaust memory/fds by opening streams.
+const maxStreamsPerSession = 256
+
 // serveMuxSession upgrades an authenticated secure stream into a smux
 // session; every stream inside carries one relayTarget exchange.
 func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peerReason string) {
@@ -312,19 +323,27 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 		return
 	}
 	defer sess.Close()
+	sem := make(chan struct{}, maxStreamsPerSession)
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
 			return
 		}
+		select {
+		case sem <- struct{}{}:
+		default:
+			o.logger().Printf("server: stream cap (%d) reached — dropping stream", maxStreamsPerSession)
+			stream.Close()
+			continue
+		}
 		go func(s *smux.Stream) {
-			defer s.Close()
+			defer func() { <-sem; s.Close() }()
 			atyp := make([]byte, 1)
 			if _, err := io.ReadFull(s, atyp); err != nil {
 				return
 			}
 			if atyp[0] == protocol.UdpMarker {
-				serveUDPStream(s, o.logger())
+				serveUDPStream(s, o)
 				return
 			}
 			relayTarget(atyp[0], s, o, token, peerStatus, peerReason)

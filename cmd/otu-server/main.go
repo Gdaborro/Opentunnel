@@ -74,7 +74,7 @@ func main() {
 		if stateDir == "" {
 			stateDir = "."
 		}
-			// Support comma-separated domains for zero-downtime migration.
+		// Support comma-separated domains for zero-downtime migration.
 		acmeDomains = splitAndTrim(cfg.AcmeDomain)
 		mgr := &autocert.Manager{
 			Cache:      autocert.DirCache(filepath.Join(stateDir, "acme")),
@@ -144,9 +144,10 @@ func main() {
 	}
 
 	baseHandler := server.Handler(server.Options{
-		Token:   cfg.Token,
-		WSPath:  cfg.WSPath,
-		PanelDB: panelDB, // nil-safe: legacy mode when panel disabled
+		Token:                  cfg.Token,
+		WSPath:                 cfg.WSPath,
+		PanelDB:                panelDB, // nil-safe: legacy mode when panel disabled
+		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
 	})
 	var handler http.Handler = baseHandler
 	if panelHandler != nil {

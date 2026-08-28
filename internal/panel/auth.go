@@ -14,12 +14,33 @@ import (
 
 type Auth struct {
 	db       *DB
-	sessions map[string]string // sessionID -> username
+	sessions map[string]*session // sessionID -> session
 	mu       sync.RWMutex
+
+	// login throttle: per-IP failed attempts
+	lmu   sync.Mutex
+	fails map[string]*loginFail
 }
 
+type session struct {
+	user    string
+	created time.Time
+}
+
+type loginFail struct {
+	count int
+	until time.Time // locked until this time
+	last  time.Time
+}
+
+const (
+	sessionTTL      = 24 * time.Hour
+	loginMaxFails   = 5
+	loginLockWindow = 15 * time.Minute
+)
+
 func NewAuth(db *DB) *Auth {
-	return &Auth{db: db, sessions: make(map[string]string)}
+	return &Auth{db: db, sessions: make(map[string]*session), fails: make(map[string]*loginFail)}
 }
 
 func (a *Auth) NeedsSetup() bool {
@@ -68,9 +89,16 @@ func (a *Auth) CreateSession(username string) string {
 	rand.Read(b)
 	sid := base64.RawURLEncoding.EncodeToString(b)
 	a.mu.Lock()
-	a.sessions[sid] = username
+	a.sessions[sid] = &session{user: username, created: time.Now()}
 	a.mu.Unlock()
 	return sid
+}
+
+// DestroySession invalidates a session server-side (logout).
+func (a *Auth) DestroySession(sid string) {
+	a.mu.Lock()
+	delete(a.sessions, sid)
+	a.mu.Unlock()
 }
 
 func (a *Auth) GetUser(r *http.Request) string {
@@ -78,16 +106,56 @@ func (a *Auth) GetUser(r *http.Request) string {
 	if err != nil {
 		return ""
 	}
-	a.mu.RLock()
-	u := a.sessions[c.Value]
-	a.mu.RUnlock()
-	return u
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s, ok := a.sessions[c.Value]
+	if !ok {
+		return ""
+	}
+	if time.Since(s.created) > sessionTTL {
+		delete(a.sessions, c.Value)
+		return ""
+	}
+	return s.user
+}
+
+// LoginLocked reports whether the IP is currently locked out.
+func (a *Auth) LoginLocked(ip string) bool {
+	a.lmu.Lock()
+	defer a.lmu.Unlock()
+	f := a.fails[ip]
+	return f != nil && time.Now().Before(f.until)
+}
+
+// RecordLoginFail registers a failed attempt; after loginMaxFails within the
+// window the IP is locked for loginLockWindow.
+func (a *Auth) RecordLoginFail(ip string) {
+	a.lmu.Lock()
+	defer a.lmu.Unlock()
+	now := time.Now()
+	f := a.fails[ip]
+	if f == nil || now.Sub(f.last) > loginLockWindow {
+		f = &loginFail{}
+		a.fails[ip] = f
+	}
+	f.count++
+	f.last = now
+	if f.count >= loginMaxFails {
+		f.until = now.Add(loginLockWindow)
+	}
+}
+
+// ClearLoginFail resets the counter after a successful login.
+func (a *Auth) ClearLoginFail(ip string) {
+	a.lmu.Lock()
+	delete(a.fails, ip)
+	a.lmu.Unlock()
 }
 
 func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Setup is always public (but handler will reject if already setup)
-	if r.URL.Path == "/admin/login" || r.URL.Path == "/admin/api/login" || r.URL.Path == "/admin/setup" || r.URL.Path == "/admin/api/setup" {
+		if r.URL.Path == "/admin/login" || r.URL.Path == "/admin/api/login" || r.URL.Path == "/admin/setup" || r.URL.Path == "/admin/api/setup" {
 			next.ServeHTTP(w, r)
 			return
 		}

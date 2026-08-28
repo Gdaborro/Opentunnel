@@ -36,8 +36,8 @@ func NewTokenStore() (*TokenStore, error) {
 	return &TokenStore{Dir: dir}, nil
 }
 
-func (s *TokenStore) TokenPath() string { return filepath.Join(s.Dir, "device.json") }
-func (s *TokenStore) BanPath() string   { return filepath.Join(s.Dir, "ban.json") }
+func (s *TokenStore) TokenPath() string      { return filepath.Join(s.Dir, "device.json") }
+func (s *TokenStore) BanPath() string        { return filepath.Join(s.Dir, "ban.json") }
 func (s *TokenStore) SSHPrivatePath() string { return filepath.Join(s.Dir, "device_ssh") }
 func (s *TokenStore) SSHPublicPath() string  { return filepath.Join(s.Dir, "device_ssh.pub") }
 

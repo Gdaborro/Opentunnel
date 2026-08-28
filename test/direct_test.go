@@ -38,7 +38,7 @@ func TestDirectDialTunnel(t *testing.T) {
 		t.Fatal(err)
 	}
 	srvHTTP := &http.Server{
-		Handler:   server.Handler(server.Options{Token: token}),
+		Handler:   server.Handler(server.Options{Token: token, AllowRestrictedTargets: true}),
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{*cert}},
 	}
 	go func() { _ = srvHTTP.ServeTLS(srvLn, "", "") }()

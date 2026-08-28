@@ -2,7 +2,6 @@ package server
 
 import (
 	"io"
-	"log"
 	"net"
 
 	"opentunnel/internal/protocol"
@@ -14,12 +13,14 @@ import (
 //
 //	client → server: [u16][ATYP addr port][payload]  (destination)
 //	server → client: [u16][ATYP addr port][payload]  (source)
-func serveUDPStream(rw io.ReadWriteCloser, logger *log.Logger) {
+//
+// Destinations pass the same SSRF filter and blocklist as TCP targets.
+func serveUDPStream(rw io.ReadWriteCloser, opt Options) {
 	defer rw.Close()
 
 	pc, err := net.ListenPacket("udp", "")
 	if err != nil {
-		logger.Printf("server: udp relay listen: %v", err)
+		opt.logger().Printf("server: udp relay listen: %v", err)
 		return
 	}
 	defer pc.Close()
@@ -47,8 +48,22 @@ func serveUDPStream(rw io.ReadWriteCloser, logger *log.Logger) {
 		if err != nil {
 			return
 		}
+		// Blocklist applies to domains and IP literals alike.
+		if opt.PanelDB != nil {
+			name := dst.Domain
+			if name == "" && dst.IP != nil {
+				name = dst.IP.String()
+			}
+			if name != "" && opt.PanelDB.IsBlocked(name) {
+				continue
+			}
+		}
 		raddr, err := net.ResolveUDPAddr("udp", dst.HostPort())
 		if err != nil {
+			continue
+		}
+		// Post-resolution check covers domain targets resolving inward.
+		if !opt.AllowRestrictedTargets && isRestrictedIP(raddr.IP) {
 			continue
 		}
 		if _, err := pc.WriteTo(payload, raddr); err != nil {

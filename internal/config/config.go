@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -17,10 +18,13 @@ type Server struct {
 	Token          string `toml:"token"`           // shared secret; generate with a password manager
 	CertFile       string `toml:"cert_file"`
 	KeyFile        string `toml:"key_file"`
-	AcmeDomain     string `toml:"acme_domain"` // optional: obtain/renew a public LE cert (TLS-ALPN)
-	WSPath         string `toml:"ws_path"`     // default "/ws"
-	Host           string `toml:"host"`        // public hostname, used for self-signed CN
+	AcmeDomain     string `toml:"acme_domain"`  // optional: obtain/renew a public LE cert (TLS-ALPN)
+	WSPath         string `toml:"ws_path"`      // default "/ws"
+	Host           string `toml:"host"`         // public hostname, used for self-signed CN
 	AutoApprove    bool   `toml:"auto_approve"` // new device registrations start approved (no manual gate)
+	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
+	// private, link-local/metadata, CGNAT). Default false.
+	AllowRestrictedTargets bool `toml:"allow_restricted_targets"`
 }
 
 type ClientConf struct {
@@ -29,18 +33,30 @@ type ClientConf struct {
 	Fingerprint string   `toml:"fingerprint"` // SHA-256 hex pin of server cert (wstls only)
 	Insecure    bool     `toml:"insecure"`    // dev only
 	WSPath      string   `toml:"ws_path"`
-	Transport   string   `toml:"transport"`    // wstls (default) | ssh
-	SSHUser     string   `toml:"ssh_user"`     // for transport="ssh"
-	SSHKey      string   `toml:"ssh_key"`      // path to private key
-	SSHPort     string   `toml:"ssh_port"`     // default "22"
-	SSHInternal string   `toml:"ssh_internal"` // loopback ws target on VPS, e.g. 127.0.0.1:8081
-	Profile     string   `toml:"profile"`      // auto | fast | balanced | stealth
-	FallbackSSH *bool    `toml:"fallback_ssh"` // add ssh last-resort tier to the ladder
-	Mux         *bool    `toml:"mux"`          // default true: multiplexed sessions
-	UDP         *bool    `toml:"udp"`          // default true: SOCKS5 UDP ASSOCIATE
-	SOCKSAddr   string   `toml:"socks_addr"`   // default 127.0.0.1:1080
-	HTTPAddr    string   `toml:"http_addr"`    // default 127.0.0.1:8118
-	BypassList  []string `toml:"bypass_list"`  // extra ProxyOverride entries
+	Transport   string   `toml:"transport"`     // wstls (default) | ssh
+	SSHUser     string   `toml:"ssh_user"`      // for transport="ssh"
+	SSHKey      string   `toml:"ssh_key"`       // path to private key
+	SSHPort     string   `toml:"ssh_port"`      // default "22"
+	SSHInternal string   `toml:"ssh_internal"`  // loopback ws target on VPS, e.g. 127.0.0.1:8081
+	SSHHostKeys string   `toml:"ssh_host_keys"` // comma-separated SHA256:<b64> host-key pins for the ssh tier
+	Profile     string   `toml:"profile"`       // auto | fast | balanced | stealth
+	FallbackSSH *bool    `toml:"fallback_ssh"`  // add ssh last-resort tier to the ladder
+	Mux         *bool    `toml:"mux"`           // default true: multiplexed sessions
+	UDP         *bool    `toml:"udp"`           // default true: SOCKS5 UDP ASSOCIATE
+	SOCKSAddr   string   `toml:"socks_addr"`    // default 127.0.0.1:1080
+	HTTPAddr    string   `toml:"http_addr"`     // default 127.0.0.1:8118
+	BypassList  []string `toml:"bypass_list"`   // extra ProxyOverride entries
+}
+
+// SSHHostKeyPins splits ssh_host_keys into individual pins.
+func (c *ClientConf) SSHHostKeyPins() []string {
+	var out []string
+	for _, p := range strings.Split(c.SSHHostKeys, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // FallbackSSHEnabled reports whether the ssh last-resort tier should be
@@ -127,6 +143,9 @@ key_file  = ""
 	# When true, newly registering devices start approved (no manual gate).
 	# Default false: every new device waits for admin approval.
 	auto_approve = false
+	# When true, clients may dial loopback/private/link-local/metadata
+	# targets through the relay (SSRF filter off). Default false.
+	allow_restricted_targets = false
 	`
 	return writeFile(path, t)
 }
@@ -149,6 +168,7 @@ ssh_port = "22"
 ssh_user = "tun"
 ssh_key = "tun.key"
 ssh_internal = "127.0.0.1:8081"
+ssh_host_keys = "SHA256:msXZMQ8kGmiZF6bt75T3aWtL2ebPnWtZ6+X1vs69Jas,SHA256:og9K+1+YtASuye2jO06RN3V6TA/eK+/zIMF8GHcsLyQ,SHA256:tWpmC5YfGj9UJD9iDb/FlkeCO/m/2pB59vGRSKvTl5o"
 socks_addr = "127.0.0.1:1080"
 http_addr = "127.0.0.1:18080"
 bypass_list = ["cdn.aborro.dev", "vpn.aborro.dev", "*.aborro.dev", "localhost", "127.0.0.1"]
