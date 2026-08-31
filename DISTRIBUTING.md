@@ -4,11 +4,18 @@ What to give someone:
 
 ```
 otu-client.exe      (from the latest GitHub Release)
-tun.key             (optional: enables the SSH last-resort tier)
 ```
 
-That's it. No config file needed — one is created automatically next to the
-exe on first run. Keep both files in the same folder.
+That's it — one file. The client generates everything else itself: config on
+first run, its own device token, and its own SSH key (approved automatically
+when you approve the device, so the SSH fallback tier needs no `tun.key`).
+
+> **Windows SmartScreen** ("Windows protected your PC") may appear the first
+> time because the exe is unsigned. The recipient clicks **More info → Run
+> anyway**. This is normal for any unsigned exe and happens once per download.
+> (Removing it permanently requires a code-signing certificate — a paid
+> Microsoft-trusted cert — which can be added later without changing
+> anything else.)
 
 ## What the recipient does
 

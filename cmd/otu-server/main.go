@@ -25,6 +25,11 @@ import (
 	"opentunnel/internal/version"
 )
 
+func readFileString(path string) string {
+	data, _ := os.ReadFile(path)
+	return string(data)
+}
+
 func main() {
 	cfgPath := flag.String("c", "server.toml", "path to server config")
 	genConfig := flag.Bool("gen-config", false, "write a template config and exit")
@@ -135,7 +140,33 @@ func main() {
 				log.Printf("panel: geoip db %s unreadable — country map disabled", cfg.GeoIPDB)
 			}
 		}
-		panelHandler = panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo).Handler()
+		ph := panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo)
+		// Approving a device also installs its SSH public key into the ssh
+		// tier's authorized_keys, so standalone clients (device-generated
+		// keys) can use the fallback tier without shipping tun.key.
+		ph.WithApproveHook(func(token string) {
+			pub := ph.SSHKeyPath(token)
+			if pub == "" {
+				return
+			}
+			akPath := os.Getenv("OTU_AUTHORIZED_KEYS")
+			if akPath == "" {
+				akPath = "/home/tun/.ssh/authorized_keys"
+			}
+			if _, err := os.Stat(akPath); err != nil {
+				return // no ssh tier on this server — skip silently
+			}
+			f, err := os.OpenFile(akPath, os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				log.Printf("panel: authorize ssh key for %s: %v", token[:8], err)
+				return
+			}
+			defer f.Close()
+			if !strings.Contains(readFileString(akPath), strings.TrimSpace(pub)) {
+				f.WriteString(strings.TrimSpace(pub) + "\n")
+			}
+		})
+		panelHandler = ph.Handler()
 		if cfg.AutoApprove {
 			log.Printf("panel: auto_approve enabled — new devices register as approved")
 		}

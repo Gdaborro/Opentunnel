@@ -111,6 +111,19 @@ func main() {
 	if cfg.SSHKey != "" && !filepath.IsAbs(cfg.SSHKey) {
 		cfg.SSHKey = filepath.Join(filepath.Dir(*cfgPath), cfg.SSHKey)
 	}
+	// tun.key not shipped? Use the device's own SSH key (auto-generated in
+	// %LOCALAPPDATA%\opentunnel on first run and authorized by the panel on
+	// approval) — so the exe works fully standalone, no files needed.
+	if cfg.SSHKey != "" {
+		if _, err := os.Stat(cfg.SSHKey); err != nil {
+			if ts, terr := client.NewTokenStore(); terr == nil {
+				if _, kerr := ts.EnsureSSHKey(); kerr == nil {
+					cfg.SSHKey = ts.SSHPrivatePath()
+					fmt.Println("[i] ssh key: using this device's own key (auto-generated)")
+				}
+			}
+		}
+	}
 
 	// Per-device token: the device's tunnel credential. It authenticates the
 	// handshake and seeds the per-session AEAD keys; no shared secret ships
@@ -278,7 +291,12 @@ func main() {
 	if socksAddr != "" {
 		lnSOCKS, err = listenRetry("tcp", socksAddr)
 		if err != nil {
-			log.Fatalf("socks listen: %v", err)
+			fmt.Printf("\n[X] Could not start the proxy on %s.\n", socksAddr)
+			fmt.Println("    Most likely otu is ALREADY RUNNING (check your taskbar/other windows")
+			fmt.Println("    or another app uses this port). Close it and try again.")
+			fmt.Println("\nPress Enter to close...")
+			fmt.Scanln()
+			os.Exit(1)
 		}
 		go proxy.ServeSOCKS5(ctx, lnSOCKS, dialer, log.Default())
 		fmt.Printf("[+] SOCKS5     -> %s\n", socksAddr)
@@ -286,7 +304,12 @@ func main() {
 	if httpAddr != "" {
 		lnHTTP, err = listenRetry("tcp", httpAddr)
 		if err != nil {
-			log.Fatalf("http listen: %v", err)
+			fmt.Printf("\n[X] Could not start the proxy on %s.\n", httpAddr)
+			fmt.Println("    Most likely otu is ALREADY RUNNING (check your taskbar/other windows")
+			fmt.Println("    or another app uses this port). Close it and try again.")
+			fmt.Println("\nPress Enter to close...")
+			fmt.Scanln()
+			os.Exit(1)
 		}
 		go proxy.ServeHTTPProxy(ctx, lnHTTP, dialer, log.Default())
 		fmt.Printf("[+] HTTP proxy -> %s\n", httpAddr)

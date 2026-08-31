@@ -22,8 +22,12 @@ type Handler struct {
 	autoApprove bool
 	geo         *GeoIP // optional; nil = no country resolution
 
-	rlMu  sync.Mutex
+	rlMu sync.Mutex
 	rlMap map[string]*regLimit // per-IP registration rate limit
+
+	// OnApprove installs a device's SSH public key into the ssh tier's
+	// authorized_keys when an admin approves it (nil = not configured).
+	OnApprove func(token string)
 }
 
 type regLimit struct {
@@ -41,6 +45,16 @@ func New(db *DB, auth *Auth, autoApprove bool) *Handler {
 
 // WithGeoIP attaches an offline GeoIP resolver (panel map / countries).
 func (h *Handler) WithGeoIP(g *GeoIP) *Handler { h.geo = g; return h }
+
+// WithApproveHook registers a callback fired after a device is approved.
+func (h *Handler) WithApproveHook(fn func(token string)) *Handler { h.OnApprove = fn; return h }
+
+// SSHKeyPath returns the stored SSH public key for a device token.
+func (h *Handler) SSHKeyPath(token string) string {
+	var pub string
+	h.db.QueryRow(`SELECT COALESCE(ssh_pubkey,'') FROM peers WHERE token=?`, token).Scan(&pub)
+	return pub
+}
 
 // regAllowed enforces a per-IP registration rate limit so a banned device
 // cannot hammer /api/token/request with fresh identities.
@@ -230,6 +244,9 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		h.db.Exec(`UPDATE peers SET status='approved', last_seen=datetime('now') WHERE token=?`, token)
 		h.db.RecordEvent("approve", short+" approved")
 		h.db.RecordAlert("info", "nac", "device "+short+" approved for network access")
+		if h.OnApprove != nil {
+			h.OnApprove(token)
+		}
 	case "kick":
 		var req struct {
 			Reason string `json:"reason"`
