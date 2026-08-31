@@ -158,6 +158,11 @@ func SelfUpdate(ctx context.Context, rel *Release) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("auto-update: download %s", resp.Status)
 	}
+	// Refuse absurd downloads even if a release asset were misconfigured:
+	// the client is ~11 MB, so 64 MB is a generous ceiling.
+	if resp.ContentLength > 64<<20 {
+		return fmt.Errorf("auto-update: asset too large (%d bytes)", resp.ContentLength)
+	}
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
 		return err

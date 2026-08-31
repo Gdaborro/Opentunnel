@@ -472,6 +472,7 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10) // 16 KB is plenty for registration
 	var req struct {
 		Token       string `json:"token"`
 		Fingerprint string `json:"fingerprint"`
@@ -485,6 +486,12 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Token) < 16 || len(req.Token) > 1024 {
 		http.Error(w, "token must be 16-1024 chars", 400)
+		return
+	}
+	// Bounded fields: a hostile registrant must not be able to stuff
+	// multi-megabyte strings into the DB / alert feed.
+	if len(req.DeviceName) > 64 || len(req.Fingerprint) > 128 || len(req.SSHPubKey) > 2048 {
+		http.Error(w, "field too long", 400)
 		return
 	}
 	// Hard ban on fingerprint OR device public key: a banned device cannot
@@ -543,6 +550,7 @@ func (h *Handler) tokenHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10) // telemetry is tiny
 	var req struct {
 		Token        string  `json:"token"`
 		Version      string  `json:"version"`
@@ -558,6 +566,11 @@ func (h *Handler) tokenHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
 		http.Error(w, "bad request", 400)
+		return
+	}
+	// Bounded telemetry strings (token length is enforced at registration).
+	if len(req.Version) > 64 || len(req.OS) > 64 || len(req.Arch) > 32 {
+		http.Error(w, "field too long", 400)
 		return
 	}
 	var n int

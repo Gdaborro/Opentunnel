@@ -1,9 +1,15 @@
-# opentunnel
+# otu (opentunnel)
 
 A minimal, self-hostable censorship-circumvention proxy. One Go binary runs
 on a VPS (`otu-server`); one runs locally without administrator rights
 (`otu-client`) and exposes SOCKS5/HTTP proxies that any browser can use.
 
+- **Double-click client** — no arguments needed: the exe auto-configures the
+  browser proxy on launch and restores everything on exit/crash/close.
+- **Per-device identity** — each install generates its own device token and
+  SSH key; the admin approves new devices once from the web panel (NAC).
+  No shared secret ships in the binary. Banned devices (fingerprint + key)
+  stay banned. Inactive devices are purged and re-approved on return.
 - **User-level by design** — no TUN driver, no services, no UAC prompts.
   Runs from `%USERPROFILE%` or a USB stick.
 - **Looks like HTTPS** — traffic rides a genuine TLS session to your server's
@@ -12,48 +18,57 @@ on a VPS (`otu-server`); one runs locally without administrator rights
   AES-256-GCM keys derived via HKDF(token, per-session salt); direction-split
   nonce counters and a server-side replay cache defeat record-and-replay
   probing. Hardware-accelerated: near-zero throughput cost.
+- **SSH last-resort tier** — on networks that intercept TLS outright, the
+  client tunnels inside real SSH (host-key pinned) automatically.
 - **Multiplexed sessions** — one tunnel carries all your connections: faster
   page loads and fewer connections on the wire (enabled by default).
 - **UDP relay** — DNS-over-UDP, QUIC/HTTP3, calls and games work through the
   tunnel via SOCKS5 UDP ASSOCIATE.
-- **Share links + QR** — `otu-client -c client.toml -share-link [-qr out.png]`
-  produces a self-contained `otu://` link (⚠ embeds your secret token).
+- **Auto-update** — the client watches GitHub Releases, verifies SHA-256,
+  and updates itself safely (old binary kept as `.old`).
 - **Adaptive stealth ladder** — `profile = "auto"` starts at *fast*, escalates
   to *balanced* (Chrome-fingerprint ClientHello + size-bucket padding) or
   *stealth* (+ per-frame timing jitter) only when blocked or throttled, then
   automatically re-probes downward so you stay at maximum speed.
-- **Abuse-resistant server** — per-IP connection caps and escalating bans on
-  failed handshakes; over-limit peers see the ordinary decoy page.
+- **ISP NOC panel** — device inventory with live health (CPU, memory,
+  temperature, uptime), tunnel latency/jitter/loss, alerts, top talkers,
+  access schedules, bandwidth caps, data quotas, category filtering, custom
+  blocklists, GeoIP locations and a global kill switch — all enforced at the
+  relay.
 - **Zero residue** — every setting changed (Windows per-user proxy) is
   journaled and restored on exit, crash, or even console-window close.
 
-> Status: v0.3.0 — protocol v3 (mux + UDP), adaptive profiles, uTLS Chrome
-> hello, replay cache, connection guard, console-close restore, CI. See
-> [CHANGELOG.md](CHANGELOG.md).
+> Status: v0.9.x — per-device auth (NAC), ISP NOC panel, client telemetry,
+> auto-update from GitHub Releases. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
 ### 1. Server (any Linux VPS)
 
 ```bash
-./otu-server -gen-config -c server.toml   # edit token!
+./otu-server -gen-config -c server.toml   # edit token if you want a legacy fallback!
 ./otu-server -c server.toml
 ```
 
-Copy the printed **certificate fingerprint**.
+Devices authenticate per-device by default; the `token` in server.toml is
+only a legacy fallback (`allow_legacy_master`) and can stay disabled.
 
 ### 2. Client (Windows, no admin)
 
+**Easiest**: put `otu-client.exe` (and `tun.key` if you were given one) in a
+folder and **double-click it**. A console opens, the browser is routed
+automatically, and the first run waits for the admin to approve the device.
+
 ```powershell
-.\otu-client.exe -gen-config -c client.toml
-# edit client.toml: server_addr, token, paste the fingerprint
-.\otu-client.exe -c client.toml                # manual mode
-.\otu-client.exe -c client.toml --auto-proxy   # also sets/restores system proxy
+.\otu-client.exe                        # double-click equivalent (auto-proxy on)
+.\otu-client.exe -c client.toml         # manual: use a specific config, no auto-proxy
+.\otu-client.exe -c client.toml --auto-proxy   # manual config + system proxy
+.\otu-client.exe --restore              # emergency: restore network settings
 ```
 
-Point Firefox at `127.0.0.1:1080` (SOCKS5) or use the HTTP proxy on
-`127.0.0.1:8118`. With `--auto-proxy`, Edge/Chrome follow the system proxy
-automatically; original settings are restored when you press Ctrl+C.
+Without `--auto-proxy`, point Firefox at `127.0.0.1:1080` (SOCKS5) or any
+browser at the HTTP proxy on `127.0.0.1:18080`. Original settings are
+restored when you press Ctrl+C or close the window.
 
 If anything ever crashes, `otu-client.exe --restore` puts settings back.
 

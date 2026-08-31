@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"opentunnel/internal/client"
@@ -32,6 +33,14 @@ func main() {
 	shareLink := flag.Bool("share-link", false, "print an otu:// share link for this config and exit")
 	qrOut := flag.String("qr", "", "with -share-link: also write a PNG QR code to this path")
 	flag.Parse()
+
+	// Double-click mode: launched with no arguments from Explorer. Route the
+	// browser automatically and keep the window informative; everything is
+	// still restored on exit, crash, or window close.
+	doubleClick := flag.NFlag() == 0 && flag.NArg() == 0
+	if doubleClick {
+		*autoProxy = true
+	}
 
 	if *showVersion {
 		fmt.Println("opentunnel client", version.Version)
@@ -122,10 +131,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("device token: %v", err)
 	}
+	fmt.Printf("[i] device: %s\n", device.DeviceName)
+
+	// Graceful stop path: signals (Ctrl+C / window close) or panel decisions
+	// (ban) both cancel the context and wake the main loop.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
+	var stopOnce sync.Once
+	requestStop := func() {
+		stopOnce.Do(func() {
+			stopSignals()
+		})
+	}
+
 	// Register with panel (fire-and-forget; panel will create pending peer)
 	go client.RegisterWithPanel(cfg, device)
 	// Background heartbeat and status poll (kick/ban/pending)
-	go client.PollTokenStatus(cfg, device)
+	go client.PollTokenStatus(cfg, device, requestStop)
 
 	if *shareLink {
 		link, lerr := share.Build(share.Params{
@@ -248,9 +269,6 @@ func main() {
 		fmt.Println("[i] auto-update: watching GitHub releases")
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
 	httpAddr := cfg.HTTPAddr
 	socksAddr := cfg.SOCKSAddr
 	var lnHTTP, lnSOCKS net.Listener
@@ -293,17 +311,30 @@ func main() {
 		fmt.Printf("[+] System proxy set to %s (restored on any exit)\n", sysProxy)
 	}
 
-	fmt.Println("[i] Press Ctrl+C to stop and restore settings.")
+	if doubleClick {
+		fmt.Println()
+		fmt.Println("================================================================")
+		fmt.Println(" otu is running. Your web browser now goes through the tunnel.")
+		fmt.Println()
+		fmt.Println(" HOW TO USE")
+		fmt.Println("   1. Just browse normally - no other setup needed.")
+		fmt.Println("   2. First time only: the admin must approve this device,")
+		fmt.Println("      then pages load automatically (can take a minute).")
+		fmt.Println("   3. To stop: close this window or press Ctrl+C.")
+		fmt.Println("      Your normal connection is restored automatically.")
+		fmt.Println("================================================================")
+	} else {
+		fmt.Println("[i] Point your browser at the SOCKS5 or HTTP proxy above, or press Ctrl+C to stop.")
+	}
 
 	<-ctx.Done()
-	stop()
 	if lnSOCKS != nil {
 		_ = lnSOCKS.Close()
 	}
 	if lnHTTP != nil {
 		_ = lnHTTP.Close()
 	}
-	fmt.Println("\nbye — settings restored where changed.")
+	fmt.Println("\nbye - settings restored where changed.")
 }
 
 func firstNonEmpty(a, b string) string {
