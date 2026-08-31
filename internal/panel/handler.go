@@ -440,25 +440,45 @@ func (h *Handler) apiEvents(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		json.NewEncoder(w).Encode(map[string]any{
+		resp := map[string]any{
 			"kill_switch": h.db.KillSwitch(),
-		})
+		}
+		if until := h.db.AutoAcceptUntil(); !until.IsZero() {
+			resp["auto_accept_until"] = until.Format(time.RFC3339)
+			resp["auto_accept_active"] = h.db.AutoAcceptActive()
+		} else {
+			resp["auto_accept_active"] = false
+		}
+		json.NewEncoder(w).Encode(resp)
 		return
 	}
 	var req struct {
-		KillSwitch *bool `json:"kill_switch"`
+		KillSwitch   *bool `json:"kill_switch"`
+		AutoAcceptMin *int  `json:"auto_accept_minutes"` // >0 open for N minutes; 0 close now
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.KillSwitch == nil {
-		http.Error(w, "kill_switch required", 400)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || (req.KillSwitch == nil && req.AutoAcceptMin == nil) {
+		http.Error(w, "kill_switch or auto_accept_minutes required", 400)
 		return
 	}
-	h.db.SetKillSwitch(*req.KillSwitch)
-	if *req.KillSwitch {
-		h.db.RecordEvent("kill-switch", "all tunnel traffic suspended")
-		h.db.RecordAlert("critical", "kill-switch", "KILL SWITCH ENGAGED — all tunnel traffic suspended")
-	} else {
-		h.db.RecordEvent("kill-switch", "tunnel traffic resumed")
-		h.db.RecordAlert("info", "kill-switch", "kill switch released — traffic resumed")
+	if req.AutoAcceptMin != nil {
+		until := h.db.SetAutoAccept(*req.AutoAcceptMin)
+		if until.IsZero() {
+			h.db.RecordEvent("auto-accept", "auto-accept window closed")
+			h.db.RecordAlert("info", "nac", "auto-accept window closed — new devices need approval again")
+		} else {
+			h.db.RecordEvent("auto-accept", "auto-accept window open until "+until.Format("2006-01-02 15:04:05")+" UTC")
+			h.db.RecordAlert("warning", "nac", "auto-accept OPEN until "+until.Format("2006-01-02 15:04:05")+" UTC — new devices are approved instantly")
+		}
+	}
+	if req.KillSwitch != nil {
+		h.db.SetKillSwitch(*req.KillSwitch)
+		if *req.KillSwitch {
+			h.db.RecordEvent("kill-switch", "all tunnel traffic suspended")
+			h.db.RecordAlert("critical", "kill-switch", "KILL SWITCH ENGAGED — all tunnel traffic suspended")
+		} else {
+			h.db.RecordEvent("kill-switch", "tunnel traffic resumed")
+			h.db.RecordAlert("info", "kill-switch", "kill switch released — traffic resumed")
+		}
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
@@ -517,9 +537,10 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "device banned", 403)
 		return
 	}
-	// New devices start pending unless auto-approve is enabled.
+	// New devices start pending unless auto-approve is configured or the
+	// admin has opened a temporary auto-accept window.
 	status := "pending"
-	if h.autoApprove {
+	if h.autoApprove || h.db.AutoAcceptActive() {
 		status = "approved"
 	}
 	// Only set status on first insert; existing peers keep their current status
@@ -533,6 +554,11 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	} else {
 		h.db.RecordEvent("register", req.DeviceName+" registered ("+status+")")
 		h.db.RecordAlert("info", "nac", "new device "+req.DeviceName+" registered — status: "+status)
+		// Auto-approved via the window: install the SSH key now so
+		// standalone clients can use the ssh tier immediately.
+		if status == "approved" && h.OnApprove != nil && !h.autoApprove {
+			h.OnApprove(req.Token)
+		}
 	}
 	json.NewEncoder(w).Encode(map[string]string{"status": status})
 }

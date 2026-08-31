@@ -42,6 +42,8 @@ export function Security() {
   const [alerts, setAlerts] = useState<AlertItem[]>([])
   const [categories, setCategories] = useState<Category[]>([])
   const [health, setHealth] = useState<ServerHealth | null>(null)
+  const [aaUntil, setAaUntil] = useState<string | undefined>(undefined)
+  const [aaActive, setAaActive] = useState(false)
 
   const load = () => {
     api.peers().then(setPeers).catch(() => {})
@@ -49,12 +51,26 @@ export function Security() {
     api.alerts().then((a) => setAlerts(a.alerts)).catch(() => {})
     api.categories().then(setCategories).catch(() => {})
     api.serverHealth().then(setHealth).catch(() => {})
+    api
+      .settings()
+      .then((s) => {
+        setAaUntil(s.auto_accept_until)
+        setAaActive(s.auto_accept_active)
+      })
+      .catch(() => {})
   }
   useEffect(() => {
     load()
     const id = setInterval(load, 5000)
     return () => clearInterval(id)
   }, [])
+
+  const openWindow = (minutes: number) => {
+    api
+      .setAutoAccept(minutes)
+      .then(load)
+      .catch(() => {})
+  }
 
   const pending = peers.filter((p) => p.status === "pending")
   const securityAlerts = alerts.filter(
@@ -78,7 +94,47 @@ export function Security() {
             per-device credential; posture is checked before access is granted
           </CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/60 bg-muted/30 p-3">
+            <div className="text-sm">
+              {aaActive ? (
+                <>
+                  <span className="mr-2 inline-flex size-2 animate-pulse rounded-full bg-primary" />
+                  <span className="font-medium text-primary">Auto-accept open</span>
+                  <span className="text-muted-foreground"> — new devices are approved instantly (until {new Date(aaUntil ?? "").toLocaleTimeString()})</span>
+                </>
+              ) : aaUntil ? (
+                <>
+                  <span className="font-medium">Auto-accept window expired</span>
+                  <span className="text-muted-foreground"> — new devices need approval again</span>
+                </>
+              ) : (
+                <>
+                  <span className="font-medium">Manual approval</span>
+                  <span className="text-muted-foreground"> — open a window when handing the client out so recipients connect instantly</span>
+                </>
+              )}
+            </div>
+            <div className="flex gap-2">
+              {aaActive ? (
+                <Button size="sm" variant="outline" onClick={() => openWindow(0)}>
+                  Close window
+                </Button>
+              ) : (
+                <>
+                  <Button size="sm" variant="outline" onClick={() => openWindow(15)}>
+                    Open 15 min
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => openWindow(30)}>
+                    30 min
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => openWindow(60)}>
+                    60 min
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
           {pending.length === 0 ? (
             <p className="flex items-center gap-2 text-sm text-muted-foreground">
               <ShieldCheckIcon className="size-4 text-primary" />

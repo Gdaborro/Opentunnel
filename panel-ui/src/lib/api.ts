@@ -121,7 +121,12 @@ export const api = {
   events: () => req<EventItem[]>("/admin/api/events"),
   categories: () => req<Category[]>("/admin/api/categories"),
   blocklist: () => req<BlockEntry[]>("/admin/api/blocklist"),
-  settings: () => req<{ kill_switch: boolean }>("/admin/api/settings"),
+  settings: () =>
+    req<{
+      kill_switch: boolean
+      auto_accept_until?: string
+      auto_accept_active: boolean
+    }>("/admin/api/settings"),
   visits: () => req<{ domain: string; hits: number; last: string }[]>("/admin/api/visits"),
   report: () => req<{ day: string; up: number; down: number }[]>("/admin/api/report"),
   devices: () => req<DeviceHealth[]>("/admin/api/devices"),
@@ -144,4 +149,6 @@ export const api = {
       body: JSON.stringify({ domain }),
     }),
   setKillSwitch: (on: boolean) => req<{ ok: boolean }>("/admin/api/settings", post({ kill_switch: on })),
+  setAutoAccept: (minutes: number) =>
+    req<{ ok: boolean }>("/admin/api/settings", post({ auto_accept_minutes: minutes })),
 }

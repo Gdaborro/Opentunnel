@@ -185,6 +185,37 @@ func (db *DB) SetKillSwitch(on bool) {
 	killMu.Unlock()
 }
 
+// AutoAcceptUntil returns the current auto-accept deadline (zero when off).
+func (db *DB) AutoAcceptUntil() time.Time {
+	raw := db.Setting("auto_accept_until")
+	if raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02 15:04:05", raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// SetAutoAccept opens (minutes > 0) or closes (minutes <= 0) the auto-accept
+// window: while open, new devices are approved instantly on registration.
+func (db *DB) SetAutoAccept(minutes int) time.Time {
+	if minutes <= 0 {
+		db.SetSetting("auto_accept_until", "")
+		return time.Time{}
+	}
+	until := time.Now().UTC().Add(time.Duration(minutes) * time.Minute)
+	db.SetSetting("auto_accept_until", until.Format("2006-01-02 15:04:05"))
+	return until
+}
+
+// AutoAcceptActive reports whether the auto-accept window is currently open.
+func (db *DB) AutoAcceptActive() bool {
+	until := db.AutoAcceptUntil()
+	return !until.IsZero() && time.Now().UTC().Before(until)
+}
+
 // PeerLimits returns the configured per-device caps (0 = unlimited).
 func (db *DB) PeerLimits(token string) (maxBps, quotaBytes int64) {
 	db.QueryRow(`SELECT COALESCE(max_bps,0), COALESCE(quota_bytes,0) FROM peers WHERE token=?`, token).Scan(&maxBps, &quotaBytes)
