@@ -551,6 +551,17 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		var existingStatus string
 		h.db.QueryRow(`SELECT status FROM peers WHERE token=?`, req.Token).Scan(&existingStatus)
 		status = existingStatus
+		// A device that registered before an auto-accept window opened must
+		// not stay stuck pending forever: while the window is open, upgrade
+		// it and install its SSH key so early launchers connect too.
+		if status == "pending" && h.db.AutoAcceptActive() {
+			h.db.Exec(`UPDATE peers SET status='approved' WHERE token=?`, req.Token)
+			status = "approved"
+			h.db.RecordEvent("auto-accept", req.DeviceName+" upgraded to approved (auto-accept window)")
+			if h.OnApprove != nil {
+				h.OnApprove(req.Token)
+			}
+		}
 	} else {
 		h.db.RecordEvent("register", req.DeviceName+" registered ("+status+")")
 		h.db.RecordAlert("info", "nac", "new device "+req.DeviceName+" registered — status: "+status)

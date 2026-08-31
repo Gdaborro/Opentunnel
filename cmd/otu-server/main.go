@@ -149,12 +149,16 @@ func main() {
 			if pub == "" {
 				return
 			}
+			// Default: a keys file the panel service user can write
+			// (otu owns /var/lib/opentunnel). sshd is configured to read
+			// it as a second AuthorizedKeysFile, which it does as root —
+			// so no service needs root or write access under /home/tun.
 			akPath := os.Getenv("OTU_AUTHORIZED_KEYS")
 			if akPath == "" {
-				akPath = "/home/tun/.ssh/authorized_keys"
+				akPath = filepath.Join(stateDirForPanel, "authorized_keys")
 			}
 			if _, err := os.Stat(akPath); err != nil {
-				return // no ssh tier on this server — skip silently
+				return // ssh tier not provisioned — skip silently
 			}
 			f, err := os.OpenFile(akPath, os.O_APPEND|os.O_WRONLY, 0o600)
 			if err != nil {
