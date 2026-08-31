@@ -35,17 +35,17 @@ export function SectionCards({
   version: string
 }) {
   return (
-    <div className="grid grid-cols-1 gap-4 *:data-[slot=card]:bg-gradient-to-t *:data-[slot=card]:from-primary/5 *:data-[slot=card]:to-card *:data-[slot=card]:shadow-xs @xl/main:grid-cols-2 @5xl/main:grid-cols-4 dark:*:data-[slot=card]:bg-card">
+    <div className="grid grid-cols-1 gap-4 @xl/main:grid-cols-2 @5xl/main:grid-cols-4">
       <Card className="@container/card">
         <CardHeader>
           <CardDescription>Devices Online</CardDescription>
-          <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+          <CardTitle className="gradient-text text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
             {online}
             <span className="text-lg text-muted-foreground"> / {total}</span>
           </CardTitle>
           <CardAction>
-            <Badge variant="outline">
-              <TrendingUpIcon />
+            <Badge variant="outline" className="gap-1.5 border-primary/25 bg-primary/5">
+              <span className={`size-1.5 rounded-full ${online > 0 ? "bg-primary glow-dot" : "bg-muted-foreground"}`} />
               live
             </Badge>
           </CardAction>
@@ -62,11 +62,11 @@ export function SectionCards({
       <Card className="@container/card">
         <CardHeader>
           <CardDescription>Total Traffic</CardDescription>
-          <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+          <CardTitle className="gradient-text text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
             {formatBytes(bytesUp + bytesDown)}
           </CardTitle>
           <CardAction>
-            <Badge variant="outline">
+            <Badge variant="outline" className="gap-1 border-chart-2/25 bg-chart-2/5 text-chart-2">
               <TrendingUpIcon />
               all time
             </Badge>
@@ -87,11 +87,11 @@ export function SectionCards({
       <Card className="@container/card">
         <CardHeader>
           <CardDescription>Unacked Alerts</CardDescription>
-          <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+          <CardTitle className="gradient-text text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
             {unacked}
           </CardTitle>
           <CardAction>
-            <Badge variant="outline">
+            <Badge variant="outline" className={unacked > 0 ? "gap-1 border-destructive/30 bg-destructive/10 text-destructive" : "gap-1 border-primary/25 bg-primary/5"}>
               {unacked > 0 ? <AlertTriangleIcon /> : <TrendingUpIcon />}
               {unacked > 0 ? "attention" : "clear"}
             </Badge>
@@ -109,12 +109,12 @@ export function SectionCards({
       <Card className="@container/card">
         <CardHeader>
           <CardDescription>Relay Uptime</CardDescription>
-          <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+          <CardTitle className="gradient-text text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
             {uptimeLabel}
           </CardTitle>
           <CardAction>
-            <Badge variant="outline">
-              <TrendingUpIcon />
+            <Badge variant="outline" className="gap-1.5 border-chart-2/25 bg-chart-2/5 text-chart-2">
+              <span className="glow-dot size-1.5 rounded-full bg-chart-2" />
               {version}
             </Badge>
           </CardAction>
@@ -123,7 +123,7 @@ export function SectionCards({
           <div className="line-clamp-1 flex gap-2 font-medium">
             Core relay process continuous run
           </div>
-          <div className="text-muted-foreground">cdn.aborro.dev</div>
+          <div className="text-muted-foreground">Core relay</div>
         </CardFooter>
       </Card>
     </div>

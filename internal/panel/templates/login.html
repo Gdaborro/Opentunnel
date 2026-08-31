@@ -3,23 +3,41 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Login — opentunnel panel</title>
+<title>otu — sign in</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
-:root{--background:0 0% 100%;--foreground:240 10% 3.9%;--card:0 0% 100%;--primary:240 5.9% 10%;--primary-foreground:0 0% 98%;--muted:240 4.8% 95.9%;--border:240 5.9% 90%;}
-*{border-color:hsl(var(--border))}
+:root{--bg:#0d0e13;--card:#15161d;--border:#262835;--fg:#f5f6fa;--muted:#9aa0b4;--primary:#8b5cf6;--primary2:#22d3ee}
+*{border-color:var(--border)}
+body{background:var(--bg);color:var(--fg);font-family:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif}
+body::before{content:"";position:fixed;inset:0;background:
+ radial-gradient(55rem 34rem at 80% -10%,rgba(139,92,246,.14),transparent 60%),
+ radial-gradient(45rem 30rem at -10% 40%,rgba(34,211,238,.07),transparent 55%);
+ pointer-events:none}
 </style>
 </head>
-<body class="min-h-screen bg-white flex items-center justify-center p-4">
-<div class="w-full max-w-sm border rounded-lg shadow-sm p-6 bg-white">
-<h1 class="text-xl font-semibold mb-1">opentunnel</h1>
-<p class="text-sm text-gray-500 mb-6">Sign in to manage your network</p>
-<form id="f" class="space-y-4">
-<input id="u" placeholder="Username" class="w-full border rounded-md px-3 py-2 text-sm">
-<input id="p" type="password" placeholder="Password" class="w-full border rounded-md px-3 py-2 text-sm">
-<button class="w-full bg-black text-white rounded-md py-2 text-sm">Sign in</button>
-<p id="e" class="text-sm text-red-600 hidden"></p>
-</form>
+<body class="min-h-screen flex items-center justify-center p-4">
+<div class="relative w-full max-w-sm rounded-2xl border p-7 backdrop-blur-xl"
+     style="background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(21,22,29,.92));box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 24px 60px -20px rgba(0,0,0,.6)">
+  <div class="mb-6 flex items-center gap-3">
+    <div class="flex size-10 items-center justify-center rounded-xl text-white font-bold"
+         style="background:linear-gradient(135deg,var(--primary2),var(--primary));box-shadow:0 8px 24px -6px rgba(139,92,246,.5)">o</div>
+    <div>
+      <h1 class="text-lg font-bold tracking-tight">otu</h1>
+      <p class="text-xs uppercase tracking-[0.16em]" style="color:var(--muted)">network operations</p>
+    </div>
+  </div>
+  <p class="mb-5 text-sm" style="color:var(--muted)">Sign in to manage your network</p>
+  <form id="f" class="space-y-3">
+    <input id="u" placeholder="Username" autocomplete="username"
+      class="w-full rounded-xl border px-3.5 py-2.5 text-sm outline-none transition focus:border-violet-500/60"
+      style="background:rgba(255,255,255,.03)">
+    <input id="p" type="password" placeholder="Password" autocomplete="current-password"
+      class="w-full rounded-xl border px-3.5 py-2.5 text-sm outline-none transition focus:border-violet-500/60"
+      style="background:rgba(255,255,255,.03)">
+    <button class="w-full rounded-xl py-2.5 text-sm font-semibold text-white transition active:scale-[0.98]"
+      style="background:linear-gradient(100deg,var(--primary),#a78bfa);box-shadow:0 10px 30px -10px rgba(139,92,246,.6)">Sign in</button>
+    <p id="e" class="text-sm hidden" style="color:#f87171"></p>
+  </form>
 </div>
 <script>
 document.getElementById('f').onsubmit=async e=>{

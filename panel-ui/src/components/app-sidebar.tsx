@@ -21,7 +21,7 @@ import {
   FilterIcon,
   Settings2Icon,
   FileTextIcon,
-  GlobeIcon,
+  SparklesIcon,
 } from "lucide-react"
 
 export type PageKey =
@@ -48,11 +48,6 @@ const navSecondary = [
     title: "Service Status",
     url: "/status",
     icon: <FileTextIcon />,
-  },
-  {
-    title: "Aborro.dev",
-    url: "/",
-    icon: <GlobeIcon />,
   },
 ]
 
@@ -88,8 +83,15 @@ export function AppSidebar({
               className="data-[slot=sidebar-menu-button]:p-1.5!"
             >
               <a href="#">
-                <GlobeIcon className="size-5! text-primary" />
-                <span className="text-base font-semibold">Aborro Network</span>
+                <span className="relative flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-chart-5 via-primary to-chart-2 shadow-lg shadow-primary/25">
+                  <SparklesIcon className="!size-4 text-primary-foreground" />
+                </span>
+                <span className="text-base font-bold tracking-tight">
+                  otu
+                  <span className="ml-1.5 align-middle text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                    network
+                  </span>
+                </span>
               </a>
             </SidebarMenuButton>
           </SidebarMenuItem>
@@ -103,7 +105,7 @@ export function AppSidebar({
         <NavUser
           user={{
             name: "Network Operator",
-            email: "noc@aborro.dev",
+            email: "otu admin",
             avatar: "",
           }}
         />

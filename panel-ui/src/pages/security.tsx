@@ -301,7 +301,7 @@ export function Security() {
             </TableHeader>
             <TableBody>
               <TableRow>
-                <TableCell className="font-medium">Core relay (cdn.aborro.dev)</TableCell>
+                <TableCell className="font-medium">Core relay</TableCell>
                 <TableCell>{health?.version ?? "—"}</TableCell>
                 <TableCell>
                   {health?.platform ?? health?.os ?? "linux"} · kernel{" "}

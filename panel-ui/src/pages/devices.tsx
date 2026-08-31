@@ -39,7 +39,7 @@ export function Devices() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-sm">
             <ServerIcon className="size-4 text-primary" />
-            Core Relay — cdn.aborro.dev
+            Core Relay
           </CardTitle>
           <CardDescription>
             OLT-equivalent aggregation point: hardware health, load and uptime

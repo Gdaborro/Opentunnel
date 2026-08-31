@@ -56,14 +56,14 @@ export default function App() {
           unacked={unacked}
           onNavigate={setPage}
         />
-        <SidebarInset>
+        <SidebarInset className="border-sidebar-border/60">
           <SiteHeader
             title={page}
             subtitle={subtitles[page]}
             killSwitch={kill}
             pending={pending}
           />
-          <main className="@container/main flex flex-1 flex-col gap-4 p-4 lg:p-6">
+          <main key={page} className="@container/main page-enter flex flex-1 flex-col gap-4 p-4 lg:p-6">
             {page === "Overview" && <Overview />}
             {page === "Monitoring" && <Monitoring />}
             {page === "Security" && <Security />}
