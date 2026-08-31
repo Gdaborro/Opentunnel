@@ -63,7 +63,7 @@ export default function App() {
             killSwitch={kill}
             pending={pending}
           />
-          <main key={page} className="@container/main page-enter flex flex-1 flex-col gap-4 p-4 lg:p-6">
+          <main key={page} className="@container/main flex flex-1 flex-col gap-4 p-4 lg:p-6">
             {page === "Overview" && <Overview />}
             {page === "Monitoring" && <Monitoring />}
             {page === "Security" && <Security />}

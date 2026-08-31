@@ -1,4 +1,4 @@
-"use client"
+﻿"use client"
 
 import { Badge } from "@/components/ui/badge"
 import {
@@ -9,12 +9,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import {
-  TrendingUpIcon,
-  AlertTriangleIcon,
-  ArrowUpIcon,
-  ArrowDownIcon,
-} from "lucide-react"
+import { TrendingUpIcon, AlertTriangleIcon, ArrowUpIcon, ArrowDownIcon } from "lucide-react"
 import { formatBytes } from "@/lib/format"
 
 export function SectionCards({
@@ -35,17 +30,17 @@ export function SectionCards({
   version: string
 }) {
   return (
-    <div className="grid grid-cols-1 gap-4 @xl/main:grid-cols-2 @5xl/main:grid-cols-4">
+    <div className="grid grid-cols-1 gap-4 *:data-[slot=card]:bg-gradient-to-t *:data-[slot=card]:from-primary/5 *:data-[slot=card]:to-card *:data-[slot=card]:shadow-xs @xl/main:grid-cols-2 @5xl/main:grid-cols-4 dark:*:data-[slot=card]:bg-card">
       <Card className="@container/card">
         <CardHeader>
           <CardDescription>Devices Online</CardDescription>
-          <CardTitle className="gradient-text text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+          <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
             {online}
             <span className="text-lg text-muted-foreground"> / {total}</span>
           </CardTitle>
           <CardAction>
-            <Badge variant="outline" className="gap-1.5 border-primary/25 bg-primary/5">
-              <span className={`size-1.5 rounded-full ${online > 0 ? "bg-primary glow-dot" : "bg-muted-foreground"}`} />
+            <Badge variant="outline">
+              <TrendingUpIcon />
               live
             </Badge>
           </CardAction>
@@ -54,19 +49,17 @@ export function SectionCards({
           <div className="line-clamp-1 flex gap-2 font-medium">
             Approved subscribers on the network
           </div>
-          <div className="text-muted-foreground">
-            Updated every 5 seconds
-          </div>
+          <div className="text-muted-foreground">Updated every 5 seconds</div>
         </CardFooter>
       </Card>
       <Card className="@container/card">
         <CardHeader>
           <CardDescription>Total Traffic</CardDescription>
-          <CardTitle className="gradient-text text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+          <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
             {formatBytes(bytesUp + bytesDown)}
           </CardTitle>
           <CardAction>
-            <Badge variant="outline" className="gap-1 border-chart-2/25 bg-chart-2/5 text-chart-2">
+            <Badge variant="outline">
               <TrendingUpIcon />
               all time
             </Badge>
@@ -87,11 +80,11 @@ export function SectionCards({
       <Card className="@container/card">
         <CardHeader>
           <CardDescription>Unacked Alerts</CardDescription>
-          <CardTitle className="gradient-text text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+          <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
             {unacked}
           </CardTitle>
           <CardAction>
-            <Badge variant="outline" className={unacked > 0 ? "gap-1 border-destructive/30 bg-destructive/10 text-destructive" : "gap-1 border-primary/25 bg-primary/5"}>
+            <Badge variant="outline">
               {unacked > 0 ? <AlertTriangleIcon /> : <TrendingUpIcon />}
               {unacked > 0 ? "attention" : "clear"}
             </Badge>
@@ -103,18 +96,18 @@ export function SectionCards({
               ? "Security & fault alerts need review"
               : "No alerts awaiting acknowledgement"}
           </div>
-          <div className="text-muted-foreground">See Monitoring → Alerts</div>
+          <div className="text-muted-foreground">See Monitoring alerts</div>
         </CardFooter>
       </Card>
       <Card className="@container/card">
         <CardHeader>
           <CardDescription>Relay Uptime</CardDescription>
-          <CardTitle className="gradient-text text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
+          <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
             {uptimeLabel}
           </CardTitle>
           <CardAction>
-            <Badge variant="outline" className="gap-1.5 border-chart-2/25 bg-chart-2/5 text-chart-2">
-              <span className="glow-dot size-1.5 rounded-full bg-chart-2" />
+            <Badge variant="outline">
+              <TrendingUpIcon />
               {version}
             </Badge>
           </CardAction>

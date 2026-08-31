@@ -1,4 +1,4 @@
-import * as React from "react"
+﻿import * as React from "react"
 
 import { NavMain } from "@/components/nav-main"
 import { NavSecondary } from "@/components/nav-secondary"
@@ -83,12 +83,12 @@ export function AppSidebar({
               className="data-[slot=sidebar-menu-button]:p-1.5!"
             >
               <a href="#">
-                <span className="relative flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-chart-5 via-primary to-chart-2 shadow-lg shadow-primary/25">
-                  <SparklesIcon className="!size-4 text-primary-foreground" />
+                <span className="flex size-8 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
+                  <SparklesIcon className="size-4" />
                 </span>
-                <span className="text-base font-bold tracking-tight">
+                <span className="text-base font-semibold tracking-tight">
                   otu
-                  <span className="ml-1.5 align-middle text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                  <span className="ml-1.5 align-middle text-[10px] font-medium uppercase tracking-[0.14em] text-sidebar-foreground/60">
                     network
                   </span>
                 </span>
