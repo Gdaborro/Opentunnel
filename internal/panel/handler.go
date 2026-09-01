@@ -73,6 +73,10 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	// below), so it is served publicly; every other admin route stays gated.
 	mux.Handle("/admin/setup", http.HandlerFunc(h.dashboard))
 	mux.Handle("/admin/login", http.HandlerFunc(h.dashboard))
+	// Static SPA assets are public: the modulepreload/script tags in the
+	// pre-login index.html must load with correct MIME types (an auth
+	// redirect would serve HTML and the module would be rejected).
+	mux.Handle("/admin/assets/", http.HandlerFunc(h.dashboard))
 	mux.Handle("/admin/api/setup", http.HandlerFunc(h.apiSetup))
 	mux.Handle("/admin/api/setup-status", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]bool{"needs_setup": h.auth.NeedsSetup()})
