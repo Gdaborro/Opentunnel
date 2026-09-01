@@ -102,11 +102,24 @@ export interface ServerHealth {
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { credentials: "same-origin", ...init })
   if (res.status === 401 || res.status === 403) {
-    if (!path.startsWith("/admin/api/login")) window.location.href = "/admin/login"
     throw new Error("unauthorized")
   }
   if (!res.ok) throw new Error(await res.text())
   return res.json() as Promise<T>
+}
+
+// Session gate for the SPA shell: authenticated, needs-login, or fresh box.
+export async function authState(): Promise<"authenticated" | "login" | "setup"> {
+  try {
+    await req<unknown>("/admin/api/stats")
+    return "authenticated"
+  } catch (e) {
+    if (String(e).includes("unauthorized")) {
+      const s = await req<{ needs_setup: boolean }>("/admin/api/setup-status")
+      return s.needs_setup ? "setup" : "login"
+    }
+    throw e
+  }
 }
 
 const post = (body: unknown): RequestInit => ({

@@ -3,7 +3,6 @@ package panel
 import (
 	"database/sql"
 	"encoding/json"
-	"html/template"
 	"net"
 	"net/http"
 	"strings"
@@ -18,7 +17,6 @@ var _ = time.Second // peers carry time.Time fields
 type Handler struct {
 	db          *DB
 	auth        *Auth
-	tmpl        *template.Template
 	autoApprove bool
 	geo         *GeoIP // optional; nil = no country resolution
 
@@ -39,8 +37,7 @@ const regLimitMax = 10 // registrations per IP per window
 const regLimitWindow = time.Minute
 
 func New(db *DB, auth *Auth, autoApprove bool) *Handler {
-	tmpl := template.Must(template.ParseFS(templateFS, "templates/*.html"))
-	return &Handler{db: db, auth: auth, tmpl: tmpl, autoApprove: autoApprove, rlMap: make(map[string]*regLimit)}
+	return &Handler{db: db, auth: auth, autoApprove: autoApprove, rlMap: make(map[string]*regLimit)}
 }
 
 // WithGeoIP attaches an offline GeoIP resolver (panel map / countries).
@@ -72,9 +69,14 @@ func (h *Handler) regAllowed(ip string) bool {
 }
 
 func (h *Handler) Mount(mux *http.ServeMux) {
-	mux.Handle("/admin/setup", http.HandlerFunc(h.setupPage))
+	// The SPA handles login and first-run setup itself (calls the JSON APIs
+	// below), so it is served publicly; every other admin route stays gated.
+	mux.Handle("/admin/setup", http.HandlerFunc(h.dashboard))
+	mux.Handle("/admin/login", http.HandlerFunc(h.dashboard))
 	mux.Handle("/admin/api/setup", http.HandlerFunc(h.apiSetup))
-	mux.Handle("/admin/login", http.HandlerFunc(h.loginPage))
+	mux.Handle("/admin/api/setup-status", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]bool{"needs_setup": h.auth.NeedsSetup()})
+	}))
 	mux.Handle("/admin/api/login", http.HandlerFunc(h.apiLogin))
 	mux.Handle("/admin/logout", http.HandlerFunc(h.logout))
 	mux.Handle("/admin/api/peers", h.auth.RequireAuth(http.HandlerFunc(h.apiPeers)))
@@ -103,22 +105,6 @@ func (h *Handler) Handler() http.Handler {
 	mux := http.NewServeMux()
 	h.Mount(mux)
 	return mux
-}
-
-func (h *Handler) loginPage(w http.ResponseWriter, r *http.Request) {
-	if h.auth.NeedsSetup() {
-		http.Redirect(w, r, "/admin/setup", http.StatusFound)
-		return
-	}
-	h.tmpl.ExecuteTemplate(w, "login.html", nil)
-}
-
-func (h *Handler) setupPage(w http.ResponseWriter, r *http.Request) {
-	if !h.auth.NeedsSetup() {
-		http.Redirect(w, r, "/admin/login", http.StatusFound)
-		return
-	}
-	h.tmpl.ExecuteTemplate(w, "setup.html", nil)
 }
 
 func (h *Handler) apiSetup(w http.ResponseWriter, r *http.Request) {
