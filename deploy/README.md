@@ -28,3 +28,21 @@ sudo sshd -t && sudo systemctl reload ssh
   connection caps, per-session stream cap 256, per-device bandwidth/quota).
 - No fail2ban on the default image; if you add one later, whitelist the
   school/office NAT IPs that share one public address for many clients.
+## VPS: sshd serving panel-approved device keys
+
+The panel service runs as user 'otu' (ProtectHome=tmpfs) and cannot write
+/home/tun/.ssh/authorized_keys. Instead it appends approved device keys to
+/var/lib/opentunnel/authorized_keys (otu-owned, 0600) and sshd serves them:
+
+/usr/local/sbin/otu-keys.sh  (root:root 755):
+  #!/bin/bash
+  cat /home/tun/.ssh/authorized_keys /var/lib/opentunnel/authorized_keys 2>/dev/null
+
+/etc/ssh/sshd_config.d/91-otu-keys.conf:
+  Match User tun
+      AuthorizedKeysCommand /usr/local/sbin/otu-keys.sh
+      AuthorizedKeysCommandUser root
+
+(AuthorizedKeysCommand runs as root, so no file-ownership/StrictModes issues
+apply to the panel-managed file. Verified: fresh device key -> register ->
+auto-accept -> sshd 'Server accepts key' + 'Authenticated using publickey'.)
