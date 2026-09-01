@@ -23,7 +23,9 @@ async function api(path: string, body: unknown): Promise<boolean> {
       body: JSON.stringify(body),
     })
     if (res.ok) return true
-    if (res.status === 401 || res.status === 403) {
+    if (res.status === 403 && path === "/admin/api/setup") {
+      toast.error("Setup is already complete — sign in instead")
+    } else if (res.status === 401 || res.status === 403) {
       toast.error("Invalid credentials")
     } else {
       toast.error((await res.text()) || "Request failed")
@@ -133,21 +135,21 @@ export function AuthPage({
                     {mode === "login" ? "Login" : "Create admin"}
                   </Button>
                 </Field>
-                <FieldDescription className="text-center">
-                  <a
-                    href="#"
-                    className="underline-offset-2 hover:underline"
-                    onClick={(e) => {
-                      e.preventDefault()
-                      setMode(mode === "login" ? "setup" : "login")
-                      setConfirm("")
-                    }}
-                  >
-                    {mode === "login"
-                      ? "First time? Create the admin account"
-                      : "Already have an admin? Sign in"}
-                  </a>
-                </FieldDescription>
+                {mode === "setup" && (
+                  <FieldDescription className="text-center">
+                    <a
+                      href="#"
+                      className="underline-offset-2 hover:underline"
+                      onClick={(e) => {
+                        e.preventDefault()
+                        setMode("login")
+                        setConfirm("")
+                      }}
+                    >
+                      Already have an admin? Sign in
+                    </a>
+                  </FieldDescription>
+                )}
               </FieldGroup>
             </form>
             <div className="relative hidden bg-muted md:block">

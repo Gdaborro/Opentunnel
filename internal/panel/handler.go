@@ -71,7 +71,15 @@ func (h *Handler) regAllowed(ip string) bool {
 func (h *Handler) Mount(mux *http.ServeMux) {
 	// The SPA handles login and first-run setup itself (calls the JSON APIs
 	// below), so it is served publicly; every other admin route stays gated.
-	mux.Handle("/admin/setup", http.HandlerFunc(h.dashboard))
+	// Once an admin exists the setup path is closed entirely: the SPA only
+	// shows setup when setup-status says so, and the route itself bounces.
+	mux.Handle("/admin/setup", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.auth.NeedsSetup() {
+			h.dashboard(w, r)
+			return
+		}
+		http.Redirect(w, r, "/admin/login", http.StatusFound)
+	}))
 	mux.Handle("/admin/login", http.HandlerFunc(h.dashboard))
 	// Static SPA assets are public: the modulepreload/script tags in the
 	// pre-login index.html must load with correct MIME types (an auth
