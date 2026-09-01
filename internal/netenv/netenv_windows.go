@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"unsafe"
 
 	"golang.org/x/sys/windows/registry"
 
@@ -18,6 +20,25 @@ import (
 )
 
 const regKeyPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+
+// Chromium-family browsers (Chrome, Brave, Edge, Vivaldi, Opera...) read the
+// WinINET proxy at startup and ignore later broadcasts in some versions. The
+// per-user policy keys below ARE watched live, so we set both: WinINET for
+// Edge/Firefox/most apps, and policies for every Chromium fork. All HKCU —
+// no UAC, no admin — and journaled for restore like the rest.
+var chromiumPolicyPaths = []string{
+	`Software\Policies\Google\Chrome`,
+	`Software\Policies\Microsoft\Edge`,
+	`Software\Policies\BraveSoftware\Brave`,
+	`Software\Policies\Vivaldi`,
+	`Software\Policies\Chromium`,
+}
+
+const (
+	polMode   = "ProxyMode"
+	polServer = "ProxyServer"
+	polBypass = "ProxyBypassList"
+)
 
 const (
 	optSettingsChanged = 39
@@ -27,14 +48,36 @@ const (
 var (
 	wininet               = windows.NewLazySystemDLL("wininet.dll")
 	procInternetSetOption = wininet.NewProc("InternetSetOptionW")
+
+	user32         = windows.NewLazySystemDLL("user32.dll")
+	procSendMessageTimeout = user32.NewProc("SendMessageTimeoutW")
 )
 
+const (
+	wmSettingChange = 0x001A
+	hwndBroadcast   = 0xFFFF
+	smwtoAbortIfHung = 0x0002
+)
+
+// notifySystem tells running apps the proxy changed: the WinINET refresh +
+// a broadcast WM_SETTINGCHANGE("Internet Settings"). Chromium's proxy watcher
+// (ProxyConfigServiceWin) reacts to the broadcast, so browsers pick up the
+// new proxy without a restart in most cases.
 func notifySystem() {
-	if err := wininet.Load(); err != nil {
-		return
+	if err := wininet.Load(); err == nil {
+		_, _, _ = procInternetSetOption.Call(0, optSettingsChanged, 0, 0)
+		_, _, _ = procInternetSetOption.Call(0, optRefresh, 0, 0)
 	}
-	_, _, _ = procInternetSetOption.Call(0, optSettingsChanged, 0, 0)
-	_, _, _ = procInternetSetOption.Call(0, optRefresh, 0, 0)
+	if err := user32.Load(); err == nil {
+		internetSettings, _ := windows.UTF16PtrFromString("Internet Settings")
+		_, _, _ = procSendMessageTimeout.Call(
+			hwndBroadcast,
+			wmSettingChange,
+			0,
+			uintptr(unsafe.Pointer(internetSettings)),
+			smwtoAbortIfHung, 1000, 0,
+		)
+	}
 }
 
 type stringVal struct {
@@ -42,11 +85,21 @@ type stringVal struct {
 	Data   string `json:"data,omitempty"`
 }
 
+type policySnap struct {
+	Mode   stringVal `json:"mode"`
+	Server stringVal `json:"server"`
+	Bypass stringVal `json:"bypass"`
+	// HadKey records whether the policy key existed at all, so restore can
+	// remove keys we created instead of leaving empty shells behind.
+	HadKey bool `json:"had_key"`
+}
+
 type snapshot struct {
-	ProxyEnable   uint32    `json:"proxy_enable"`
-	ProxyServer   stringVal `json:"proxy_server"`
-	ProxyOverride stringVal `json:"proxy_override"`
-	AutoConfigURL stringVal `json:"autoconfig_url"`
+	ProxyEnable   uint32                 `json:"proxy_enable"`
+	ProxyServer   stringVal              `json:"proxy_server"`
+	ProxyOverride stringVal              `json:"proxy_override"`
+	AutoConfigURL stringVal              `json:"autoconfig_url"`
+	Policies      map[string]policySnap  `json:"policies,omitempty"`
 }
 
 // Manager owns the journal directory (%LOCALAPPDATA%\opentunnel).
@@ -78,8 +131,9 @@ func (m *Manager) Recover() error {
 	pidFile := m.lockPath()
 	stale := true
 	if raw, err := os.ReadFile(pidFile); err == nil {
-		if pid, perr := strconv.Atoi(string(raw)); perr == nil && processAlive(uint32(pid)) {
-			stale = false
+		if pid, perr := strconv.Atoi(strings.TrimSpace(string(raw))); perr == nil {
+			alive := processAlive(uint32(pid)) && isOtuProcess(uint32(pid))
+			stale = !alive
 		}
 	}
 	if !stale {
@@ -101,6 +155,24 @@ func processAlive(pid uint32) bool {
 	return true
 }
 
+// isOtuProcess reports whether the given live pid is one of ours by checking
+// its process image path. This defeats PID reuse, where a recycled pid would
+// otherwise be mistaken for a live client and trap the proxy settings on.
+func isOtuProcess(pid uint32) bool {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var buf [windows.MAX_PATH]uint16
+	size := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
+		return false
+	}
+	image := strings.ToLower(windows.UTF16ToString(buf[:size]))
+	return strings.Contains(image, "otu-client")
+}
+
 // Begin snapshots current proxy settings, journals them to disk, then applies
 // proxyAddr as the system (per-user) proxy.
 func (m *Manager) Begin(proxyAddr string, bypass []string) error {
@@ -116,6 +188,7 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 	snap.ProxyOverride = readString(k, "ProxyOverride")
 	snap.AutoConfigURL = readString(k, "AutoConfigURL")
 	_ = k.Close()
+	snap.Policies = snapshotPolicies()
 
 	raw, err := json.Marshal(&snap)
 	if err != nil {
@@ -155,8 +228,113 @@ func (m *Manager) apply(proxyAddr string, bypass []string) error {
 	if err := k.SetStringValue("ProxyOverride", override); err != nil {
 		return err
 	}
+	applyPolicies(proxyAddr, bypassList(override))
 	notifySystem()
 	return nil
+}
+
+// snapshotPolicies records the proxy state of every policy key otu can touch.
+// Paths that don't exist yet are recorded with HadKey=false so restore can
+// delete keys otu created — leaving zero trace.
+func snapshotPolicies() map[string]policySnap {
+	out := make(map[string]policySnap)
+	for _, path := range chromiumPolicyPaths {
+		k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.QUERY_VALUE)
+		if err != nil {
+			out[path] = policySnap{HadKey: false}
+			continue
+		}
+		ps := policySnap{Mode: readString(k, polMode), Server: readString(k, polServer), Bypass: readString(k, polBypass), HadKey: true}
+		_ = k.Close()
+		out[path] = ps
+	}
+	return out
+}
+
+// applyPolicies points every Chromium fork at the tunnel via HKCU policy
+// keys, which Chromium watches live (no browser restart needed). On
+// managed machines (e.g. school group policy) HKCU\Software\Policies may be
+// read-only for the user; we report that once so the user knows a browser
+// restart makes WinINET apply instead.
+func applyPolicies(proxyAddr string, bypass string) {
+	appliedAny := false
+	for _, path := range chromiumPolicyPaths {
+		k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.SET_VALUE)
+		if err != nil {
+			k, _, err = registry.CreateKey(registry.CURRENT_USER, path, registry.SET_VALUE)
+			if err != nil {
+				continue
+			}
+		}
+		_ = k.SetStringValue(polMode, "fixed_servers")
+		_ = k.SetStringValue(polServer, proxyAddr)
+		_ = k.SetStringValue(polBypass, strings.ReplaceAll(bypass, ";", ","))
+		_ = k.Close()
+		appliedAny = true
+	}
+	if !appliedAny {
+		fmt.Println("[i] browser policy keys are locked (managed PC): browsers already open may need a restart to route through otu")
+	}
+}
+
+// restorePolicies puts back exactly what snapshotPolicies captured. Keys otu
+// created are deleted outright (no empty shells left behind); keys that
+// existed keep their exact original values.
+func restorePolicies(snaps map[string]policySnap) {
+	for path, ps := range snaps {
+		if !ps.HadKey {
+			// otu created this key — remove it entirely. If something added
+			// subkeys in the meantime, fall back to clearing our values.
+			if err := registry.DeleteKey(registry.CURRENT_USER, path); err == nil {
+				continue
+			}
+			if k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.SET_VALUE); err == nil {
+				_ = k.DeleteValue(polMode)
+				_ = k.DeleteValue(polServer)
+				_ = k.DeleteValue(polBypass)
+				_ = k.Close()
+			}
+			continue
+		}
+		k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.SET_VALUE)
+		if err != nil {
+			continue
+		}
+		restoreString(k, polMode, ps.Mode)
+		restoreString(k, polServer, ps.Server)
+		restoreString(k, polBypass, ps.Bypass)
+		_ = k.Close()
+	}
+}
+
+// bypassList converts the WinINET override string ("a;b;<local>") into the
+// comma-separated form Chromium policy expects ("a,b,<local>"). <local> is
+// kept as Chromium understands it too.
+func bypassList(override string) string {
+	parts := strings.Split(override, ";")
+	for i, p := range parts {
+		parts[i] = strings.TrimSpace(p)
+	}
+	return strings.Join(parts, ",")
+}
+
+// looksLikeOtuState reports whether a snapshotted proxy state is actually
+// otu's own footprint (server = our local proxy + our bypass entries). A
+// previous crashed session can journal otu's settings as the "original";
+// restoring that would leave otu's server string behind (enabled=0, but
+// still a trace). In that case we clear instead.
+func looksLikeOtuState(server stringVal, override stringVal, enable uint32) bool {
+	if !server.Exists || server.Data == "" {
+		return false
+	}
+	if !strings.HasPrefix(server.Data, "127.0.0.1:1") {
+		return false
+	}
+	// Enable can be 0 in a contaminated chain (a crashed session that was
+	// force-restored before the next journal), so the server+bypass
+	// signature alone decides.
+	o := override.Data
+	return strings.Contains(o, "cdn.aborro.dev") || strings.Contains(o, "<local>;")
 }
 
 // Restore reapplies the journaled original settings and removes the journal.
@@ -172,6 +350,13 @@ func (m *Manager) Restore() error {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return fmt.Errorf("netenv: corrupt snapshot: %w", err)
 	}
+	if looksLikeOtuState(s.ProxyServer, s.ProxyOverride, s.ProxyEnable) {
+		// The "original" we captured was itself otu's residue from an
+		// earlier crashed session: fall back to a clean no-proxy state.
+		s.ProxyServer = stringVal{}
+		s.ProxyOverride = stringVal{}
+		s.ProxyEnable = 0
+	}
 	k, err := registry.OpenKey(registry.CURRENT_USER, regKeyPath, registry.SET_VALUE)
 	if err != nil {
 		return err
@@ -182,6 +367,9 @@ func (m *Manager) Restore() error {
 	restoreString(k, "AutoConfigURL", s.AutoConfigURL)
 	if err := k.SetDWordValue("ProxyEnable", s.ProxyEnable); err != nil {
 		return err
+	}
+	if s.Policies != nil {
+		restorePolicies(s.Policies)
 	}
 	notifySystem()
 	_ = os.Remove(m.snapPath())

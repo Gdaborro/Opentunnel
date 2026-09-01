@@ -3,4 +3,4 @@
 package version
 
 // Version defaults to the next planned release; release builds stamp the tag.
-var Version = "0.9.7"
+var Version = "0.9.8"
