@@ -22,6 +22,13 @@ type MuxPool struct {
 	mu          sync.Mutex
 	sessions    []*muxEntry
 	next        int
+
+	// dialing guards session creation so a page-load burst (dozens of
+	// domains at once) mints at most ONE full SSH+WS+auth handshake at a
+	// time; the rest wait briefly for it to land and then reuse it instead
+	// of stampeding the relay with parallel handshakes.
+	dialing bool
+	dialCh  chan struct{} // closed when the in-flight dial finishes
 }
 
 type muxEntry struct{ sess *smux.Session }
@@ -80,6 +87,10 @@ func (p *MuxPool) pick() *muxEntry {
 func (p *MuxPool) add(e *muxEntry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.addLocked(e)
+}
+
+func (p *MuxPool) addLocked(e *muxEntry) {
 	if len(p.sessions) >= p.maxSessions {
 		// Replace the oldest; smux keepalive will retire it cleanly.
 		old := p.sessions[0]
@@ -103,16 +114,22 @@ func (p *MuxPool) drop(e *muxEntry) {
 }
 
 // Open returns one multiplexed stream ready for a target exchange.
+//
+// Burst behavior: with no live session, at most one handshake runs at a
+// time. Concurrent openers wait on the in-flight dial (bounded by ctx and a
+// cap); when it lands they all reuse the new session instead of queueing
+// their own handshakes. If the wait runs long (hung dial), a caller may
+// break out and dial itself as a last resort.
 func (p *MuxPool) Open(ctx context.Context) (net.Conn, error) {
+	const waiterCap = 10 * time.Second
 	for attempt := 0; attempt < 2; attempt++ {
 		e := p.pick()
 		if e == nil {
 			var err error
-			e, err = p.createSession(ctx)
+			e, err = p.getOrDial(ctx, waiterCap)
 			if err != nil {
 				return nil, err
 			}
-			p.add(e)
 		}
 		stream, err := e.sess.OpenStream()
 		if err == nil {
@@ -126,6 +143,60 @@ func (p *MuxPool) Open(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	return nil, errors.New("client: mux pool exhausted")
+}
+
+// getOrDial returns a usable session, dialing one if none exists. Only one
+// caller dials at a time; the rest wait for its result and reuse it.
+func (p *MuxPool) getOrDial(ctx context.Context, waiterCap time.Duration) (*muxEntry, error) {
+	deadline := time.Now().Add(waiterCap)
+	for {
+		p.mu.Lock()
+		// A session appeared while we waited for the lock.
+		for _, e := range p.sessions {
+			if !e.sess.IsClosed() {
+				p.mu.Unlock()
+				return e, nil
+			}
+		}
+		if !p.dialing {
+			// We're the dialer.
+			p.dialing = true
+			ch := make(chan struct{})
+			p.dialCh = ch
+			p.mu.Unlock()
+			entry, err := p.createSession(ctx)
+			p.mu.Lock()
+			p.dialing = false
+			if p.dialCh == ch {
+				close(ch)
+				p.dialCh = nil
+			}
+			if err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
+			p.addLocked(entry)
+			p.mu.Unlock()
+			return entry, nil
+		}
+		// Someone else is dialing: wait for them, bounded.
+		ch := p.dialCh
+		p.mu.Unlock()
+		select {
+		case <-ch:
+			// loop: pick up the session (or become the dialer if it failed)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Until(deadline)):
+			// The in-flight dial looks hung — dial one ourselves.
+			entry, err := p.createSession(ctx)
+			if err != nil {
+				return nil, err
+			}
+			p.add(entry)
+			return entry, nil
+		}
+	}
 }
 
 // NumSessions reports the count of live mux sessions (for status output).

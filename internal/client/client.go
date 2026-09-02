@@ -240,7 +240,7 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 
 func (c *Client) getPool() *MuxPool {
 	c.poolOnce.Do(func() {
-		c.pool = newMuxPool(c.muxSessionFactory, 3, c.opts.DialTimeout)
+		c.pool = newMuxPool(c.muxSessionFactory, 8, c.opts.DialTimeout)
 	})
 	return c.pool
 }

@@ -78,6 +78,21 @@ func main() {
 			log.Fatalf("write default config: %v", werr)
 		}
 		fmt.Printf("[i] no config found — wrote default settings to %s\n", *cfgPath)
+		// Also drop a stop helper next to the exe: the double-click console
+		// hides itself, so recipients need an obvious off switch. It kills
+		// the client then runs its own --restore to put network settings
+		// back immediately (no admin needed).
+		if exe, eerr := os.Executable(); eerr == nil {
+			stop := filepath.Join(filepath.Dir(exe), "stop-otu.bat")
+			if _, serr := os.Stat(stop); os.IsNotExist(serr) {
+				bat := "@echo off\r\n" +
+					"taskkill /IM otu-client.exe /F >nul 2>&1\r\n" +
+					"\"%~dp0otu-client.exe\" --restore >nul 2>&1\r\n" +
+					"echo otu stopped - your normal connection is restored.\r\n" +
+					"pause\r\n"
+				_ = os.WriteFile(stop, []byte(bat), 0o755)
+			}
+		}
 	}
 
 	mgr, mgrErr := netenv.NewManager()
@@ -343,9 +358,16 @@ func main() {
 		fmt.Println("   1. Just browse normally - no other setup needed.")
 		fmt.Println("   2. First time only: the admin must approve this device,")
 		fmt.Println("      then pages load automatically (can take a minute).")
-		fmt.Println("   3. To stop: close this window or press Ctrl+C.")
-		fmt.Println("      Your normal connection is restored automatically.")
+		fmt.Println("   3. This window hides itself in a few seconds and otu keeps")
+		fmt.Println("      running in the background. To stop, run stop-otu.bat")
+		fmt.Println("      (next to otu-client.exe). Settings restore automatically.")
 		fmt.Println("================================================================")
+		// Close-proof: hide the console once the banner has been read so an
+		// accidental window close can't take the tunnel down.
+		go func() {
+			time.Sleep(8 * time.Second)
+			netenv.HideConsole()
+		}()
 	} else {
 		fmt.Println("[i] Point your browser at the SOCKS5 or HTTP proxy above, or press Ctrl+C to stop.")
 	}
