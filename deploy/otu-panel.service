@@ -1,0 +1,32 @@
+[Unit]
+Description=opentunnel management panel (control plane)
+After=network-online.target
+Wants=network-online.target
+# The relay proxies /admin and /api/token here; start order doesn't matter
+# (relay tolerates it being briefly down) but this keeps boot deterministic.
+After=opentunnel.service
+
+[Service]
+UMask=0077
+User=otu
+ExecStart=/usr/local/bin/otu-panel -c /etc/opentunnel/server.toml -listen 127.0.0.1:8090 -tls-listen 127.0.0.1:8444
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ReadWritePaths=/var/lib/opentunnel
+StateDirectory=opentunnel
+WorkingDirectory=/var/lib/opentunnel
+LimitNOFILE=16384
+Environment=TMPDIR=/var/lib/opentunnel
+EnvironmentFile=/etc/opentunnel/panel.env
+# Control plane must stay responsive when the relay is saturated:
+# high CPU weight and a nice score keep admin requests snappy.
+CPUWeight=900
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target

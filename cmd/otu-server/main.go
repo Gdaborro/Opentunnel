@@ -1,14 +1,19 @@
 // otu-server is the opentunnel relay. Run it on a VPS; clients connect over
-// TLS+WebSocket and it dials their requested targets.
+// TLS+WebSocket and it dials their requested targets. The management plane
+// (panel) runs separately as otu-panel; this relay reverse-proxies /admin and
+// /api/token to it so heavy tunnel traffic can never starve admin requests.
 package main
 
 import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,11 +29,6 @@ import (
 	"opentunnel/internal/transport"
 	"opentunnel/internal/version"
 )
-
-func readFileString(path string) string {
-	data, _ := os.ReadFile(path)
-	return string(data)
-}
 
 func main() {
 	cfgPath := flag.String("c", "server.toml", "path to server config")
@@ -99,89 +99,26 @@ func main() {
 	fmt.Printf("  certificate fingerprint (pin this in the client):\n    %s\n", fingerprint)
 	fmt.Println("========================================================")
 
-	// Panel DB (same machine, shadcn UI at /admin)
+	// Management plane split: the panel runs as its own process (otu-panel)
+	// on PanelUpstream. The relay keeps using the same panel DB directly for
+	// per-stream decisions (CheckToken/IsBlocked — hot path, cached), and
+	// reverse-proxies the /admin and /api/token request trees to the panel
+	// process so admin actions stay responsive even under full load.
+	panelUpstream := os.Getenv("OTU_PANEL_UPSTREAM")
+	if panelUpstream == "" {
+		panelUpstream = "http://127.0.0.1:8090"
+	}
+
+	// Relay still opens the panel DB: per-token checks, blocklist, traffic
+	// accounting and ISP enforcement are enforced here at the data plane.
 	stateDirForPanel := os.Getenv("TMPDIR")
 	if stateDirForPanel == "" {
 		stateDirForPanel = "/var/lib/opentunnel"
 	}
 	panelDB, err := panel.Open(filepath.Join(stateDirForPanel, "panel.db"), cfg.PurgeAfterDays)
 	if err != nil {
-		log.Printf("panel db: %v (panel disabled)", err)
+		log.Printf("panel db: %v (panel enforcement disabled)", err)
 		panelDB = nil
-	}
-	var panelHandler http.Handler
-	if panelDB != nil {
-		auth := panel.NewAuth(panelDB)
-		// One-time setup: if ADMIN_USER/PASSWORD env is set, pre-seed it
-		// (useful for headless deploys). Otherwise first visitor to
-		// /admin/setup creates the admin — after that only that login works.
-		if envUser := os.Getenv("ADMIN_USER"); envUser != "" {
-			if envPass := os.Getenv("ADMIN_PASSWORD"); envPass != "" {
-				_ = auth.EnsureAdmin(envUser, envPass)
-			}
-		}
-		if auth.NeedsSetup() {
-			log.Printf("panel: no admin — visit https://%s/admin/setup to create one (one-time)", func() string {
-				h := cfg.Host
-				if len(acmeDomains) > 0 {
-					h = acmeDomains[0]
-				}
-				if h == "" {
-					h = "localhost" + cfg.Listen
-				}
-				return h
-			}())
-		}
-		geo := panel.OpenGeoIP(cfg.GeoIPDB)
-		if cfg.GeoIPDB != "" {
-			if geo != nil {
-				log.Printf("panel: geoip enabled (%s)", cfg.GeoIPDB)
-			} else {
-				log.Printf("panel: geoip db %s unreadable — country map disabled", cfg.GeoIPDB)
-			}
-		}
-		ph := panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo)
-		// Approving a device also installs its SSH public key into the ssh
-		// tier's authorized_keys, so standalone clients (device-generated
-		// keys) can use the fallback tier without shipping tun.key.
-		ph.WithApproveHook(func(token string) {
-			pub := ph.SSHKeyPath(token)
-			if pub == "" {
-				return
-			}
-			// Default: a keys file the panel service user can write
-			// (otu owns /var/lib/opentunnel). sshd is configured to read
-			// it as a second AuthorizedKeysFile, which it does as root —
-			// so no service needs root or write access under /home/tun.
-			akPath := os.Getenv("OTU_AUTHORIZED_KEYS")
-			if akPath == "" {
-				akPath = filepath.Join(stateDirForPanel, "authorized_keys")
-			}
-			if _, err := os.Stat(akPath); err != nil {
-				return // ssh tier not provisioned — skip silently
-			}
-			f, err := os.OpenFile(akPath, os.O_APPEND|os.O_WRONLY, 0o600)
-			if err != nil {
-				log.Printf("panel: authorize ssh key for %s: %v", token[:8], err)
-				return
-			}
-			defer f.Close()
-			if !strings.Contains(readFileString(akPath), strings.TrimSpace(pub)) {
-				f.WriteString(strings.TrimSpace(pub) + "\n")
-			}
-		})
-		panelHandler = ph.Handler()
-		if cfg.AutoApprove {
-			log.Printf("panel: auto_approve enabled — new devices register as approved")
-		}
-		panelHost := cfg.Host
-		if len(acmeDomains) > 0 {
-			panelHost = acmeDomains[0]
-		}
-		if panelHost == "" {
-			panelHost = "localhost" + cfg.Listen
-		}
-		log.Printf("panel enabled at https://%s/admin", panelHost)
 	}
 
 	baseHandler := server.Handler(server.Options{
@@ -192,11 +129,39 @@ func main() {
 		AllowLegacyMaster:      cfg.AllowLegacyMaster,
 	})
 	var handler http.Handler = baseHandler
-	if panelHandler != nil {
+	if panelDB != nil {
+		target, perr := url.Parse(panelUpstream)
+		if perr != nil {
+			log.Fatalf("panel upstream: %v", perr)
+		}
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		origDirector := proxy.Director
+		proxy.Director = func(r *http.Request) {
+			origDirector(r)
+			r.Host = target.Host
+		}
+		// Keep-alive to the panel process: under load, each proxied request
+		// reuses a warm connection instead of paying a fresh loopback TCP
+		// setup, keeping admin actions fast when the relay is busy.
+		proxy.Transport = &http.Transport{
+			MaxIdleConns:          16,
+			MaxIdleConnsPerHost:   16,
+			IdleConnTimeout:       90 * time.Second,
+			DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+		}
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			// Panel process down or saturated: serve a plain-text pointer
+			// instead of hanging the admin's browser.
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, "panel process unavailable — retry in a moment; the relay itself is fine\n")
+		}
 		mux := http.NewServeMux()
-		mux.Handle("/admin/", panelHandler)
-		mux.Handle("/admin", panelHandler)
-		mux.Handle("/api/token/", panelHandler)
+		mux.Handle("/admin/", proxy)
+		mux.Handle("/admin", proxy)
+		mux.Handle("/api/token/", proxy)
 		mux.Handle("/", baseHandler)
 		handler = mux
 	}

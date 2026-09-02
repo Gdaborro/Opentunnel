@@ -16,6 +16,13 @@ ReadWritePaths=/var/lib/opentunnel
 StateDirectory=opentunnel
 WorkingDirectory=/var/lib/opentunnel
 LimitNOFILE=65535
+Environment=TMPDIR=/var/lib/opentunnel
+EnvironmentFile=/etc/opentunnel/panel.env
+# Data plane: deliberately lower priority than otu-panel so tunnel load
+# can never starve admin requests (control plane).
+CPUWeight=100
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
 
 [Install]
 WantedBy=multi-user.target
