@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -24,7 +25,119 @@ import (
 	"opentunnel/internal/version"
 )
 
+// crashLogPath is where panics and fatal errors are mirrored. The console
+// hides itself in double-click mode, so the file is the only reliable trace
+// after an unexpected exit.
+func crashLogPath() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "opentunnel", "crash.log")
+}
+
+// setupCrashLog mirrors log output to crash.log (best effort; never fatal).
+func setupCrashLog() {
+	if err := os.MkdirAll(filepath.Dir(crashLogPath()), 0o700); err != nil {
+		return
+	}
+	f, err := os.OpenFile(crashLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.SetPrefix("otu ")
+}
+
+// safeGo runs fn in a goroutine that cannot take the process down: a panic
+// is logged (console + crash.log) and swallowed. The tunnel, proxy ports
+// and system settings survive a fault in any one background worker.
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("worker %s panicked: %v", name, r)
+			}
+		}()
+		fn()
+	}()
+}
+
+// singleInstance detects an already-running otu-client (live lock journal or
+// our ports held by an otu process) and returns true. Callers print a short
+// friendly note and exit quietly instead of looking like a crash.
+func singleInstance(mgr *netenv.Manager, socksAddr, httpAddr string) bool {
+	if mgr != nil {
+		if err := mgr.Recover(); err != nil {
+			// Journal + live lock holder = another instance is running.
+			fmt.Println("otu is already running in the background.")
+			fmt.Println("Nothing to do - this window closes. Use stop-otu.bat to stop it.")
+			time.Sleep(3 * time.Second)
+			return true
+		}
+	}
+	// Ports held by an otu process (no journal, e.g. manual mode) — same story.
+	for _, addr := range []string{socksAddr, httpAddr} {
+		if addr == "" {
+			continue
+		}
+		if l, err := net.Listen("tcp", addr); err != nil {
+			// Someone holds the port; check it is actually otu (PID reuse /
+			// unrelated app would otherwise fake a conflict).
+			if netenv.PortHeldByOtu(addr) {
+				fmt.Println("otu is already running in the background.")
+				fmt.Println("Nothing to do - this window closes. Use stop-otu.bat to stop it.")
+				time.Sleep(3 * time.Second)
+				return true
+			}
+		} else {
+			_ = l.Close()
+		}
+	}
+	return false
+}
+
+// portFailExit reports a proxy-port bind failure in plain language, restores
+// any journaled settings so this path can never leave the proxy stuck, and
+// exits without looking like a crash.
+func portFailExit(addr string, err error, mgr *netenv.Manager) {
+	fmt.Printf("\n[X] Could not start the proxy on %s (%v).\n", addr, err)
+	fmt.Println("    Another otu may already be running, or another app uses this port.")
+	if mgr != nil {
+		if rerr := mgr.Restore(); rerr == nil {
+			fmt.Println("    Network settings were restored to normal.")
+		}
+	}
+	fmt.Println("\nPress Enter to close...")
+	fmt.Scanln()
+	os.Exit(1)
+}
+
+// doubleClickMode reports whether the current run was launched with no
+// arguments (Explorer double-click).
+var doubleClick bool
+
+// main is the panic shield: whatever happens inside run(), settings are
+// restored before the process exits, and the panic is recorded in crash.log
+// (the console may be hidden, so the file is the only trace).
 func main() {
+	setupCrashLog()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC (main): %v", r)
+			fmt.Println("[!] Something went wrong. Your network settings are being restored.")
+			if mgr, err := netenv.NewManager(); err == nil {
+				_ = mgr.Restore()
+			}
+			if doubleClick {
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}()
+	run()
+}
+
+func run() {
 	cfgPath := flag.String("c", "client.toml", "path to client config")
 	genConfig := flag.Bool("gen-config", false, "write a template config and exit")
 	autoProxy := flag.Bool("auto-proxy", false, "configure the Windows user-level system proxy automatically (restored on exit)")
@@ -37,7 +150,7 @@ func main() {
 	// Double-click mode: launched with no arguments from Explorer. Route the
 	// browser automatically and keep the window informative; everything is
 	// still restored on exit, crash, or window close.
-	doubleClick := flag.NFlag() == 0 && flag.NArg() == 0
+	doubleClick = flag.NFlag() == 0 && flag.NArg() == 0
 	if doubleClick {
 		*autoProxy = true
 	}
@@ -46,6 +159,10 @@ func main() {
 		fmt.Println("opentunnel client", version.Version)
 		return
 	}
+
+	// Everything from here on is mirrored to crash.log: the console hides
+	// itself in double-click mode, so unexpected exits must leave a trace.
+	setupCrashLog()
 
 	// Standalone mode: when -c is not given explicitly, look for client.toml
 	// next to the executable (not the working directory) and create it from
@@ -121,7 +238,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	// Relative ssh_key paths are resolved against the config file's
+
+	// Friendly single-instance: if another otu is already running, say so
+	// and exit quietly — never look like a crash loop.
+	if singleInstance(mgr, cfg.SOCKSAddr, cfg.HTTPAddr) {
+		return
+	}	// Relative ssh_key paths are resolved against the config file's
 	// directory, so a key dropped next to the exe/config just works.
 	if cfg.SSHKey != "" && !filepath.IsAbs(cfg.SSHKey) {
 		cfg.SSHKey = filepath.Join(filepath.Dir(*cfgPath), cfg.SSHKey)
@@ -172,9 +294,9 @@ func main() {
 	}
 
 	// Register with panel (fire-and-forget; panel will create pending peer)
-	go client.RegisterWithPanel(cfg, device)
+	safeGo("register", func() { client.RegisterWithPanel(cfg, device) })
 	// Background heartbeat and status poll (kick/ban/pending)
-	go client.PollTokenStatus(cfg, device, requestStop)
+	safeGo("poll", func() { client.PollTokenStatus(cfg, device, requestStop) })
 
 	if *shareLink {
 		link, lerr := share.Build(share.Params{
@@ -291,9 +413,11 @@ func main() {
 	}
 
 	fmt.Printf("[i] otu-client %s\n", version.Version)
-	client.NewHealthReporter(cfg, device, dialer.Probe).Start(60 * time.Second)
+	safeGo("health", func() {
+		client.NewHealthReporter(cfg, device, dialer.Probe).Start(60 * time.Second)
+	})
 	if cfg.AutoUpdateEnabled() {
-		go client.UpdateLoop()
+		safeGo("update", func() { client.UpdateLoop() })
 		fmt.Println("[i] auto-update: watching GitHub releases")
 	}
 
@@ -306,27 +430,17 @@ func main() {
 	if socksAddr != "" {
 		lnSOCKS, err = listenRetry("tcp", socksAddr)
 		if err != nil {
-			fmt.Printf("\n[X] Could not start the proxy on %s.\n", socksAddr)
-			fmt.Println("    Most likely otu is ALREADY RUNNING (check your taskbar/other windows")
-			fmt.Println("    or another app uses this port). Close it and try again.")
-			fmt.Println("\nPress Enter to close...")
-			fmt.Scanln()
-			os.Exit(1)
+			portFailExit(socksAddr, err, mgr)
 		}
-		go proxy.ServeSOCKS5(ctx, lnSOCKS, dialer, log.Default())
+		safeGo("socks", func() { proxy.ServeSOCKS5(ctx, lnSOCKS, dialer, log.Default()) })
 		fmt.Printf("[+] SOCKS5     -> %s\n", socksAddr)
 	}
 	if httpAddr != "" {
 		lnHTTP, err = listenRetry("tcp", httpAddr)
 		if err != nil {
-			fmt.Printf("\n[X] Could not start the proxy on %s.\n", httpAddr)
-			fmt.Println("    Most likely otu is ALREADY RUNNING (check your taskbar/other windows")
-			fmt.Println("    or another app uses this port). Close it and try again.")
-			fmt.Println("\nPress Enter to close...")
-			fmt.Scanln()
-			os.Exit(1)
+			portFailExit(httpAddr, err, mgr)
 		}
-		go proxy.ServeHTTPProxy(ctx, lnHTTP, dialer, log.Default())
+		safeGo("http", func() { proxy.ServeHTTPProxy(ctx, lnHTTP, dialer, log.Default()) })
 		fmt.Printf("[+] HTTP proxy -> %s\n", httpAddr)
 	}
 
@@ -364,10 +478,10 @@ func main() {
 		fmt.Println("================================================================")
 		// Close-proof: hide the console once the banner has been read so an
 		// accidental window close can't take the tunnel down.
-		go func() {
+		safeGo("hide-console", func() {
 			time.Sleep(8 * time.Second)
 			netenv.HideConsole()
-		}()
+		})
 	} else {
 		fmt.Println("[i] Point your browser at the SOCKS5 or HTTP proxy above, or press Ctrl+C to stop.")
 	}
