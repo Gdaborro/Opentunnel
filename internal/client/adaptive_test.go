@@ -119,6 +119,40 @@ func TestFixedProfileNeverEscalates(t *testing.T) {
 	}
 }
 
+// TestTierClientsAreSharedAcrossDials: the same tier must reuse one Client
+// (and therefore one warm mux pool) instead of handshaking per request.
+// Regression test for the 440-sshd-sessions incident: before the cache,
+// every DialTunnel built a fresh client and every request paid a full
+// transport handshake.
+func TestTierClientsAreSharedAcrossDials(t *testing.T) {
+	builds := 0
+	a, addr, _, cleanup := startAdaptiveFixture(t, "auto", new(int), false)
+	defer cleanup()
+	a.EnableMux()
+	prevFactory := a.factory
+	a.factory = func(a *Adaptive, idx int) *Client {
+		builds++
+		return prevFactory(a, idx)
+	}
+	// Escalate once to a working tier, then dial repeatedly: all dials must
+	// ride cached clients, so no new builds happen after the first round.
+	for i := 0; i < 5; i++ {
+		conn, err := a.DialTunnel(context.Background(), addr)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		conn.Close()
+	}
+	// auto mode tries fast(0) then balanced(1): exactly 2 builds total for
+	// 5 dials. Without the cache this would be 10.
+	if builds != 2 {
+		t.Fatalf("expected 2 tier-client builds for 5 dials, got %d", builds)
+	}
+	if n := a.build(1).getPool().NumSessions(); n < 1 {
+		t.Fatalf("expected the shared pool to hold sessions, got %d", n)
+	}
+}
+
 // TestSSHFallbackTierRescuesTotalTLSInterception: all ws-tls tiers fail
 // (simulating a full MITM), the ssh last-resort tier succeeds and sticks.
 func TestSSHFallbackTierRescuesTotalTLSInterception(t *testing.T) {

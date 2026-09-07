@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 
 	"opentunnel/internal/protocol"
 )
@@ -114,14 +115,12 @@ func handleSocks(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logge
 				_, _ = conn.Write([]byte{socksVer, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			}
 			if logErr != nil {
-				logErr.Printf("socks: blocked %s: %v", addr, err)
+				logThrottled(logErr, "blocked:"+addr.String(), 60*time.Second, "socks: blocked %s: %v", addr, err)
 			}
 			return
 		}
 		_, _ = conn.Write([]byte{socksVer, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		if logErr != nil {
-			logErr.Printf("socks: tunnel %s: %v", addr, err)
-		}
+		logThrottled(logErr, "tunnel:"+addr.String(), 60*time.Second, "socks: tunnel %s: %v", addr, err)
 		return
 	}
 	_, _ = conn.Write([]byte{socksVer, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -187,25 +186,73 @@ func serveBlockPageHTML(addr *protocol.Address, err error) string {
 		}
 	}
 	reason := blockReason(err)
-	kind := "Blocked"
+	kind := "blocked"
+	badgeClass := "badge-outline"
+	badgeLabel := "Blocked"
+	title := "Access blocked"
+	desc := ""
 	if err != nil && strings.Contains(err.Error(), "banned:") {
-		kind = "Banned"
+		kind = "banned"
+		badgeClass = "badge-destructive"
+		badgeLabel = "Banned"
+		title = "Access suspended"
+		desc = fmt.Sprintf("This device is <strong>banned</strong>: %s. Every site shows this page until an administrator lifts the ban.", escHTML(reason))
 	} else if err != nil && strings.Contains(err.Error(), "kicked") {
-		kind = "Kicked"
-	}
-	title := kind + " by ISP"
-	msg := ""
-	if kind == "Banned" {
-		msg = fmt.Sprintf("You are <b>banned</b>: %s<br>Any site will show this page.<br>You will be kicked off the network in 10 minutes.<br>Hard to bypass (fingerprint+IP banned).<br>Easy to unban via panel.", escHTML(reason))
-	} else if kind == "Kicked" {
 		if strings.Contains(err.Error(), "silent") {
 			return "" // silent kick - no page
 		}
-		msg = fmt.Sprintf("You are <b>kicked</b>: %s<br>You will be disconnected in 10 minutes.<br>Silent kick available for stealth.", escHTML(reason))
+		kind = "kicked"
+		badgeClass = "badge-destructive"
+		badgeLabel = "Paused"
+		title = "Access paused"
+		desc = fmt.Sprintf("This device is temporarily <strong>paused</strong>: %s. Access resumes automatically.", escHTML(reason))
 	} else {
-		msg = fmt.Sprintf("Domain <b>%s</b> is blocked: %s<br>Contact admin to unblock. Subdomains also blocked.", escHTML(domain), escHTML(reason))
+		desc = fmt.Sprintf("The domain <strong>%s</strong> is blocked by network policy%sSubdomains are included. Contact your administrator to request access.", escHTML(domain), reasonSuffix(reason))
 	}
-	return fmt.Sprintf("<html><head><title>%s</title><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>body{font-family:system-ui,sans-serif;background:#f8fafc;margin:0;display:grid;place-items:center;min-height:100vh;color:#1e293b}main{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:2rem;max-width:520px;box-shadow:0 4px 12px rgba(0,0,0,0.05)}h1{margin:0 0 0.5rem;font-size:1.4rem}p{color:#475569;line-height:1.5}</style></head><body><main><h1>🚫 %s</h1><p>%s</p><p style=\"font-size:0.85em;color:#64748b;margin-top:1rem\">opentunnel ISP • aggregated visits only (privacy) • abuse protection active</p></main></body></html>", escHTML(title), escHTML(title), msg)
+	_ = kind
+	return "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charset=\"utf-8\">" +
+		"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+		"<title>" + escHTML(title) + " — otu</title>" +
+		"<style>" +
+		":root{--background:oklch(0.145 0 0);--foreground:oklch(0.985 0 0);" +
+		"--card:oklch(0.205 0 0);--card-foreground:oklch(0.985 0 0);" +
+		"--primary:oklch(0.922 0 0);--primary-foreground:oklch(0.205 0 0);" +
+		"--muted:oklch(0.269 0 0);--muted-foreground:oklch(0.708 0 0);" +
+		"--destructive:oklch(0.704 0.191 22.216);--border:oklch(1 0 0 / 10%);--radius:0.625rem}" +
+		"*{box-sizing:border-box;margin:0}" +
+		"body{background:var(--background);color:var(--foreground);" +
+		"font-family:ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;" +
+		"min-height:100vh;display:grid;place-items:center;padding:1rem;-webkit-font-smoothing:antialiased}" +
+		".card{display:flex;flex-direction:column;gap:1.5rem;width:100%;max-width:26rem;" +
+		"background:var(--card);color:var(--card-foreground);border-radius:1rem;" +
+		"padding:1.5rem;box-shadow:0 0 0 1px oklch(0.985 0 0 / 10%);font-size:0.875rem;line-height:1.5}" +
+		".head{display:flex;align-items:center;gap:0.75rem}" +
+		".icon{flex:none;display:grid;place-items:center;width:2.25rem;height:2.25rem;border-radius:0.75rem;" +
+		"background:oklch(0.704 0.191 22.216 / 0.12);color:var(--destructive)}" +
+		".icon svg{width:1.125rem;height:1.125rem}" +
+		".badge{display:inline-flex;align-items:center;height:1.25rem;border-radius:9999px;" +
+		"padding:0 0.5rem;font-size:0.75rem;font-weight:500;white-space:nowrap}" +
+		".badge-outline{border:1px solid var(--border);color:var(--foreground);background:oklch(0.922 0 0 / 0.03)}" +
+		".badge-destructive{color:var(--destructive);background:oklch(0.704 0.191 22.216 / 0.12)}" +
+		"h1{font-size:1.25rem;font-weight:600;letter-spacing:-0.01em;line-height:1.4}" +
+		".desc{color:var(--muted-foreground)}.desc strong{color:var(--foreground);font-weight:600}" +
+		".foot{border-top:1px solid var(--border);padding-top:1rem;font-size:0.75rem;color:var(--muted-foreground);" +
+		"display:flex;align-items:center;justify-content:space-between}" +
+		".brand{font-weight:600;color:var(--foreground)}" +
+		"</style></head><body><main class=\"card\" role=\"alert\">" +
+		"<div class=\"head\"><span class=\"icon\">" +
+		"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z\"/><path d=\"M12 8v4\"/><path d=\"M12 16h.01\"/></svg>" +
+		"</span><span class=\"badge " + badgeClass + "\">" + badgeLabel + "</span></div>" +
+		"<div><h1>" + escHTML(title) + "</h1><p class=\"desc\">" + desc + "</p></div>" +
+		"<div class=\"foot\"><span class=\"brand\">otu</span><span>network protection</span></div>" +
+		"</main></body></html>"
+}
+
+func reasonSuffix(reason string) string {
+	if reason == "" || reason == "blocked" {
+		return " "
+	}
+	return ": " + escHTML(reason) + ". "
 }
 
 func escHTML(s string) string {
@@ -273,14 +320,10 @@ func handleHTTPOne(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Log
 				// For CONNECT (usually TLS), just close - browser will show connection reset, but also try to serve block page via HTTP
 				// For better UX, close and let browser retry as HTTP block page
 				serveHTTPBlockPage(conn, addr, err)
-				if logErr != nil {
-					logErr.Printf("http: blocked %s: %v", addr, err)
-				}
+				logThrottled(logErr, "blocked:"+addr.String(), 60*time.Second, "http: blocked %s: %v", addr, err)
 				return
 			}
-			if logErr != nil {
-				logErr.Printf("http: tunnel %s: %v", addr, err)
-			}
+			logThrottled(logErr, "tunnel:"+addr.String(), 60*time.Second, "http: tunnel %s: %v", addr, err)
 			return
 		}
 		_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
@@ -293,9 +336,11 @@ func handleHTTPOne(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Log
 	if err != nil {
 		if isBlockedErr(err) {
 			serveHTTPBlockPage(conn, addr, err)
+			logThrottled(logErr, "blocked:"+addr.String(), 60*time.Second, "http: blocked %s: %v", addr, err)
 			return
 		}
 		httpRespondError(conn, 502, "tunnel unavailable")
+		logThrottled(logErr, "tunnel:"+addr.String(), 60*time.Second, "http: tunnel %s: %v", addr, err)
 		return
 	}
 	defer up.Close()

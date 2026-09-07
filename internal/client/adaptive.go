@@ -68,6 +68,12 @@ type Adaptive struct {
 	mux         bool        // multiplexing requested by config
 	failStreak  int         // consecutive failures on current tier
 
+	// clients caches one Client per tier so every browser connection reuses
+	// the tier's warm mux pool instead of paying a full transport handshake
+	// (TCP + TLS/SSH + auth) per request. Without this, page-load bursts
+	// mint hundreds of handshakes and melt a small relay.
+	clients map[int]*Client
+
 	// transportBuilder lets configs swap the underlying transport per
 	// profile (e.g. ssh). Defaults to ws-tls with Chrome hello above fast.
 	transportBuilder func(profile string) transport.Transport
@@ -83,16 +89,27 @@ type Adaptive struct {
 }
 
 // EnableMux turns on connection multiplexing for every profile's clients.
-func (a *Adaptive) EnableMux() { a.mux = true }
+func (a *Adaptive) EnableMux() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.mux = true
+	a.clients = nil // rebuilt lazily with the new setting
+}
 
 // EnableSSHFallback adds the ssh last-resort tier to the ladder.
 func (a *Adaptive) EnableSSHFallback(builder func() transport.Transport) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.sshFallback = builder
+	a.clients = nil // rebuilt lazily with the new setting
 }
 
 // UseTransportBuilder overrides how per-profile transports are constructed.
 func (a *Adaptive) UseTransportBuilder(f func(profile string) transport.Transport) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.transportBuilder = f
+	a.clients = nil // rebuilt lazily with the new setting
 }
 
 func (a *Adaptive) logger() *log.Logger {
@@ -143,7 +160,19 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 	})
 }
 
-func (a *Adaptive) build(idx int) *Client { return a.factory(a, idx) }
+func (a *Adaptive) build(idx int) *Client {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.clients == nil {
+		a.clients = make(map[int]*Client)
+	}
+	if cl, ok := a.clients[idx]; ok {
+		return cl
+	}
+	cl := a.factory(a, idx)
+	a.clients[idx] = cl
+	return cl
+}
 
 // fatalUpstream reports errors that indicate the tunnel works but the target
 // is unreachable — escalating profiles cannot help. Pending/expired device

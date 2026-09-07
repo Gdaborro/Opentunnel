@@ -34,7 +34,14 @@ type Client struct {
 	pool     *MuxPool
 	mu       sync.RWMutex
 	banInfo  string // last "banned:reason" or "kicked:reason" from token check
+	banAt    time.Time
 }
+
+// banRefreshInterval bounds how long a cached banned/kicked verdict sticks
+// without re-checking: the client short-circuits dials while banned, but a
+// device that gets unbanned/unkicked mid-session must recover without a
+// restart. One handshake per minute worst case is cheap.
+const banRefreshInterval = time.Minute
 
 func New(t transport.Transport, token string) *Client {
 	return &Client{Transport: t, opts: Options{Token: token}}
@@ -219,6 +226,7 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 		if len(resp) >= 7 && (resp[:7] == "banned:" || resp[:7] == "kicked:") {
 			c.mu.Lock()
 			c.banInfo = resp
+			c.banAt = time.Now()
 			c.mu.Unlock()
 			// Still establish mux session, but future dials will be blocked until unban
 		} else {
@@ -251,18 +259,30 @@ func (c *Client) DialTunnel(ctx context.Context, target *protocol.Address) (net.
 	// ISP-level ban/kick: if peer is banned/kicked, show block page for any site and schedule 10min kick
 	c.mu.RLock()
 	ban := c.banInfo
+	banAt := c.banAt
 	c.mu.RUnlock()
 	if ban != "" {
-		if len(ban) >= 7 && ban[:7] == "banned:" {
-			return nil, &BlockedError{Kind: "banned", Reason: ban[7:]}
-		}
-		if len(ban) >= 7 && ban[:7] == "kicked:" {
-			reason := ban[7:]
-			// silent: prefix means silent kick - just close, no page
-			if len(reason) >= 7 && reason[:7] == "silent:" {
-				return nil, &BlockedError{Kind: "kicked-silent", Reason: reason[7:]}
+		// Verdicts refresh: a device unbanned/unkicked mid-session recovers
+		// on the next dial after the interval instead of staying blocked
+		// until restart.
+		if time.Since(banAt) > banRefreshInterval {
+			c.mu.Lock()
+			if c.banInfo == ban {
+				c.banInfo = ""
 			}
-			return nil, &BlockedError{Kind: "kicked", Reason: reason}
+			c.mu.Unlock()
+		} else {
+			if len(ban) >= 7 && ban[:7] == "banned:" {
+				return nil, &BlockedError{Kind: "banned", Reason: ban[7:]}
+			}
+			if len(ban) >= 7 && ban[:7] == "kicked:" {
+				reason := ban[7:]
+				// silent: prefix means silent kick - just close, no page
+				if len(reason) >= 7 && reason[:7] == "silent:" {
+					return nil, &BlockedError{Kind: "kicked-silent", Reason: reason[7:]}
+				}
+				return nil, &BlockedError{Kind: "kicked", Reason: reason}
+			}
 		}
 	}
 	timeout := c.opts.DialTimeout
