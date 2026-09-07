@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/proxy"
 
 	"opentunnel/internal/version"
 )
@@ -40,7 +43,10 @@ type Release struct {
 }
 
 // LatestRelease fetches the newest published release (public repo, no auth).
-func LatestRelease(ctx context.Context) (*Release, error) {
+// socksAddr is the client's own SOCKS proxy (usually 127.0.0.1:1080); when
+// set, update traffic prefers a direct connection and falls back to the
+// tunnel, so updates keep working on networks that block github.com.
+func LatestRelease(ctx context.Context, socksAddr string) (*Release, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET",
 		"https://api.github.com/repos/"+updateRepo+"/releases/latest", nil)
 	if err != nil {
@@ -48,7 +54,7 @@ func LatestRelease(ctx context.Context) (*Release, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "otu-client/"+version.Version)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := updateClient(socksAddr).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -109,8 +115,8 @@ func expectedSHA256(body string) string {
 }
 
 // CheckUpdate returns the release to install, or nil when up to date.
-func CheckUpdate(ctx context.Context) (*Release, error) {
-	rel, err := LatestRelease(ctx)
+func CheckUpdate(ctx context.Context, socksAddr string) (*Release, error) {
+	rel, err := LatestRelease(ctx, socksAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -120,10 +126,61 @@ func CheckUpdate(ctx context.Context) (*Release, error) {
 	return rel, nil
 }
 
+// updateClient builds an HTTP client for update traffic: direct connection
+// first (fast path), falling back to the tunnel's SOCKS proxy when direct
+// is blocked (school/corporate firewalls that filter github.com). TLS stays
+// end-to-end in both cases, so the fallback changes only the TCP path —
+// integrity still rests on the SHA-256 check in SelfUpdate.
+func updateClient(socksAddr string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dd := &net.Dialer{Timeout: 8 * time.Second}
+				if conn, err := dd.DialContext(ctx, network, addr); err == nil {
+					return conn, nil
+				} else if socksAddr == "" {
+					return nil, err
+				}
+				return socksDialContext(ctx, socksAddr, network, addr)
+			},
+			TLSHandshakeTimeout: 15 * time.Second,
+		},
+	}
+}
+
+// socksDialContext dials through a SOCKS5 proxy with ctx awareness.
+func socksDialContext(ctx context.Context, socksAddr, network, addr string) (net.Conn, error) {
+	sd, err := proxy.SOCKS5("tcp", socksAddr, nil, &net.Dialer{Timeout: 15 * time.Second})
+	if err != nil {
+		return nil, err
+	}
+	type res struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		c, err := sd.Dial(network, addr)
+		ch <- res{c, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.c, r.err
+	case <-ctx.Done():
+		// Don't leak the late conn: close it if it lands after cancel.
+		go func() {
+			if r := <-ch; r.err == nil {
+				r.c.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
 // SelfUpdate downloads the release asset for this platform, verifies it,
 // swaps the running binary, and re-executes. Returns after spawning the
 // new process; the caller should exit.
-func SelfUpdate(ctx context.Context, rel *Release) error {
+func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	assetName := updateAssetWin
 	if runtime.GOOS != "windows" {
 		return errors.New("auto-update: unsupported platform " + runtime.GOOS)
@@ -150,7 +207,7 @@ func SelfUpdate(ctx context.Context, rel *Release) error {
 		return err
 	}
 	req.Header.Set("User-Agent", "otu-client/"+version.Version)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := updateClient(socksAddr).Do(req)
 	if err != nil {
 		return err
 	}
@@ -212,18 +269,20 @@ func SelfUpdate(ctx context.Context, rel *Release) error {
 
 // UpdateLoop checks for updates shortly after start and then periodically.
 // On success it re-executes the new binary and exits this process.
-func UpdateLoop() {
+// socksAddr wires update traffic through the tunnel when direct access to
+// github.com is filtered; empty means direct-only.
+func UpdateLoop(socksAddr string) {
 	for {
 		time.Sleep(30 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		rel, err := CheckUpdate(ctx)
+		rel, err := CheckUpdate(ctx, socksAddr)
 		cancel()
 		if err != nil {
 			log.Printf("auto-update: check failed: %v", err)
 		} else if rel != nil {
 			log.Printf("auto-update: %s available (running %s) — downloading", rel.TagName, version.Version)
 			dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			err := SelfUpdate(dctx, rel)
+			err := SelfUpdate(dctx, rel, socksAddr)
 			dcancel()
 			if err != nil {
 				log.Printf("auto-update: %v", err)

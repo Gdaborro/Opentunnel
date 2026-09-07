@@ -417,7 +417,7 @@ func run() {
 		client.NewHealthReporter(cfg, device, dialer.Probe).Start(60 * time.Second)
 	})
 	if cfg.AutoUpdateEnabled() {
-		safeGo("update", func() { client.UpdateLoop() })
+		safeGo("update", func() { client.UpdateLoop(cfg.SOCKSAddr) })
 		fmt.Println("[i] auto-update: watching GitHub releases")
 	}
 
