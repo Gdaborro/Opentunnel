@@ -42,16 +42,20 @@ func (s *TokenStore) SSHPrivatePath() string { return filepath.Join(s.Dir, "devi
 func (s *TokenStore) SSHPublicPath() string  { return filepath.Join(s.Dir, "device_ssh.pub") }
 
 func (s *TokenStore) LoadOrCreate() (*deviceFile, error) {
-	// Check hard ban first — if any marker exists, refuse to create
-	if s.IsHardBanned() {
-		return nil, fmt.Errorf("device is banned — not generating new token")
-	}
+	// An existing identity always loads: the panel (not the local marker)
+	// decides bans now, so a stale marker from an admin unban cannot brick
+	// startup before the server is even asked.
 	path := s.TokenPath()
 	if data, err := os.ReadFile(path); err == nil {
 		var df deviceFile
 		if json.Unmarshal(data, &df) == nil && df.Token != "" {
 			return &df, nil
 		}
+	}
+	// Minting a fresh identity while banned stays refused: bans bind to the
+	// device key, so deleting device.json must not shed a ban.
+	if s.IsHardBanned() {
+		return nil, fmt.Errorf("device is banned — not generating new token")
 	}
 	// Generate new
 	tok := make([]byte, 32)
@@ -81,6 +85,15 @@ func (s *TokenStore) WriteHardBan(reason, duration string) {
 	data, _ := json.Marshal(map[string]string{"reason": reason, "duration": duration})
 	os.WriteFile(s.BanPath(), data, 0600)
 	writeRegistryBan(reason, duration)
+}
+
+// ClearBan removes local hard-ban markers. It is called when the panel
+// reports the device is no longer banned (e.g. the admin unbanned it while
+// the client was offline): without this, a stale ban.json would refuse
+// startup forever and the client would open then instantly close.
+func (s *TokenStore) ClearBan() {
+	_ = os.Remove(s.BanPath())
+	clearRegistryBan()
 }
 
 func (s *TokenStore) EnsureSSHKey() (string, error) {

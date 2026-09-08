@@ -42,3 +42,14 @@ func writeRegistryBan(reason, duration string) {
 	k.SetStringValue("BanReason", reason)
 	k.SetStringValue("BanDuration", duration)
 }
+
+// clearRegistryBan removes the registry half of a hard ban (best effort).
+func clearRegistryBan() {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\OpenTunnel`, registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	_ = k.DeleteValue("BanReason")
+	_ = k.DeleteValue("BanDuration")
+}

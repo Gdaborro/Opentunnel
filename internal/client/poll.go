@@ -43,23 +43,34 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 	return nil
 }
 
+// TokenStatus queries the panel for this device's admission state.
+// Startup uses it to distinguish a live ban (grace notice mode) from a
+// stale local ban marker left behind by an admin unban.
+func TokenStatus(cfg *config.ClientConf, token string) (status, kickReason, banReason, kickExpires string, err error) {
+	return checkTokenStatus(cfg, token)
+}
+
 // PollTokenStatus watches the panel for admission changes (approval, kick,
 // ban, purge) and prints plain-language notices on state transitions. stop
-// requests a clean shutdown (banned devices must not keep running).
-func PollTokenStatus(cfg *config.ClientConf, device *deviceFile, stop func()) {
+// requests a clean shutdown; onBan fires instead of stop for bans so the
+// client can show the ban notice everywhere for a grace period first
+// (nil onBan keeps the old instant-stop behavior); onApproved fires on
+// transitions back to approved so a pending grace shutdown can be cancelled
+// (nil onApproved is fine).
+func PollTokenStatus(cfg *config.ClientConf, device *deviceFile, stop func(), onBan func(reason string), onApproved func()) {
 	// Give the fire-and-forget registration a moment to land, then check
 	// immediately so a fresh device sees its pending notice right away.
 	time.Sleep(3 * time.Second)
 	last := ""
-	checkOnce(cfg, device, stop, &last)
+	checkOnce(cfg, device, stop, onBan, onApproved, &last)
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		checkOnce(cfg, device, stop, &last)
+		checkOnce(cfg, device, stop, onBan, onApproved, &last)
 	}
 }
 
-func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), last *string) {
+func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan func(reason string), onApproved func(), last *string) {
 	status, kickReason, banReason, kickExpires, err := checkTokenStatus(cfg, device.Token)
 	if err != nil {
 		return // transient network error — keep the last known state
@@ -71,6 +82,14 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), last *st
 	switch status {
 	case "approved":
 		fmt.Println("[+] Access granted — this device is online.")
+		// An unban that landed while we carry stale local markers (or a
+		// pending grace shutdown) takes effect immediately.
+		if ts, terr := NewTokenStore(); terr == nil {
+			ts.ClearBan()
+		}
+		if onApproved != nil {
+			onApproved()
+		}
 	case "pending":
 		fmt.Println("[*] Waiting for one-time approval from the network administrator.")
 		fmt.Println("    Nothing to do here — you'll be connected automatically once approved.")
@@ -81,10 +100,13 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), last *st
 			fmt.Printf("[!] Access paused: %s\n", kickReason)
 		}
 	case "banned":
-		fmt.Printf("[X] This device has been banned by the administrator.\n    Reason: %s\n", banReason)
 		ts, _ := NewTokenStore()
 		ts.WriteHardBan(banReason, "permanent")
-		stop()
+		if onBan != nil {
+			onBan(banReason)
+		} else {
+			stop()
+		}
 	case "expired":
 		fmt.Println("[*] Registration expired — re-registering for approval...")
 		_ = doRegister(cfg, device)

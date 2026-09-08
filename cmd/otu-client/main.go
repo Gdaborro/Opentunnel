@@ -243,7 +243,7 @@ func run() {
 	// and exit quietly — never look like a crash loop.
 	if singleInstance(mgr, cfg.SOCKSAddr, cfg.HTTPAddr) {
 		return
-	}	// Relative ssh_key paths are resolved against the config file's
+	} // Relative ssh_key paths are resolved against the config file's
 	// directory, so a key dropped next to the exe/config just works.
 	if cfg.SSHKey != "" && !filepath.IsAbs(cfg.SSHKey) {
 		cfg.SSHKey = filepath.Join(filepath.Dir(*cfgPath), cfg.SSHKey)
@@ -270,13 +270,6 @@ func run() {
 	if err != nil {
 		log.Fatalf("token store: %v", err)
 	}
-	if tokenStore.IsHardBanned() {
-		fmt.Println("This device is banned. Please contact the administrator.")
-		if data, err := os.ReadFile(tokenStore.BanPath()); err == nil {
-			fmt.Printf("Ban info: %s\n", string(data))
-		}
-		os.Exit(1)
-	}
 	device, err := tokenStore.LoadOrCreate()
 	if err != nil {
 		log.Fatalf("device token: %v", err)
@@ -293,10 +286,45 @@ func run() {
 		})
 	}
 
-	// Register with panel (fire-and-forget; panel will create pending peer)
-	safeGo("register", func() { client.RegisterWithPanel(cfg, device) })
-	// Background heartbeat and status poll (kick/ban/pending)
-	safeGo("poll", func() { client.PollTokenStatus(cfg, device, requestStop) })
+	// Live ban check: a stale local marker never blocks startup on its own
+	// (an admin unban clears server state; the markers clear below). A live
+	// ban enters notice mode instead: proxies up, ban page on every site,
+	// for the grace period — then disconnect.
+	banGate := &proxy.BanGate{}
+	var graceStop *time.Timer
+	graceStart := false
+	if reason, isBanned := checkBanAtStartup(cfg, device.Token, tokenStore); isBanned {
+		graceStart = true
+		banGate.Activate(reason)
+		fmt.Printf("[X] This device is banned by the administrator.\n    Reason: %s\n", reason)
+		fmt.Printf("    Every page shows this notice for %s, then otu disconnects.\n", banGracePeriod)
+		graceStop = time.AfterFunc(banGracePeriod, requestStop)
+	}
+
+	if !graceStart {
+		// Register with panel (fire-and-forget; panel will create pending peer)
+		safeGo("register", func() { client.RegisterWithPanel(cfg, device) })
+		// A mid-session ban switches to notice mode (ban page everywhere)
+		// for the grace period instead of dropping instantly; an unban
+		// landing mid-grace cancels the shutdown and clears the gate.
+		onBan := func(reason string) {
+			banGate.Activate(reason)
+			fmt.Printf("\n[X] This device has been banned by the administrator.\n    Reason: %s\n", reason)
+			fmt.Printf("    Every page shows this notice for %s, then otu disconnects.\n", banGracePeriod)
+			graceStop = time.AfterFunc(banGracePeriod, requestStop)
+		}
+		onApproved := func() {
+			if graceStop != nil {
+				if graceStop.Stop() {
+					fmt.Println("[+] Ban lifted — staying connected.")
+				}
+				graceStop = nil
+			}
+			banGate.Deactivate()
+		}
+		// Background heartbeat and status poll (kick/ban/pending)
+		safeGo("poll", func() { client.PollTokenStatus(cfg, device, requestStop, onBan, onApproved) })
+	}
 
 	if *shareLink {
 		link, lerr := share.Build(share.Params{
@@ -325,100 +353,109 @@ func run() {
 		return
 	}
 
-	baseOpts := transport.WSTLSOptions{
-		ServerAddr:  cfg.ServerAddr,
-		WSPath:      cfg.WSPath,
-		Fingerprint: cfg.Fingerprint,
-		Insecure:    cfg.Insecure,
-	}
-	dialer := client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
-	dialer.Logger = log.Default()
-	// If the panel no longer knows our device token (purged after
-	// inactivity), re-register and wait for approval again.
-	dialer.OnAuthRejected = func() { client.RegisterWithPanel(cfg, device) }
+	var serveDialer proxy.Dialer
+	var dialer *client.Adaptive
+	if graceStart {
+		// Ban notice mode: no tunnel at all — every page served locally.
+		serveDialer = &proxy.BanDialer{Gate: banGate}
+		fmt.Printf("[i] otu-client %s (ban notice mode)\n", version.Version)
+	} else {
+		baseOpts := transport.WSTLSOptions{
+			ServerAddr:  cfg.ServerAddr,
+			WSPath:      cfg.WSPath,
+			Fingerprint: cfg.Fingerprint,
+			Insecure:    cfg.Insecure,
+		}
+		dialer = client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
+		dialer.Logger = log.Default()
+		// If the panel no longer knows our device token (purged after
+		// inactivity), re-register and wait for approval again.
+		dialer.OnAuthRejected = func() { client.RegisterWithPanel(cfg, device) }
 
-	switch cfg.TransportKind() {
-	case "ssh":
-		internal := cfg.SSHInternal
-		if internal == "" {
-			internal = "127.0.0.1:8081"
-		}
-		user := cfg.SSHUser
-		if user == "" {
-			user = "ubuntu"
-		}
-		key := cfg.SSHKey
-		if key == "" {
-			log.Fatal("transport=ssh requires ssh_key in config")
-		}
-		sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
-		dialer.UseTransportBuilder(func(profile string) transport.Transport {
-			return transport.NewSSH(transport.SSHOptions{
-				Host:        sshAddr,
-				User:        user,
-				KeyFile:     key,
-				InternalWS:  internal,
-				WSPath:      cfg.WSPath,
-				HostKeyPins: cfg.SSHHostKeyPins(),
-			})
-		})
-		fmt.Println("[i] transport: ssh (tunnel inside SSH; AEAD still end-to-end)")
-		if len(cfg.SSHHostKeyPins()) == 0 {
-			fmt.Println("[!] WARNING: no ssh_host_keys pinned — the ssh tier will accept any host key")
-		}
-	default:
-		fmt.Println("[i] transport: ws-tls")
-		// Optional last-resort tier: if every ws-tls tier is intercepted,
-		// try tunneling inside real SSH before giving up. New devices do not
-		// have the key — only add the tier when the key file actually exists.
-		if cfg.FallbackSSHEnabled() && cfg.SSHKey != "" {
-			if _, err := os.Stat(cfg.SSHKey); err != nil {
-				fmt.Printf("[i] ssh_key %q not found — skipping ssh fallback tier (ws-tls only)\n", cfg.SSHKey)
-			} else {
-				internal := cfg.SSHInternal
-				if internal == "" {
-					internal = "127.0.0.1:8081"
-				}
-				user := cfg.SSHUser
-				if user == "" {
-					user = "ubuntu"
-				}
-				sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
-				pins := cfg.SSHHostKeyPins()
-				dialer.EnableSSHFallback(func() transport.Transport {
-					return transport.NewSSH(transport.SSHOptions{
-						Host:        sshAddr,
-						User:        user,
-						KeyFile:     cfg.SSHKey,
-						InternalWS:  internal,
-						WSPath:      cfg.WSPath,
-						HostKeyPins: pins,
-					})
+		switch cfg.TransportKind() {
+		case "ssh":
+			internal := cfg.SSHInternal
+			if internal == "" {
+				internal = "127.0.0.1:8081"
+			}
+			user := cfg.SSHUser
+			if user == "" {
+				user = "ubuntu"
+			}
+			key := cfg.SSHKey
+			if key == "" {
+				log.Fatal("transport=ssh requires ssh_key in config")
+			}
+			sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
+			dialer.UseTransportBuilder(func(profile string) transport.Transport {
+				return transport.NewSSH(transport.SSHOptions{
+					Host:        sshAddr,
+					User:        user,
+					KeyFile:     key,
+					InternalWS:  internal,
+					WSPath:      cfg.WSPath,
+					HostKeyPins: cfg.SSHHostKeyPins(),
 				})
-				fmt.Println("[i] ssh fallback tier enabled (last resort)")
-				if len(pins) == 0 {
-					fmt.Println("[!] WARNING: no ssh_host_keys pinned — the ssh tier will accept any host key")
+			})
+			fmt.Println("[i] transport: ssh (tunnel inside SSH; AEAD still end-to-end)")
+			if len(cfg.SSHHostKeyPins()) == 0 {
+				fmt.Println("[!] WARNING: no ssh_host_keys pinned — the ssh tier will accept any host key")
+			}
+		default:
+			fmt.Println("[i] transport: ws-tls")
+			// Optional last-resort tier: if every ws-tls tier is intercepted,
+			// try tunneling inside real SSH before giving up. New devices do not
+			// have the key — only add the tier when the key file actually exists.
+			if cfg.FallbackSSHEnabled() && cfg.SSHKey != "" {
+				if _, err := os.Stat(cfg.SSHKey); err != nil {
+					fmt.Printf("[i] ssh_key %q not found — skipping ssh fallback tier (ws-tls only)\n", cfg.SSHKey)
+				} else {
+					internal := cfg.SSHInternal
+					if internal == "" {
+						internal = "127.0.0.1:8081"
+					}
+					user := cfg.SSHUser
+					if user == "" {
+						user = "ubuntu"
+					}
+					sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
+					pins := cfg.SSHHostKeyPins()
+					dialer.EnableSSHFallback(func() transport.Transport {
+						return transport.NewSSH(transport.SSHOptions{
+							Host:        sshAddr,
+							User:        user,
+							KeyFile:     cfg.SSHKey,
+							InternalWS:  internal,
+							WSPath:      cfg.WSPath,
+							HostKeyPins: pins,
+						})
+					})
+					fmt.Println("[i] ssh fallback tier enabled (last resort)")
+					if len(pins) == 0 {
+						fmt.Println("[!] WARNING: no ssh_host_keys pinned — the ssh tier will accept any host key")
+					}
 				}
 			}
 		}
-	}
 
-	if cfg.MuxEnabled() {
-		dialer.EnableMux()
-	}
-	if cfg.Profile == "auto" {
-		fmt.Println("[i] adaptive mode: fast -> balanced -> stealth only as needed")
-	} else {
-		fmt.Printf("[i] fixed profile: %s\n", dialer.Current())
-	}
+		if cfg.MuxEnabled() {
+			dialer.EnableMux()
+		}
+		if cfg.Profile == "auto" {
+			fmt.Println("[i] adaptive mode: fast -> balanced -> stealth only as needed")
+		} else {
+			fmt.Printf("[i] fixed profile: %s\n", dialer.Current())
+		}
 
-	fmt.Printf("[i] otu-client %s\n", version.Version)
-	safeGo("health", func() {
-		client.NewHealthReporter(cfg, device, dialer.Probe).Start(60 * time.Second)
-	})
-	if cfg.AutoUpdateEnabled() {
-		safeGo("update", func() { client.UpdateLoop(cfg.SOCKSAddr) })
-		fmt.Println("[i] auto-update: watching GitHub releases")
+		fmt.Printf("[i] otu-client %s\n", version.Version)
+		safeGo("health", func() {
+			client.NewHealthReporter(cfg, device, dialer.Probe).Start(60 * time.Second)
+		})
+		if cfg.AutoUpdateEnabled() {
+			safeGo("update", func() { client.UpdateLoop(cfg.SOCKSAddr) })
+			fmt.Println("[i] auto-update: watching GitHub releases")
+		}
+		serveDialer = &proxy.BanDialer{Inner: dialer, Gate: banGate}
 	}
 
 	httpAddr := cfg.HTTPAddr
@@ -432,7 +469,7 @@ func run() {
 		if err != nil {
 			portFailExit(socksAddr, err, mgr)
 		}
-		safeGo("socks", func() { proxy.ServeSOCKS5(ctx, lnSOCKS, dialer, log.Default()) })
+		safeGo("socks", func() { proxy.ServeSOCKS5(ctx, lnSOCKS, serveDialer, log.Default()) })
 		fmt.Printf("[+] SOCKS5     -> %s\n", socksAddr)
 	}
 	if httpAddr != "" {
@@ -440,7 +477,7 @@ func run() {
 		if err != nil {
 			portFailExit(httpAddr, err, mgr)
 		}
-		safeGo("http", func() { proxy.ServeHTTPProxy(ctx, lnHTTP, dialer, log.Default()) })
+		safeGo("http", func() { proxy.ServeHTTPProxy(ctx, lnHTTP, serveDialer, log.Default()) })
 		fmt.Printf("[+] HTTP proxy -> %s\n", httpAddr)
 	}
 
@@ -463,7 +500,9 @@ func run() {
 		fmt.Printf("[+] System proxy set to %s (restored on any exit)\n", sysProxy)
 	}
 
-	if doubleClick {
+	if graceStart {
+		fmt.Println("[i] Ban notice mode: point the browser at the proxy above; every page shows the ban notice.")
+	} else if doubleClick {
 		fmt.Println()
 		fmt.Println("================================================================")
 		fmt.Println(" otu is running. Your web browser now goes through the tunnel.")
@@ -494,6 +533,35 @@ func run() {
 		_ = lnHTTP.Close()
 	}
 	fmt.Println("\nbye - settings restored where changed.")
+}
+
+// banGracePeriod is how long a banned client stays up serving the ban
+// notice on every page before disconnecting.
+const banGracePeriod = 2 * time.Minute
+
+// checkBanAtStartup asks the panel whether this device is currently banned.
+// A live ban returns its reason (the client enters notice mode). Anything
+// else clears stale local ban markers: an admin unban that landed while the
+// client was offline must not brick the next start (open-then-instantly-
+// close). When the panel is unreachable, the local marker is the fallback
+// so an offline banned device still cannot connect.
+func checkBanAtStartup(cfg *config.ClientConf, token string, ts *client.TokenStore) (reason string, banned bool) {
+	status, _, banReason, _, err := client.TokenStatus(cfg, token)
+	if err != nil {
+		if ts.IsHardBanned() {
+			fmt.Println("This device is banned. Please contact the administrator.")
+			if data, err := os.ReadFile(ts.BanPath()); err == nil {
+				fmt.Printf("Ban info: %s\n", string(data))
+			}
+			os.Exit(1)
+		}
+		return "", false
+	}
+	if status == "banned" {
+		return banReason, true
+	}
+	ts.ClearBan()
+	return "", false
 }
 
 func firstNonEmpty(a, b string) string {

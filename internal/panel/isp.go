@@ -102,6 +102,59 @@ func invalidateBlockCache() {
 	blockCacheV.mu.Unlock()
 }
 
+// BlockWhy names the rule that blocks a domain: the entry's own reason
+// when the admin gave one, "blocklist" for plain custom entries, or the
+// matching category ("ads category"), "" when allowed. The relay sends this
+// to the client so the block page can state the reason instead of just the
+// domain.
+func (db *DB) BlockWhy(domain string) string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return ""
+	}
+	match := func(d string) bool {
+		return domain == d || strings.HasSuffix(domain, "."+d)
+	}
+	rows, err := db.Query(`SELECT domain, reason FROM blocklist`)
+	if err == nil {
+		for rows.Next() {
+			var d, reason string
+			if rows.Scan(&d, &reason) == nil {
+				if d = strings.ToLower(strings.TrimSpace(d)); d != "" && match(d) {
+					rows.Close()
+					if reason = strings.TrimSpace(reason); reason != "" {
+						return reason
+					}
+					return "blocklist"
+				}
+			}
+		}
+		rows.Close()
+	}
+	enabled := map[string]bool{}
+	rows, err = db.Query(`SELECT category FROM blocked_categories WHERE enabled=1`)
+	if err == nil {
+		for rows.Next() {
+			var c string
+			if rows.Scan(&c) == nil {
+				enabled[c] = true
+			}
+		}
+		rows.Close()
+	}
+	for _, cat := range CategoryNames() {
+		if !enabled[cat] {
+			continue
+		}
+		for _, d := range categoryLists[cat] {
+			if match(d) {
+				return cat + " category"
+			}
+		}
+	}
+	return ""
+}
+
 // Categories lists all categories with their enabled state and size.
 func (db *DB) Categories() []map[string]any {
 	enabled := map[string]bool{}

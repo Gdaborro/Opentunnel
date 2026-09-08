@@ -54,6 +54,7 @@ type Options struct {
 		CheckToken(token string) (status, reason, kickExpires string, err error)
 		RecordTraffic(token string, up, down int64)
 		IsBlocked(domain string) bool
+		BlockWhy(domain string) string
 		KillSwitch() bool
 		PeerLimits(token string) (maxBps, quotaBytes int64)
 		SetPeerIP(token, ip string)
@@ -305,7 +306,13 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 		if name != "" && opt.PanelDB.IsBlocked(name) {
 			opt.logger().Printf("blocked %s for %s", name, shortToken(token))
 			_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
-			_ = protocol.WriteToken(rw, "blocked:"+name)
+			// Send the rule (not just the domain): the client block page
+			// states the reason, e.g. "ads category".
+			why := opt.PanelDB.BlockWhy(name)
+			if why == "" {
+				why = "blocked"
+			}
+			_ = protocol.WriteToken(rw, "blocked:"+why)
 			return
 		}
 	}

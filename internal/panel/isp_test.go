@@ -159,3 +159,30 @@ func TestPeerLimitsAndIP(t *testing.T) {
 		t.Fatalf("last_ip=%s", ip)
 	}
 }
+
+func TestBlockWhy(t *testing.T) {
+	db := newTestDB(t)
+	if got := db.BlockWhy("example.com"); got != "" {
+		t.Fatalf("allowed domain why=%q", got)
+	}
+	if !db.SetCategoryEnabled("ads", true) {
+		t.Fatal("enable ads")
+	}
+	invalidateBlockCache()
+	if got := db.BlockWhy("doubleclick.net"); got != "ads category" {
+		t.Fatalf("category why=%q", got)
+	}
+	if got := db.BlockWhy("sub.doubleclick.net"); got != "ads category" {
+		t.Fatalf("subdomain category why=%q", got)
+	}
+	db.Exec(`INSERT OR REPLACE INTO blocklist(domain,reason) VALUES(?,?)`, "evil.test", "household rule: no torrents")
+	invalidateBlockCache()
+	if got := db.BlockWhy("evil.test"); got != "household rule: no torrents" {
+		t.Fatalf("custom reason why=%q", got)
+	}
+	db.Exec(`INSERT OR REPLACE INTO blocklist(domain,reason) VALUES(?,?)`, "plain.test", "")
+	invalidateBlockCache()
+	if got := db.BlockWhy("plain.test"); got != "blocklist" {
+		t.Fatalf("plain custom why=%q", got)
+	}
+}
