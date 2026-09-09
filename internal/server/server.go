@@ -188,6 +188,11 @@ func handleSession(stream net.Conn, opt Options) {
 		return
 	}
 
+	// Handshake phase over: lift the 15 s guard. Left armed, it would apply
+	// to the whole session lifetime and kill every tunnel (and every long
+	// download) 15 s after accept.
+	_ = stream.SetDeadline(time.Time{})
+
 	// AEAD keys derive from the handshake token: the per-device token in
 	// panel mode (per-device keys), the master token in legacy mode.
 	sec, err := protocol.ServerSideSecureStream(stream, authTok, salt)
@@ -346,8 +351,9 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	if err := protocol.WriteTargetResponse(rw, protocol.StatusOK); err != nil {
 		return
 	}
-	_ = rw.SetDeadline(time.Now().Add(10 * time.Second))
-	_ = upstream.SetDeadline(time.Now().Add(10 * time.Second))
+	// No data-phase deadlines: the upstream dial already has a 10 s timeout,
+	// and anything armed here would guillotine long transfers (large
+	// downloads died ~10 s in). See TestRelaySurvivesSlowTransfer.
 	_ = upstream.(*net.TCPConn).SetNoDelay(true)
 
 	// 256 KiB copy buffers keep syscalls (and per-frame overhead) low on

@@ -108,6 +108,9 @@ func invalidateBlockCache() {
 // to the client so the block page can state the reason instead of just the
 // domain.
 func (db *DB) BlockWhy(domain string) string {
+	if db == nil {
+		return ""
+	}
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	if domain == "" {
 		return ""
@@ -194,8 +197,11 @@ func (db *DB) SetCategoryEnabled(category string, enabled bool) bool {
 	return true
 }
 
-// Setting reads a settings key ("" when unset).
+// Setting reads a settings key ("" when unset, or when there is no DB).
 func (db *DB) Setting(key string) string {
+	if db == nil {
+		return ""
+	}
 	var v string
 	db.QueryRow(`SELECT COALESCE(value,'') FROM settings WHERE key=?`, key).Scan(&v)
 	return v
@@ -215,6 +221,9 @@ var (
 
 // KillSwitch reports whether all tunnel traffic is suspended.
 func (db *DB) KillSwitch() bool {
+	if db == nil {
+		return false
+	}
 	killMu.Lock()
 	defer killMu.Unlock()
 	if time.Since(killLoaded) < time.Second {
@@ -271,6 +280,9 @@ func (db *DB) AutoAcceptActive() bool {
 
 // PeerLimits returns the configured per-device caps (0 = unlimited).
 func (db *DB) PeerLimits(token string) (maxBps, quotaBytes int64) {
+	if db == nil {
+		return 0, 0
+	}
 	db.QueryRow(`SELECT COALESCE(max_bps,0), COALESCE(quota_bytes,0) FROM peers WHERE token=?`, token).Scan(&maxBps, &quotaBytes)
 	return
 }
@@ -282,6 +294,9 @@ func (db *DB) SetPeerLimits(token, schedule string, maxBps, quotaBytes int64) {
 
 // SetPeerIP records the last seen source IP for a device (GeoIP in panel).
 func (db *DB) SetPeerIP(token, ip string) {
+	if db == nil {
+		return
+	}
 	db.Exec(`UPDATE peers SET last_ip=? WHERE token=?`, ip, token)
 }
 

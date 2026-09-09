@@ -121,13 +121,18 @@ func main() {
 		panelDB = nil
 	}
 
-	baseHandler := server.Handler(server.Options{
+	baseOpts := server.Options{
 		Token:                  cfg.Token,
 		WSPath:                 cfg.WSPath,
-		PanelDB:                panelDB, // nil-safe: legacy mode when panel disabled
 		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
 		AllowLegacyMaster:      cfg.AllowLegacyMaster,
-	})
+	}
+	if panelDB != nil {
+		baseOpts.PanelDB = panelDB
+	} // else: leave the interface nil (a typed-nil *DB would defeat the
+	// nil checks and crash the relay on first use — legacy static-token
+	// mode when the panel is disabled).
+	baseHandler := server.Handler(baseOpts)
 	var handler http.Handler = baseHandler
 	if panelDB != nil {
 		target, perr := url.Parse(panelUpstream)

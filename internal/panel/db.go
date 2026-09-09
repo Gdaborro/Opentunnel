@@ -263,6 +263,12 @@ type Peer struct {
 }
 
 func (db *DB) CheckToken(token string) (status, reason, kickExpires string, err error) {
+	if db == nil {
+		// No panel database (legacy static-token mode): unknown here, so
+		// the caller treats the token as not-yet-approved, same as a DB
+		// miss below. Never approve blindly on a nil receiver.
+		return "pending", "", "", nil
+	}
 	var s, kr, br, ke, fp, pub, sched string
 	var quota, up, down int64
 	err = db.QueryRow(`SELECT status, COALESCE(kick_reason,''), COALESCE(ban_reason,''), COALESCE(kick_expires,''), fingerprint, COALESCE(ssh_pubkey,''), COALESCE(schedule,''), COALESCE(quota_bytes,0), COALESCE(bytes_up,0), COALESCE(bytes_down,0) FROM peers WHERE token=?`, token).Scan(&s, &kr, &br, &ke, &fp, &pub, &sched, &quota, &up, &down)
@@ -310,6 +316,9 @@ func (db *DB) CheckToken(token string) (status, reason, kickExpires string, err 
 }
 
 func (db *DB) RecordTraffic(token string, up, down int64) {
+	if db == nil {
+		return
+	}
 	db.Exec(`UPDATE peers SET bytes_up=bytes_up+?, bytes_down=bytes_down+?, last_seen=datetime('now') WHERE token=?`, up, down, token)
 	if up != 0 || down != 0 {
 		db.TrackDaily(token, up, down)
@@ -341,6 +350,9 @@ func (db *DB) WeeklyReport() []map[string]any {
 }
 
 func (db *DB) IsBlocked(domain string) bool {
+	if db == nil {
+		return false
+	}
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	if domain == "" {
 		return false
