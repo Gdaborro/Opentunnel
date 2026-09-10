@@ -16,6 +16,13 @@ import (
 // MuxPool keeps warm authenticated tunnel sessions so every new browser
 // connection reuses one TLS+WebSocket transport instead of paying a full
 // handshake. Fewer connections also look more like ordinary browsing.
+// softCapStreams caps how many concurrent streams pile onto one session
+// before the pool spills over to a fresh session. The relay drops streams
+// past its per-session cap (currently 256); without spillover every retry
+// lands on the same saturated session and the failure feeds itself — mass
+// EOFs under page-load bursts. 192 keeps headroom under the relay cap.
+const softCapStreams = 192
+
 // rotationWindow bounds a session's useful life: sessions older than
 // maxAge stop taking new streams (graceful drain) so no single TLS flow
 // lives for hours — the signature a human spots first in a flow table.
@@ -32,6 +39,7 @@ type MuxPool struct {
 	maxSessions int
 	dialTimeout time.Duration
 	maxAge      time.Duration // per-session rotation age (tests shrink this)
+	softCap     int          // spill over to a new session past this many streams (tests shrink this)
 	mu          sync.Mutex
 	sessions    []*muxEntry
 	next        int
@@ -63,6 +71,7 @@ func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions
 		maxSessions: maxSessions,
 		dialTimeout: dialTimeout,
 		maxAge:      rotationAge,
+		softCap:     softCapStreams,
 	}
 }
 
@@ -163,6 +172,14 @@ func muxConfig() *smux.Config {
 	return cfg
 }
 
+// overCap reports whether a session already carries enough streams that
+// new ones should spill over to a fresher session (see softCapStreams).
+func overCap(e *muxEntry, cap int) bool {
+	if cap <= 0 {
+		return false
+	}
+	return e.sess.NumStreams() >= cap
+}
 // pick returns the next healthy entry round-robin, pruning dead sessions.
 // Draining (retired) sessions stay listed until empty but take no new
 // streams; retire() runs first so expiry is enforced on activity too.
@@ -178,7 +195,7 @@ func (p *MuxPool) pick() *muxEntry {
 			continue
 		}
 		alive = append(alive, e)
-		if e.draining {
+		if e.draining || overCap(e, p.softCap) {
 			continue
 		}
 		if chosen == nil {
@@ -261,10 +278,10 @@ func (p *MuxPool) getOrDial(ctx context.Context, waiterCap time.Duration) (*muxE
 	deadline := time.Now().Add(waiterCap)
 	for {
 		p.mu.Lock()
-		// A session appeared while we waited for the lock (skip draining:
-		// retired sessions take no new streams).
+		// A session appeared while we waited for the lock (skip draining
+		// and over-cap ones: retired sessions take no new streams).
 		for _, e := range p.sessions {
-			if !e.sess.IsClosed() && !e.draining {
+			if !e.sess.IsClosed() && !e.draining && !overCap(e, p.softCap) {
 				p.mu.Unlock()
 				return e, nil
 			}

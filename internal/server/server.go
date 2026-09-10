@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -408,7 +409,14 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 
 // maxStreamsPerSession bounds concurrent smux streams on one tunnel session
 // so an authenticated client cannot exhaust memory/fds by opening streams.
-const maxStreamsPerSession = 256
+// Sized generously (clients spill over to fresh sessions well below this;
+// see softCapStreams) — it is a backstop against runaway/malicious peers,
+// not a throttle on legitimate bursts.
+const maxStreamsPerSession = 512
+
+// streamDropLog counts dropped streams so the saturation notice below is
+// sampled instead of logging every drop during a burst storm.
+var streamDropLog atomic.Uint64
 
 // limitedWriter paces writes through a shared token bucket (per-device QoS).
 type limitedWriter struct {
@@ -443,7 +451,9 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 		select {
 		case sem <- struct{}{}:
 		default:
-			o.logger().Printf("server: stream cap (%d) reached â€” dropping stream", maxStreamsPerSession)
+			if streamDropLog.Add(1)%64 == 1 {
+				o.logger().Printf("server: stream cap (%d) reached — dropping stream", maxStreamsPerSession)
+			}
 			stream.Close()
 			continue
 		}
