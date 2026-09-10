@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,11 +15,13 @@ import (
 )
 
 // Profile names, in escalation order: each step adds obfuscation overhead
-// only when the previous one appears blocked or throttled.
+// only when the previous one appears blocked or throttled. All profiles use
+// a Chrome-fingerprint hello (stock Go handshakes are machine-identifiable);
+// they differ in shaping, not identity.
 const (
-	ProfileFast     = "fast"     // plain TLS+WS, no shaping — fastest
-	ProfileBalanced = "balanced" // Chrome-fingerprint hello + size-bucket padding
-	ProfileStealth  = "stealth"  // balanced + per-frame write jitter
+	ProfileFast     = "fast"     // Chrome hello, no shaping — fastest
+	ProfileBalanced = "balanced" // + size-bucket padding
+	ProfileStealth  = "stealth"  // + per-frame write jitter
 )
 
 var profileOrder = []string{ProfileFast, ProfileBalanced, ProfileStealth}
@@ -27,8 +30,10 @@ var profileOrder = []string{ProfileFast, ProfileBalanced, ProfileStealth}
 const SshTierName = "ssh"
 
 // tierCount returns how many tiers exist including the optional SSH fallback.
+// In hostile mode the SSH tier is hidden unless explicitly allowed: an
+// all-day SSH session is the most conspicuous state on an intercepting net.
 func (a *Adaptive) tierCount() int {
-	if a.sshFallback != nil {
+	if a.sshFallback != nil && (!a.hostile || a.AllowHostileSSH) {
 		return len(profileOrder) + 1
 	}
 	return len(profileOrder)
@@ -81,6 +86,16 @@ type Adaptive struct {
 	// sshFallback, when set, adds a final last-resort tier that tunnels
 	// inside real SSH — used when every ws-tls tier is intercepted.
 	sshFallback func() transport.Transport
+
+	// AllowHostileSSH permits the SSH tier while hostile mode is active
+	// (TLS-intercepting network). Default true preserves connectivity;
+	// set false to forbid the conspicuous SSH fallback on hostile nets.
+	AllowHostileSSH bool
+
+	// hostile latches when every ws tier fails certificate pinning (TLS
+	// interception): stealth shaping is locked on and beacons stretch.
+	// Cleared on the first clean ws-tls dial (network changed).
+	hostile bool
 
 	// OnAuthRejected is forwarded to every built client: it fires when the
 	// panel no longer knows the device token (purged/expired) so the device
@@ -148,7 +163,7 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		tr = a.transportBuilder(name)
 	} else {
 		opt := a.base
-		opt.ChromeHello = name != ProfileFast
+		opt.ChromeHello = true // every tier mimics Chrome (see const block)
 		tr = transport.NewWSTLS(opt)
 	}
 	return NewWithOptions(tr, Options{
@@ -227,14 +242,20 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 	}
 
 	var lastErr error
+	sawPin := false
 	for _, idx := range order {
 		cl := a.build(idx)
 		t0 := time.Now()
 		conn, err := cl.DialTunnel(ctx, target)
 		if err == nil {
 			elapsed := time.Since(t0)
+			clearedHostile := false
 			a.mu.Lock()
 			a.failStreak = 0
+			if a.hostile && idx < len(profileOrder) {
+				a.hostile = false // clean ws-tls dial: network changed
+				clearedHostile = true
+			}
 			switch {
 			case probeDown && idx == 0:
 				a.idx = 0 // lower profile healthy again — stay fast
@@ -255,10 +276,16 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 				}
 			}
 			a.mu.Unlock()
+			if clearedHostile {
+				a.SetHostile(false)
+			}
 			return conn, nil
 		}
 		if fatalUpstream(err) {
 			return nil, err
+		}
+		if isPinFailure(err) {
+			sawPin = true
 		}
 		a.mu.Lock()
 		lastErr = fmt.Errorf("tier %q: %w", a.tierName(idx), err)
@@ -270,7 +297,59 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 	if lastErr == nil {
 		lastErr = errors.New("client: no tiers available")
 	}
+	if sawPin {
+		a.SetHostile(true) // every ws tier hit pinning: TLS interception
+	}
 	return nil, lastErr
+}
+
+// Reset drops the client back to the fastest tier immediately: slow-start
+// probing, failure streaks and the re-probe cool-off are cleared. Used when
+// the panel reports approval — recovery must not wait out a 10-minute
+// cool-off sitting on a degraded tier.
+func (a *Adaptive) Reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.auto {
+		return
+	}
+	a.idx = 0
+	a.failStreak = 0
+	a.lastProbe = time.Time{}
+}
+
+// SetHostile latches (or clears) hostile-network mode. While latched the
+// client locks onto stealth shaping and stretches its beacons; the SSH tier
+// hides unless AllowHostileSSH. Latched automatically on pin failures,
+// cleared on the first clean ws-tls dial.
+func (a *Adaptive) SetHostile(on bool) {
+	a.mu.Lock()
+	changed := a.hostile != on
+	a.hostile = on
+	if on && a.auto && a.idx < len(profileOrder)-1 {
+		a.idx = len(profileOrder) - 1 // lock stealth shaping
+	}
+	a.mu.Unlock()
+	setHostileMode(on)
+	if changed {
+		if on {
+			a.logger().Printf("adaptive: hostile network (TLS interception) — stealth locked, beacons stretched")
+		} else {
+			a.logger().Printf("adaptive: clean network — hostile mode off")
+		}
+	}
+}
+
+// isPinFailure reports certificate-pin rejections (the MITM tell), as
+// opposed to unreachable hosts or refused tunnels.
+func isPinFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "fingerprint mismatch") ||
+		strings.Contains(s, "certificate is not trusted") ||
+		strings.Contains(s, "unknown authority")
 }
 
 // Current reports the active tier name (for status output).

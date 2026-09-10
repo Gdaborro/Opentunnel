@@ -76,7 +76,7 @@ var (
 
 func (o *Options) wsPath() string {
 	if o.WSPath == "" {
-		return "/ws"
+		return protocol.DefaultWSPath
 	}
 	return o.WSPath
 }
@@ -98,7 +98,7 @@ func Handler(opt Options) http.Handler {
 	}
 	decoyHandler := decoy.Handler(opt.DecoyHTML)
 	mux.Handle("/", decoyHandler)
-	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+	wsHandler := func(w http.ResponseWriter, r *http.Request) {
 		release := opt.guard().Acquire(addrHost(r.RemoteAddr))
 		if release == nil {
 			// Over limit or banned: indistinguishable from the normal site.
@@ -118,6 +118,10 @@ func Handler(opt Options) http.Handler {
 		}
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			Subprotocols: []string{"otu1"},
+			// Tunnel auth happens in-band after upgrade; rejecting on
+			// Origin would only brick legit clients (and old relays must
+			// keep accepting new ones mid-migration).
+			OriginPatterns: []string{"*"},
 		})
 		if err != nil {
 			return
@@ -125,7 +129,12 @@ func Handler(opt Options) http.Handler {
 		defer conn.Close(websocket.StatusInternalError, "")
 		stream := websocket.NetConn(r.Context(), conn, websocket.MessageBinary)
 		handleSession(stream, opt)
-	})
+	}
+	mux.HandleFunc(path, wsHandler)
+	if path != protocol.LegacyWSPath {
+		// Old clients still dial /ws: keep it mounted during migration.
+		mux.HandleFunc(protocol.LegacyWSPath, wsHandler)
+	}
 	return mux
 }
 
@@ -240,10 +249,14 @@ func handleSession(stream net.Conn, opt Options) {
 		_ = protocol.WriteToken(sec, "ok")
 		peerStatus = "approved"
 	}
-	// For banned/kicked, schedule 10min kick - hard to bypass, easy to unban via panel
+	// For banned/kicked sessions, schedule a quick close: the client poll
+	// notices within ~15 s and switches to notice mode locally, so a long
+	// server-side wait only traps legitimately recovered devices (unban or
+	// re-approve must take effect fast). 60 s backstops modified clients
+	// that ignore the poll.
 	if peerStatus == "banned" || peerStatus == "kicked" || peerStatus == "kicked-silent" {
 		go func(s net.Conn, tok string) {
-			time.Sleep(10 * time.Minute)
+			time.Sleep(60 * time.Second)
 			s.Close()
 			// Also ensure peer is still banned/kicked, if kicked silent we don't log
 			if peerStatus == "kicked" || peerStatus == "kicked-silent" {

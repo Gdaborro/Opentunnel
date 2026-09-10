@@ -50,7 +50,7 @@ func (h *HealthReporter) Start(interval time.Duration) {
 		time.Sleep(5 * time.Second) // let the tunnel come up first
 		for {
 			h.reportOnce()
-			time.Sleep(interval)
+			time.Sleep(jittered(interval))
 		}
 	}()
 }

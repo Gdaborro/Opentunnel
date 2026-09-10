@@ -13,12 +13,20 @@ import (
 	utls "github.com/refraction-networking/utls"
 
 	"github.com/coder/websocket"
+
+	"opentunnel/internal/protocol"
 )
 
 const (
-	DefaultWSPath = "/ws"
+	// DefaultWSPath mirrors protocol.DefaultWSPath (kept for compatibility).
+	DefaultWSPath = protocol.DefaultWSPath
 	wsScheme      = "wss"
 )
+
+// browserUA imitates a current Chrome on the plaintext upgrade request: the
+// stock Go client would otherwise announce "Go-http-client" and offer a
+// custom subprotocol — both machine-identifiable under interception.
+const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 // WSTLSOptions configures the ws-tls transport.
 type WSTLSOptions struct {
@@ -99,9 +107,19 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 	url := fmt.Sprintf("%s://%s%s", wsScheme, hostPort, t.opt.wsPathOrDefault())
 	httpClient := newPinnedHTTPClient(tlsCfg, timeout, t.opt.ChromeHello)
 
+	// No subprotocol and a browser-plausible User-Agent: under interception
+	// this reads as an ordinary app's realtime channel, not a custom
+	// protocol ("otu1" announced the tunnel by name; Go's stock UA announced
+	// the toolchain). Deliberately NO Origin header: websocket servers
+	// (including older relays) reject mismatched Origins with 403, which
+	// would brick new clients against old servers mid-migration.
+	hdr := http.Header{
+		"User-Agent":      {browserUA},
+		"Accept-Language": {"en-US,en;q=0.9"},
+	}
 	conn, _, err := websocket.Dial(dctx, url, &websocket.DialOptions{
-		HTTPClient:   httpClient,
-		Subprotocols: []string{"otu1"},
+		HTTPClient: httpClient,
+		HTTPHeader: hdr,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("transport: websocket dial %s: %w", url, err)

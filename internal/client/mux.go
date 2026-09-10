@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -15,13 +16,26 @@ import (
 // MuxPool keeps warm authenticated tunnel sessions so every new browser
 // connection reuses one TLS+WebSocket transport instead of paying a full
 // handshake. Fewer connections also look more like ordinary browsing.
+// rotationWindow bounds a session's useful life: sessions older than
+// maxAge stop taking new streams (graceful drain) so no single TLS flow
+// lives for hours — the signature a human spots first in a flow table.
+// Draining sessions close once empty or past maxAge+maxDrain, so long
+// downloads are never cut (unlike a hard kill).
+const (
+	rotationAge = 25 * time.Minute
+	maxDrain    = 10 * time.Minute
+	sweepEvery  = 5 * time.Minute
+)
+
 type MuxPool struct {
 	factory     func(ctx context.Context) (net.Conn, error)
 	maxSessions int
 	dialTimeout time.Duration
+	maxAge      time.Duration // per-session rotation age (tests shrink this)
 	mu          sync.Mutex
 	sessions    []*muxEntry
 	next        int
+	sweeper     bool
 
 	// dialing guards session creation so a page-load burst (dozens of
 	// domains at once) mints at most ONE full SSH+WS+auth handshake at a
@@ -31,7 +45,11 @@ type MuxPool struct {
 	dialCh  chan struct{} // closed when the in-flight dial finishes
 }
 
-type muxEntry struct{ sess *smux.Session }
+type muxEntry struct {
+	sess     *smux.Session
+	retireAt time.Time
+	draining bool
+}
 
 func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions int, dialTimeout time.Duration) *MuxPool {
 	if maxSessions < 1 {
@@ -44,6 +62,7 @@ func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions
 		factory:     factory,
 		maxSessions: maxSessions,
 		dialTimeout: dialTimeout,
+		maxAge:      rotationAge,
 	}
 }
 
@@ -52,16 +71,103 @@ func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	sess, err := smux.Client(conn, protocol.MuxConfig())
+	sess, err := smux.Client(conn, muxConfig())
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	return &muxEntry{sess: sess}, nil
+	now := time.Now()
+	maxAge := rotationAge
+	p.mu.Lock()
+	if p.maxAge > 0 {
+		maxAge = p.maxAge
+	}
+	p.mu.Unlock()
+	var extra time.Duration
+	if maxAge > 0 {
+		extra = time.Duration(rand.Int63n(int64(maxAge) / 4))
+	}
+	return &muxEntry{
+		sess: sess,
+		// Slack defeats metronomic rotation: sessions retire
+		// unpredictably inside the window, never on a schedule.
+		retireAt: now.Add(maxAge).Add(extra),
+	}, nil
+}
+
+// retireLocked marks expired sessions draining and drops finished ones,
+// returning sessions to close OUTSIDE the pool lock. Draining sessions take
+// no new streams (pick skips them); in-flight streams finish undisturbed
+// until empty or past the hard cap, so rotation never cuts a download.
+func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
+	alive := p.sessions[:0]
+	for _, e := range p.sessions {
+		if e.sess.IsClosed() {
+			continue
+		}
+		if e.draining {
+			if e.sess.NumStreams() == 0 || now.After(e.retireAt.Add(maxDrain)) {
+				dead = append(dead, e)
+				continue
+			}
+			alive = append(alive, e)
+			continue
+		}
+		if now.After(e.retireAt) {
+			e.draining = true
+		}
+		alive = append(alive, e)
+	}
+	p.sessions = alive
+	if len(p.sessions) == 0 {
+		p.next = 0
+	}
+	return dead
+}
+
+// retire applies retireLocked and closes reaped sessions outside the lock.
+func (p *MuxPool) retire() {
+	p.mu.Lock()
+	dead := p.retireLocked(time.Now())
+	p.mu.Unlock()
+	for _, e := range dead {
+		_ = e.sess.Close()
+	}
+}
+
+// sweep retires on a timer so even idle pools (keepalive-only flows, the
+// quietest long-lived signature) rotate. One goroutine per pool; pools live
+// as long as the process.
+func (p *MuxPool) sweep() {
+	p.mu.Lock()
+	if p.sweeper {
+		p.mu.Unlock()
+		return
+	}
+	p.sweeper = true
+	p.mu.Unlock()
+	go func() {
+		t := time.NewTicker(sweepEvery)
+		defer t.Stop()
+		for range t.C {
+			p.retire()
+		}
+	}()
+}
+
+// muxConfig clones the shared smux parameters with a jittered keepalive:
+// an exact 20 s heartbeat from every session is a correlatable beacon.
+func muxConfig() *smux.Config {
+	cfg := protocol.MuxConfig()
+	cfg.KeepAliveInterval += time.Duration(rand.Int63n(int64(10 * time.Second)))
+	return cfg
 }
 
 // pick returns the next healthy entry round-robin, pruning dead sessions.
+// Draining (retired) sessions stay listed until empty but take no new
+// streams; retire() runs first so expiry is enforced on activity too.
 func (p *MuxPool) pick() *muxEntry {
+	p.retire()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	alive := p.sessions[:0]
@@ -72,6 +178,9 @@ func (p *MuxPool) pick() *muxEntry {
 			continue
 		}
 		alive = append(alive, e)
+		if e.draining {
+			continue
+		}
 		if chosen == nil {
 			chosen = e
 			p.next = (p.next + i + 1) % maxInt(1, len(p.sessions))
@@ -122,6 +231,7 @@ func (p *MuxPool) drop(e *muxEntry) {
 // break out and dial itself as a last resort.
 func (p *MuxPool) Open(ctx context.Context) (net.Conn, error) {
 	const waiterCap = 10 * time.Second
+	p.sweep() // idle pools rotate too (no-op after the first call)
 	for attempt := 0; attempt < 2; attempt++ {
 		e := p.pick()
 		if e == nil {
@@ -151,9 +261,10 @@ func (p *MuxPool) getOrDial(ctx context.Context, waiterCap time.Duration) (*muxE
 	deadline := time.Now().Add(waiterCap)
 	for {
 		p.mu.Lock()
-		// A session appeared while we waited for the lock.
+		// A session appeared while we waited for the lock (skip draining:
+		// retired sessions take no new streams).
 		for _, e := range p.sessions {
-			if !e.sess.IsClosed() {
+			if !e.sess.IsClosed() && !e.draining {
 				p.mu.Unlock()
 				return e, nil
 			}

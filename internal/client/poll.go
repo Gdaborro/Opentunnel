@@ -60,12 +60,13 @@ func TokenStatus(cfg *config.ClientConf, token string) (status, kickReason, banR
 func PollTokenStatus(cfg *config.ClientConf, device *deviceFile, stop func(), onBan func(reason string), onApproved func()) {
 	// Give the fire-and-forget registration a moment to land, then check
 	// immediately so a fresh device sees its pending notice right away.
+	// Afterwards the cadence is jittered (metronomic beacons to one host
+	// are correlatable); hostile networks stretch it further.
 	time.Sleep(3 * time.Second)
 	last := ""
 	checkOnce(cfg, device, stop, onBan, onApproved, &last)
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		time.Sleep(jittered(15 * time.Second))
 		checkOnce(cfg, device, stop, onBan, onApproved, &last)
 	}
 }

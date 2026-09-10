@@ -291,6 +291,7 @@ func run() {
 	// ban enters notice mode instead: proxies up, ban page on every site,
 	// for the grace period — then disconnect.
 	banGate := &proxy.BanGate{}
+	var dialer *client.Adaptive
 	var graceStop *time.Timer
 	graceStart := false
 	if reason, isBanned := checkBanAtStartup(cfg, device.Token, tokenStore); isBanned {
@@ -321,6 +322,11 @@ func run() {
 				graceStop = nil
 			}
 			banGate.Deactivate()
+			// Recovery must be immediate: drop back to the fastest tier
+			// instead of waiting out the re-probe cool-off on stealth/SSH.
+			if dialer != nil {
+				dialer.Reset()
+			}
 		}
 		// Background heartbeat and status poll (kick/ban/pending)
 		safeGo("poll", func() { client.PollTokenStatus(cfg, device, requestStop, onBan, onApproved) })
@@ -354,7 +360,6 @@ func run() {
 	}
 
 	var serveDialer proxy.Dialer
-	var dialer *client.Adaptive
 	if graceStart {
 		// Ban notice mode: no tunnel at all — every page served locally.
 		serveDialer = &proxy.BanDialer{Gate: banGate}
@@ -367,6 +372,7 @@ func run() {
 			Insecure:    cfg.Insecure,
 		}
 		dialer = client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
+		dialer.AllowHostileSSH = cfg.AllowHostileSSH()
 		dialer.Logger = log.Default()
 		// If the panel no longer knows our device token (purged after
 		// inactivity), re-register and wait for approval again.

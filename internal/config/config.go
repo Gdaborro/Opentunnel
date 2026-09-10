@@ -56,6 +56,7 @@ type ClientConf struct {
 	HTTPAddr    string   `toml:"http_addr"`     // default 127.0.0.1:8118
 	BypassList  []string `toml:"bypass_list"`   // extra ProxyOverride entries
 	AutoUpdate  *bool    `toml:"auto_update"`   // default true: self-update from GitHub Releases
+	HostileSSH  *bool    `toml:"hostile_ssh"`   // default true: allow the SSH last-resort tier on TLS-intercepting networks
 }
 
 // SSHHostKeyPins splits ssh_host_keys into individual pins.
@@ -106,6 +107,11 @@ func (c *ClientConf) UDPEnabled() bool { return c.UDP == nil || *c.UDP }
 // AutoUpdateEnabled reports the effective auto-update setting (default true).
 func (c *ClientConf) AutoUpdateEnabled() bool { return c.AutoUpdate == nil || *c.AutoUpdate }
 
+// AllowHostileSSH reports whether the SSH last-resort tier may engage on
+// TLS-intercepting networks (default true preserves connectivity; set false
+// to forbid the conspicuous SSH fallback where stealth matters more).
+func (c *ClientConf) AllowHostileSSH() bool { return c.HostileSSH == nil || *c.HostileSSH }
+
 func LoadServer(path string) (*Server, error) {
 	var s Server
 	if _, err := toml.DecodeFile(path, &s); err != nil {
@@ -154,7 +160,7 @@ cert_file = ""
 key_file  = ""
 # Public hostname clients will connect to (used for self-signed cert CN):
 	host = "example.com"
-	ws_path = "/ws"
+	ws_path = "/api/v1/stream"
 	# When true, newly registering devices start approved (no manual gate).
 	# Default false: every new device waits for admin approval.
 	auto_approve = false
@@ -179,13 +185,16 @@ const DefaultClientTOML = `# opentunnel client — default configuration (auto-g
 server_addr = "cdn.aborro.dev:443"
 fingerprint = "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"
 insecure = false
-ws_path = "/ws"
+ws_path = "/api/v1/stream"
 profile = "auto"
 mux = true
 udp = true
 # Last-resort tier for networks that intercept TLS: tunnel inside real SSH.
 # Drop tun.key next to this config to enable it (skipped when missing).
 fallback_ssh = true
+# On intercepting networks SSH is conspicuous: set false to forbid the
+# SSH tier there (stealth TLS tiers only; may leave you offline).
+hostile_ssh = true
 ssh_port = "22"
 ssh_user = "tun"
 ssh_key = "tun.key"
@@ -208,7 +217,7 @@ token = "CHANGE_ME_LONG_RANDOM_SECRET"
 # Paste the fingerprint printed by the server at startup (SHA-256 hex):
 fingerprint = ""
 insecure = false        # NEVER true outside local testing
-ws_path = "/ws"
+ws_path = "/api/v1/stream"
 # auto = start fast, escalate to balanced/stealth only when blocked,
 # then drop back to fast automatically (recommended):
 profile = "auto"
@@ -218,6 +227,8 @@ udp = true              # SOCKS5 UDP ASSOCIATE over the tunnel
 # Last-resort tier: if all TLS tiers get intercepted, tunnel inside real SSH.
 # Requires ssh_user + ssh_key (+ server running listen_internal).
 fallback_ssh = false
+# Allow that SSH tier on intercepting networks (conspicuous but connected).
+hostile_ssh = true
 ssh_user = "ubuntu"
 ssh_key = 'C:\path\to\ssh-key'
 ssh_internal = "127.0.0.1:8081"
