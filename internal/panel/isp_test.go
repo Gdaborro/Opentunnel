@@ -186,3 +186,31 @@ func TestBlockWhy(t *testing.T) {
 		t.Fatalf("plain custom why=%q", got)
 	}
 }
+
+func TestExtensionsCategoryOffByDefault(t *testing.T) {
+	db := newTestDB(t)
+	if db.IsBlocked("extensions.socalifornian.live") {
+		t.Fatal("extensions category must start disabled")
+	}
+	if got := db.BlockWhy("extensions.socalifornian.live"); got != "" {
+		t.Fatalf("disabled category why=%q", got)
+	}
+	if !db.SetCategoryEnabled("extensions", true) {
+		t.Fatal("enable extensions")
+	}
+	invalidateBlockCache()
+	if !db.IsBlocked("sub.socalifornian.live") {
+		t.Fatal("enabled category must suffix-match")
+	}
+	if got := db.BlockWhy("extensions.socalifornian.live"); got != "extensions category" {
+		t.Fatalf("enabled why=%q", got)
+	}
+	if db.SetCategoryEnabled("extensions", false) {
+		invalidateBlockCache()
+		if db.IsBlocked("extensions.socalifornian.live") {
+			t.Fatal("re-disabled category must not block")
+		}
+	} else {
+		t.Fatal("disable extensions")
+	}
+}

@@ -33,11 +33,17 @@ var categoryLists = map[string][]string{
 		"bet365.com", "sportsbet.com.au", "tab.com.au", "ladbrokes.com",
 		"pokerstars.com", "unibet.com",
 	},
+	// extensions holds domains backing community browser/app extensions
+	// (lyrics providers, extension registries). Off by default: blocking
+	// these breaks the extensions outright, so it is opt-in per network.
+	"extensions": {
+		"socalifornian.live",
+	},
 }
 
 // CategoryNames returns the built-in category names (sorted-ish stable order).
 func CategoryNames() []string {
-	return []string{"social", "streaming", "adult", "ads", "gambling"}
+	return []string{"social", "streaming", "adult", "ads", "gambling", "extensions"}
 }
 
 // blockCache caches the blocklist + enabled-category suffixes so IsBlocked
