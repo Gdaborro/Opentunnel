@@ -43,6 +43,16 @@ type wsTLSTransport struct{ opt WSTLSOptions }
 
 func NewWSTLS(opt WSTLSOptions) Transport { return &wsTLSTransport{opt: opt} }
 
+// sessionCache is shared by every dial in the process: resumed handshakes
+// are shorter, faster, and far less distinctive than full handshakes — which
+// matters most exactly when sessions churn (rotation windows, TTL quotas).
+// The cache holds tickets, never credentials; entries are keyed by endpoint.
+var sessionCache = tls.NewLRUClientSessionCache(64)
+
+// utlsCache is the same idea for Chrome-hello dials (uTLS has its own
+// session-state type, so the stdlib cache cannot be shared).
+var utlsCache = newUTLSSessionCache()
+
 func (t *wsTLSTransport) Name() string { return "ws-tls" }
 
 func (o *WSTLSOptions) wsPathOrDefault() string {
@@ -57,6 +67,7 @@ func (t *wsTLSTransport) tlsConfig(host string) (*tls.Config, error) {
 		ServerName:         host,
 		InsecureSkipVerify: true, // we pin instead of using system roots
 		MinVersion:         tls.VersionTLS12,
+		ClientSessionCache: sessionCache,
 	}
 	if t.opt.ServerName != "" {
 		cfg.ServerName = t.opt.ServerName
@@ -188,14 +199,21 @@ func newPinnedHTTPClient(cfg *tls.Config, timeout time.Duration, chrome bool) *h
 						break
 					}
 				}
-				ucfg := &utls.Config{
-					ServerName: cfg.ServerName,
-					// Pins govern trust; skip system roots exactly as in the
-					// non-uTLS path above.
-					InsecureSkipVerify:    true,
-					MinVersion:            tls.VersionTLS12,
-					VerifyPeerCertificate: cfg.VerifyPeerCertificate,
-				}
+			ucfg := &utls.Config{
+				ServerName: cfg.ServerName,
+				// Pins govern trust; skip system roots exactly as in the
+				// non-uTLS path above.
+				InsecureSkipVerify:    true,
+				MinVersion:            tls.VersionTLS12,
+				VerifyPeerCertificate: cfg.VerifyPeerCertificate,
+				ClientSessionCache:    utlsCache,
+				// The static Chrome parrot carries no pre-shared-key slot,
+				// so there is nothing to resume into yet: skip instead of
+				// panicking (uTLS panics on cache-without-slot). Plain-TLS
+				// tiers resume normally; wiring PSK into the parrot spec is
+				// future work (see u_pre_shared_key.go Initializable).
+				PreferSkipResumptionOnNilExtension: true,
+			}
 				uconn := utls.UClient(raw, ucfg, utls.HelloCustom)
 				if err := uconn.ApplyPreset(&spec); err != nil {
 					_ = raw.Close()

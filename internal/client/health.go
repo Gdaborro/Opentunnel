@@ -27,10 +27,18 @@ type HealthReporter struct {
 	device *deviceFile
 	probe  func(ctx context.Context) (time.Duration, error)
 
+	// ThroughputProbe measures tunnel goodput for shaping detection (nil =
+	// disabled). OnShaped/OnHealthy report verdicts; the owner rotates
+	// entries and toggles thin mode.
+	ThroughputProbe func(ctx context.Context) (time.Duration, float64, error)
+	OnShaped        func()
+	OnHealthy       func()
+
 	mu        sync.Mutex
 	latencies []time.Duration // recent successful probes (bounded)
 	probes    int
 	fails     int
+	reports   int // report cycles (drives the throughput cadence)
 }
 
 const probeWindow = 20 // rolling window size for loss/jitter
@@ -50,9 +58,39 @@ func (h *HealthReporter) Start(interval time.Duration) {
 		time.Sleep(5 * time.Second) // let the tunnel come up first
 		for {
 			h.reportOnce()
+			h.maybeThroughputProbe()
 			time.Sleep(jittered(interval))
 		}
 	}()
+}
+
+// maybeThroughputProbe samples tunnel goodput every fourth report (~4 min).
+// A shaping verdict goes to OnShaped, a clean one to OnHealthy; probe
+// errors are inconclusive (no verdict either way).
+func (h *HealthReporter) maybeThroughputProbe() {
+	if h.ThroughputProbe == nil {
+		return
+	}
+	h.mu.Lock()
+	h.reports++
+	due := h.reports%4 == 0
+	h.mu.Unlock()
+	if !due {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	ttfb, bps, err := h.ThroughputProbe(ctx)
+	if err != nil {
+		return
+	}
+	if isShaped(ttfb, bps) {
+		if h.OnShaped != nil {
+			h.OnShaped()
+		}
+	} else if h.OnHealthy != nil {
+		h.OnHealthy()
+	}
 }
 
 func (h *HealthReporter) recordProbe(d time.Duration, err error) {

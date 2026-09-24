@@ -1,11 +1,15 @@
-package client
+﻿package client
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +23,7 @@ import (
 // a Chrome-fingerprint hello (stock Go handshakes are machine-identifiable);
 // they differ in shaping, not identity.
 const (
-	ProfileFast     = "fast"     // Chrome hello, no shaping — fastest
+	ProfileFast     = "fast"     // Chrome hello, no shaping â€” fastest
 	ProfileBalanced = "balanced" // + size-bucket padding
 	ProfileStealth  = "stealth"  // + per-frame write jitter
 )
@@ -84,7 +88,7 @@ type Adaptive struct {
 	transportBuilder func(profile string) transport.Transport
 
 	// sshFallback, when set, adds a final last-resort tier that tunnels
-	// inside real SSH — used when every ws-tls tier is intercepted.
+	// inside real SSH â€” used when every ws-tls tier is intercepted.
 	sshFallback func() transport.Transport
 
 	// AllowHostileSSH permits the SSH tier while hostile mode is active
@@ -96,6 +100,18 @@ type Adaptive struct {
 	// interception): stealth shaping is locked on and beacons stretch.
 	// Cleared on the first clean ws-tls dial (network changed).
 	hostile bool
+
+	// entries are the rotatable tunnel endpoints (primary first). rotateEntry
+	// RotateEntry walks them when an entry fails outright (DNS death) or looks shaped;
+	// the dial machinery always builds from the current entry.
+	entries  []transport.WSTLSOptions
+	entryIdx int
+
+	// ProbeURL and ProbeSampleBytes override the throughput probe target
+	// (empty/zero = defaults). Exported so tests and operators can aim the
+	// probe at their own infrastructure.
+	ProbeURL         string
+	ProbeSampleBytes int64
 
 	// OnAuthRejected is forwarded to every built client: it fires when the
 	// panel no longer knows the device token (purged/expired) so the device
@@ -190,7 +206,7 @@ func (a *Adaptive) build(idx int) *Client {
 }
 
 // fatalUpstream reports errors that indicate the tunnel works but the target
-// is unreachable — escalating profiles cannot help. Pending/expired device
+// is unreachable â€” escalating profiles cannot help. Pending/expired device
 // tokens and ISP blocks are also terminal: no transport tier can fix them.
 func fatalUpstream(err error) bool {
 	if err == nil {
@@ -243,6 +259,7 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 
 	var lastErr error
 	sawPin := false
+	sawDNS := false
 	for _, idx := range order {
 		cl := a.build(idx)
 		t0 := time.Now()
@@ -258,8 +275,8 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 			}
 			switch {
 			case probeDown && idx == 0:
-				a.idx = 0 // lower profile healthy again — stay fast
-				a.logger().Printf("adaptive: fast profile healthy again — back to %q", ProfileFast)
+				a.idx = 0 // lower profile healthy again â€” stay fast
+				a.logger().Printf("adaptive: fast profile healthy again â€” back to %q", ProfileFast)
 			default:
 				if idx > a.idx {
 					a.idx = idx // escalated this call: stick here
@@ -272,7 +289,7 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 				if a.auto && idx == a.idx && elapsed > a.ttfbBudget && a.idx+1 < total {
 					a.idx++
 					a.lastProbe = time.Now()
-					a.logger().Printf("adaptive: slow response (%s) — pre-escalating to %q", elapsed.Round(time.Millisecond), a.tierName(a.idx))
+					a.logger().Printf("adaptive: slow response (%s) â€” pre-escalating to %q", elapsed.Round(time.Millisecond), a.tierName(a.idx))
 				}
 			}
 			a.mu.Unlock()
@@ -287,6 +304,9 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		if isPinFailure(err) {
 			sawPin = true
 		}
+		if isDNSError(err) {
+			sawDNS = true
+		}
 		a.mu.Lock()
 		lastErr = fmt.Errorf("tier %q: %w", a.tierName(idx), err)
 		if idx == a.idx {
@@ -300,12 +320,76 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 	if sawPin {
 		a.SetHostile(true) // every ws tier hit pinning: TLS interception
 	}
+	if sawDNS {
+		// Sinkholed entry hostname: go hostile-quiet instead of storming
+		// redials at a dead name, and rotate entries when possible.
+		a.SetHostile(true)
+		a.RotateEntry("dns")
+	}
 	return nil, lastErr
 }
 
+// SetEntries installs the rotatable endpoint pool (primary first). The
+// current entry becomes the live base; tier clients rebuild lazily.
+func (a *Adaptive) SetEntries(entries []transport.WSTLSOptions) {
+	if len(entries) == 0 {
+		return
+	}
+	a.mu.Lock()
+	a.entries = append([]transport.WSTLSOptions(nil), entries...)
+	a.entryIdx = 0
+	a.base = entries[0]
+	a.clients = nil
+	a.mu.Unlock()
+}
+
+// RotateEntry advances to the next endpoint (DNS death, shaping verdict).
+// Returns false with a single entry (nothing to rotate to â€” thin mode and
+// hostile quiet are the only responses left).
+func (a *Adaptive) RotateEntry(reason string) bool {
+	a.mu.Lock()
+	if len(a.entries) < 2 {
+		a.mu.Unlock()
+		return false
+	}
+	a.entryIdx = (a.entryIdx + 1) % len(a.entries)
+	a.base = a.entries[a.entryIdx]
+	a.idx = 0
+	a.failStreak = 0
+	a.lastProbe = time.Time{}
+	a.clients = nil
+	addr := a.base.ServerAddr
+	a.mu.Unlock()
+	a.logger().Printf("adaptive: rotating entry (%s) -> %s", reason, addr)
+	return true
+}
+
+// EntryCount reports the pool size (for status output).
+func (a *Adaptive) EntryCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.entries) == 0 {
+		return 1
+	}
+	return len(a.entries)
+}
+
+// isDNSError reports name-resolution failures (the sinkhole tell): the
+// entry hostname does not resolve at all, as opposed to refusing or
+// resetting connections.
+func isDNSError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return true
+	}
+	return strings.Contains(err.Error(), "no such host")
+}
 // Reset drops the client back to the fastest tier immediately: slow-start
 // probing, failure streaks and the re-probe cool-off are cleared. Used when
-// the panel reports approval — recovery must not wait out a 10-minute
+// the panel reports approval â€” recovery must not wait out a 10-minute
 // cool-off sitting on a degraded tier.
 func (a *Adaptive) Reset() {
 	a.mu.Lock()
@@ -333,9 +417,9 @@ func (a *Adaptive) SetHostile(on bool) {
 	setHostileMode(on)
 	if changed {
 		if on {
-			a.logger().Printf("adaptive: hostile network (TLS interception) — stealth locked, beacons stretched")
+			a.logger().Printf("adaptive: hostile network (TLS interception) â€” stealth locked, beacons stretched")
 		} else {
-			a.logger().Printf("adaptive: clean network — hostile mode off")
+			a.logger().Printf("adaptive: clean network â€” hostile mode off")
 		}
 	}
 }
@@ -376,3 +460,93 @@ func (a *Adaptive) OpenUDPRelay(ctx context.Context) (net.Conn, error) {
 	a.mu.Unlock()
 	return a.build(idx).OpenUDPRelay(ctx)
 }
+
+// Throughput probe defaults: a small sample from a stock speedtest file.
+// 2 MB is enough to separate shaper-flat throughput from bursty congestion
+// while costing ~70 Kbps averaged over a 4-minute cadence.
+const (
+	DefaultProbeURL         = "https://proof.ovh.net/files/100Mb.dat"
+	DefaultProbeSampleBytes = 2 << 20
+)
+
+// shapedFloorBps: sustained goodput under ~768 Kbps with a healthy handshake
+// reads as shaper-capped, not congested (congestion jitters and recovers;
+// shapers hold a flat ceiling indefinitely).
+const shapedFloorBps = 96 << 10
+
+// ProbeThroughput fetches a sample through the tunnel, returning handshake
+// latency and sustained goodput. Splitting setup (TTFB) from transfer rate
+// is the whole diagnosis: fast setup + flat low throughput is the shaper
+// signature, while slow setup points at the path rather than a cap.
+func (a *Adaptive) ProbeThroughput(ctx context.Context) (ttfb time.Duration, bps float64, err error) {
+	u := a.ProbeURL
+	if u == "" {
+		u = DefaultProbeURL
+	}
+	n := a.ProbeSampleBytes
+	if n <= 0 {
+		n = DefaultProbeSampleBytes
+	}
+	pu, err := url.Parse(u)
+	if err != nil {
+		return 0, 0, err
+	}
+	port := pu.Port()
+	if port == "" {
+		port = "443"
+		if pu.Scheme == "http" {
+			port = "80"
+		}
+	}
+	pnum, err := strconv.Atoi(port)
+	if err != nil || pnum < 1 || pnum > 65535 {
+		return 0, 0, fmt.Errorf("client: bad probe port %q", port)
+	}
+	addr, err := protocol.ParseAddress(pu.Hostname(), pnum)
+	if err != nil {
+		return 0, 0, err
+	}
+	t0 := time.Now()
+	conn, err := a.DialTunnel(ctx, addr)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n\r\n", pu.RequestURI(), pu.Host); err != nil {
+		return 0, 0, err
+	}
+	br := bufio.NewReader(conn)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return 0, 0, err
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	ttfb = time.Since(t0)
+	bodyStart := time.Now()
+	var got int64
+	buf := make([]byte, 64*1024)
+	for got < n {
+		m := int64(len(buf))
+		if m > n-got {
+			m = n - got
+		}
+		k, err := io.ReadFull(br, buf[:m])
+		got += int64(k)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	return ttfb, float64(got) / time.Since(bodyStart).Seconds(), nil
+}
+
+// isShaped reports the shaper signature: healthy handshake, flat starved
+// transfer. Anything else (slow setup, errors) is a different problem.
+func isShaped(ttfb time.Duration, bps float64) bool {
+	return ttfb < 2*time.Second && bps > 0 && bps < shapedFloorBps
+}
+
+

@@ -273,6 +273,12 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 // github.com is filtered; empty means direct-only.
 func UpdateLoop(socksAddr string) {
 	for {
+		if ThinMode() {
+			// Shaped uplink: update payloads are bulk — stand down and
+			// retry later instead of fighting interactive traffic.
+			time.Sleep(15 * time.Minute)
+			continue
+		}
 		time.Sleep(30 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		rel, err := CheckUpdate(ctx, socksAddr)

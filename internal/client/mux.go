@@ -40,6 +40,7 @@ type MuxPool struct {
 	dialTimeout time.Duration
 	maxAge      time.Duration // per-session rotation age (tests shrink this)
 	softCap     int          // spill over to a new session past this many streams (tests shrink this)
+	suggestAge  time.Duration // self-tuned rotation age (0 = follow maxAge)
 	mu          sync.Mutex
 	sessions    []*muxEntry
 	next        int
@@ -55,8 +56,55 @@ type MuxPool struct {
 
 type muxEntry struct {
 	sess     *smux.Session
+	born     time.Time
 	retireAt time.Time
 	draining bool
+}
+
+// minRotationAge floors self-tuning: rotation never gets twitchier than this.
+const minRotationAge = 5 * time.Minute
+
+// effAge returns the rotation age in force: the configured maxAge possibly
+// reduced by self-tuning (never increased — quotas only ever cut sessions
+// short, so adaptation only ever shortens).
+func (p *MuxPool) effAge() time.Duration {
+	base := p.maxAge
+	if base <= 0 {
+		base = rotationAge
+	}
+	if p.suggestAge > 0 && p.suggestAge < base {
+		return p.suggestAge
+	}
+	return base
+}
+
+// noteDeath folds one session death into self-tuning. Premature deaths
+// (forced kills well under the effective age — TTL quotas, resets) shrink
+// rotation fast; healthy retirements grow it back toward configured, so the
+// pool converges instead of ratcheting. Callers hold p.mu.
+func (p *MuxPool) noteDeath(born time.Time) {
+	if born.IsZero() {
+		return
+	}
+	age := time.Since(born)
+	if age < p.effAge()-time.Minute {
+		if s := age - time.Minute; s > minRotationAge {
+			p.suggestAge = s
+		} else {
+			p.suggestAge = minRotationAge
+		}
+		return
+	}
+	if p.suggestAge > 0 {
+		base := p.maxAge
+		if base <= 0 {
+			base = rotationAge
+		}
+		p.suggestAge += 5 * time.Minute
+		if p.suggestAge >= base {
+			p.suggestAge = 0 // back to configured
+		}
+	}
 }
 
 func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions int, dialTimeout time.Duration) *MuxPool {
@@ -86,11 +134,8 @@ func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
 		return nil, err
 	}
 	now := time.Now()
-	maxAge := rotationAge
 	p.mu.Lock()
-	if p.maxAge > 0 {
-		maxAge = p.maxAge
-	}
+	maxAge := p.effAge()
 	p.mu.Unlock()
 	var extra time.Duration
 	if maxAge > 0 {
@@ -98,6 +143,7 @@ func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
 	}
 	return &muxEntry{
 		sess: sess,
+		born: now,
 		// Slack defeats metronomic rotation: sessions retire
 		// unpredictably inside the window, never on a schedule.
 		retireAt: now.Add(maxAge).Add(extra),
@@ -116,6 +162,7 @@ func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
 		}
 		if e.draining {
 			if e.sess.NumStreams() == 0 || now.After(e.retireAt.Add(maxDrain)) {
+				p.noteDeath(e.born)
 				dead = append(dead, e)
 				continue
 			}
@@ -233,6 +280,7 @@ func (p *MuxPool) drop(e *muxEntry) {
 	for i, x := range p.sessions {
 		if x == e {
 			p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
+			p.noteDeath(e.born)
 			break
 		}
 	}

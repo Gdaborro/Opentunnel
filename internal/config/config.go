@@ -38,6 +38,8 @@ type Server struct {
 
 type ClientConf struct {
 	ServerAddr  string   `toml:"server_addr"` // host[:port]
+	ServerIP    string   `toml:"server_ip"`   // optional literal IP to dial (SNI stays server_addr host; defeats DNS sinkholing)
+	ServerFallbacks []string `toml:"server_fallbacks"` // extra entry host[:port]s, rotated when an entry fails
 	Token       string   `toml:"token"`
 	Fingerprint string   `toml:"fingerprint"` // SHA-256 hex pin of server cert (wstls only)
 	Insecure    bool     `toml:"insecure"`    // dev only
@@ -106,6 +108,39 @@ func (c *ClientConf) UDPEnabled() bool { return c.UDP == nil || *c.UDP }
 
 // AutoUpdateEnabled reports the effective auto-update setting (default true).
 func (c *ClientConf) AutoUpdateEnabled() bool { return c.AutoUpdate == nil || *c.AutoUpdate }
+
+// entryHostPort splits server_addr into host and port (default 443).
+func (c *ClientConf) entryHostPort() (string, string) {
+	if h, p, err := net.SplitHostPort(c.ServerAddr); err == nil {
+		return h, p
+	}
+	return c.ServerAddr, "443"
+}
+
+// DialHostPort is the address to open TCP toward: the IP literal when
+// server_ip is set (DNS-independent), else server_addr as configured.
+func (c *ClientConf) DialHostPort() string {
+	if c.ServerIP != "" {
+		_, port := c.entryHostPort()
+		return net.JoinHostPort(c.ServerIP, port)
+	}
+	return c.ServerAddr
+}
+
+// SNIHost is the hostname presented as SNI (and pinned cert identity):
+// always the server_addr host, even when dialing an IP literal.
+func (c *ClientConf) SNIHost() string {
+	host, _ := c.entryHostPort()
+	return host
+}
+
+// SSHDialHost mirrors DialHostPort for the SSH tier (same IP literal).
+func (c *ClientConf) SSHDialHost() string {
+	if c.ServerIP != "" {
+		return c.ServerIP
+	}
+	return c.SSHHostOnly()
+}
 
 // AllowHostileSSH reports whether the SSH last-resort tier may engage on
 // TLS-intercepting networks (default true preserves connectivity; set false
@@ -183,6 +218,12 @@ key_file  = ""
 // no config file exists, so the client works as a standalone executable.
 const DefaultClientTOML = `# opentunnel client — default configuration (auto-generated on first run)
 server_addr = "cdn.aborro.dev:443"
+# server_ip: literal IP dialed instead of resolving server_addr (SNI and
+# cert pin stay on the hostname above). Set this to survive DNS sinkholing.
+# server_ip = ""
+# server_fallbacks: extra entry host[:port]s, rotated when an entry fails
+# or looks shaped. Needs a second IP/hostname to matter.
+# server_fallbacks = []
 fingerprint = "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"
 insecure = false
 ws_path = "/api/v1/stream"

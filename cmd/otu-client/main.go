@@ -366,13 +366,28 @@ func run() {
 		fmt.Printf("[i] otu-client %s (ban notice mode)\n", version.Version)
 	} else {
 		baseOpts := transport.WSTLSOptions{
-			ServerAddr:  cfg.ServerAddr,
+			ServerAddr:  cfg.DialHostPort(),
+			ServerName:  cfg.SNIHost(),
 			WSPath:      cfg.WSPath,
 			Fingerprint: cfg.Fingerprint,
 			Insecure:    cfg.Insecure,
 		}
 		dialer = client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
 		dialer.AllowHostileSSH = cfg.AllowHostileSSH()
+		// Rotatable entries: primary plus fallbacks (same cert assumed).
+		// IP literals already applied to the primary via DialHostPort.
+		entries := []transport.WSTLSOptions{baseOpts}
+		for _, fb := range cfg.ServerFallbacks {
+			fhost, fport := fb, "443"
+			if h, p, err := net.SplitHostPort(fb); err == nil {
+				fhost, fport = h, p
+			}
+			e := baseOpts
+			e.ServerAddr = net.JoinHostPort(fhost, fport)
+			e.ServerName = fhost
+			entries = append(entries, e)
+		}
+		dialer.SetEntries(entries)
 		dialer.Logger = log.Default()
 		// If the panel no longer knows our device token (purged after
 		// inactivity), re-register and wait for approval again.
@@ -392,7 +407,7 @@ func run() {
 			if key == "" {
 				log.Fatal("transport=ssh requires ssh_key in config")
 			}
-			sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
+			sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
 			dialer.UseTransportBuilder(func(profile string) transport.Transport {
 				return transport.NewSSH(transport.SSHOptions{
 					Host:        sshAddr,
@@ -424,8 +439,8 @@ func run() {
 					if user == "" {
 						user = "ubuntu"
 					}
-					sshAddr := net.JoinHostPort(cfg.SSHHostOnly(), cfg.SSHPortOrDefault())
-					pins := cfg.SSHHostKeyPins()
+				sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
+				pins := cfg.SSHHostKeyPins()
 					dialer.EnableSSHFallback(func() transport.Transport {
 						return transport.NewSSH(transport.SSHOptions{
 							Host:        sshAddr,
@@ -454,8 +469,26 @@ func run() {
 		}
 
 		fmt.Printf("[i] otu-client %s\n", version.Version)
+		// Shaping verdicts: rotate entries while each one looks capped
+		// (at most once per entry — a shaped uplink, not a bad entry, is
+		// the common cause), then sit in thin mode until a clean probe.
+		shapedStreak := 0
+		hr := client.NewHealthReporter(cfg, device, dialer.Probe)
+		hr.ThroughputProbe = dialer.ProbeThroughput
+		hr.OnShaped = func() {
+			shapedStreak++
+			fmt.Println("[!] Uplink looks shaped (fast handshake, flat throughput) — shedding bulk load.")
+			if shapedStreak <= dialer.EntryCount() {
+				dialer.RotateEntry("shaping")
+			}
+			client.SetThinMode(true)
+		}
+		hr.OnHealthy = func() {
+			shapedStreak = 0
+			client.SetThinMode(false)
+		}
 		safeGo("health", func() {
-			client.NewHealthReporter(cfg, device, dialer.Probe).Start(60 * time.Second)
+			hr.Start(60 * time.Second)
 		})
 		if cfg.AutoUpdateEnabled() {
 			safeGo("update", func() { client.UpdateLoop(cfg.SOCKSAddr) })

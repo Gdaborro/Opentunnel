@@ -108,3 +108,29 @@ func TestKeepaliveJittered(t *testing.T) {
 		}
 	}
 }
+
+func TestSelfTuningShrinksAndRecovers(t *testing.T) {
+	p := &MuxPool{}
+	// Premature death (2 min into a 25 min age): suggest the floor.
+	p.noteDeath(time.Now().Add(-2 * time.Minute))
+	p.mu.Lock()
+	sug := p.suggestAge
+	p.mu.Unlock()
+	if sug != minRotationAge {
+		t.Fatalf("premature death must floor rotation, got %v", sug)
+	}
+	p.mu.Lock()
+	eff := p.effAge()
+	p.mu.Unlock()
+	if eff != minRotationAge {
+		t.Fatalf("effective age must follow suggestion, got %v", eff)
+	}
+	// Healthy long death grows back toward configured.
+	p.noteDeath(time.Now().Add(-30 * time.Minute))
+	p.mu.Lock()
+	sug = p.suggestAge
+	p.mu.Unlock()
+	if sug != minRotationAge+5*time.Minute {
+		t.Fatalf("healthy death must grow suggestion, got %v", sug)
+	}
+}

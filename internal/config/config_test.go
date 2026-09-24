@@ -44,6 +44,38 @@ func TestAllowHostileSSHDefaultsOn(t *testing.T) {
 	}
 }
 
+func TestDialHostPortAndSNI(t *testing.T) {
+	c := &ClientConf{ServerAddr: "cdn.aborro.dev:443"}
+	if got := c.DialHostPort(); got != "cdn.aborro.dev:443" {
+		t.Fatalf("default dial=%q", got)
+	}
+	if got := c.SNIHost(); got != "cdn.aborro.dev" {
+		t.Fatalf("sni=%q", got)
+	}
+	c.ServerIP = "158.178.137.23"
+	if got := c.DialHostPort(); got != "158.178.137.23:443" {
+		t.Fatalf("IP literal dial=%q", got)
+	}
+	if got := c.SNIHost(); got != "cdn.aborro.dev" {
+		t.Fatalf("SNI must stay the hostname, got %q", got)
+	}
+	c.ServerAddr = "example.com" // no port -> 443 default
+	c.ServerIP = "9.9.9.9"
+	if got := c.DialHostPort(); got != "9.9.9.9:443" {
+		t.Fatalf("port default dial=%q", got)
+	}
+	c.SSHUser = "tun"
+	if got := c.SSHDialHost(); got != "9.9.9.9" {
+		t.Fatalf("ssh must follow the literal, got %q", got)
+	}
+	c.ServerIP = ""
+	c.ServerAddr = "cdn.aborro.dev:443"
+	c.SSHKey = "k"
+	if got := c.SSHDialHost(); got != "cdn.aborro.dev" {
+		t.Fatalf("ssh default host=%q", got)
+	}
+}
+
 func TestDefaultPathsAreBoring(t *testing.T) {
 	if strings.Contains(DefaultClientTOML, "ws_path = \"/ws\"") {
 		t.Fatal("default client config must not use the /ws path")
