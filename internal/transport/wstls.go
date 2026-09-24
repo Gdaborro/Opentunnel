@@ -26,7 +26,10 @@ const (
 // browserUA imitates a current Chrome on the plaintext upgrade request: the
 // stock Go client would otherwise announce "Go-http-client" and offer a
 // custom subprotocol — both machine-identifiable under interception.
-const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+// Version pinned to the uTLS parrot (HelloChrome_Auto == Chrome 133):
+// handshake and headers must tell the SAME version story. Recheck when
+// bumping github.com/refraction-networking/utls.
+const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
 // WSTLSOptions configures the ws-tls transport.
 type WSTLSOptions struct {
