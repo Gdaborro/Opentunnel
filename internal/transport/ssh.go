@@ -20,6 +20,8 @@ import (
 
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
+
+	"opentunnel/internal/protocol"
 )
 
 const DefaultSSHPort = "22"
@@ -46,7 +48,7 @@ func (t *sshTransport) Name() string { return "ssh" }
 
 func (o *SSHOptions) wsPathOrDefault() string {
 	if o.WSPath == "" {
-		return "/ws"
+		return protocol.DefaultWSPath
 	}
 	return o.WSPath
 }
@@ -93,7 +95,6 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 		return nil, fmt.Errorf("transport: forward channel: %w", err)
 	}
 
-	url := fmt.Sprintf("ws://%s%s", t.opt.InternalWS, t.opt.wsPathOrDefault())
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
@@ -103,10 +104,16 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 		},
 		Timeout: timeout,
 	}
-	wsConn, resp, err := websocket.Dial(dctx, url, &websocket.DialOptions{
-		HTTPClient:   httpClient,
-		Subprotocols: []string{"otu1"},
-	})
+	// Same legacy fallback as the outer tiers: a fresh config dials the
+	// boring path, which relays predating the migration don't mount (their
+	// mux answers the decoy 404 instead of 101).
+	dial := func(path string) (*websocket.Conn, *http.Response, error) {
+		return websocket.Dial(dctx, fmt.Sprintf("ws://%s%s", t.opt.InternalWS, path), &websocket.DialOptions{
+			HTTPClient:   httpClient,
+			Subprotocols: []string{"otu1"},
+		})
+	}
+	wsConn, resp, err := dialWSWithLegacyFallback(dial, t.opt.wsPathOrDefault())
 	if err != nil {
 		if resp != nil {
 			// Surface body for diagnosis (decoy vs protocol error).

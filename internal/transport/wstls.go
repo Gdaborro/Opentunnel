@@ -104,7 +104,6 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	url := fmt.Sprintf("%s://%s%s", wsScheme, hostPort, t.opt.wsPathOrDefault())
 	httpClient := newPinnedHTTPClient(tlsCfg, timeout, t.opt.ChromeHello)
 
 	// No subprotocol and a browser-plausible User-Agent: under interception
@@ -117,12 +116,18 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 		"User-Agent":      {browserUA},
 		"Accept-Language": {"en-US,en;q=0.9"},
 	}
-	conn, _, err := websocket.Dial(dctx, url, &websocket.DialOptions{
-		HTTPClient: httpClient,
-		HTTPHeader: hdr,
-	})
+	url := func(path string) string {
+		return wsScheme + "://" + hostPort + path
+	}
+	dial := func(path string) (*websocket.Conn, *http.Response, error) {
+		return websocket.Dial(dctx, url(path), &websocket.DialOptions{
+			HTTPClient: httpClient,
+			HTTPHeader: hdr,
+		})
+	}
+	conn, _, err := dialWSWithLegacyFallback(dial, t.opt.wsPathOrDefault())
 	if err != nil {
-		return nil, fmt.Errorf("transport: websocket dial %s: %w", url, err)
+		return nil, fmt.Errorf("transport: websocket dial %s: %w", url(t.opt.wsPathOrDefault()), err)
 	}
 	// Note: the 101 response's body is managed by the websocket library.
 	stream := websocket.NetConn(ctx, conn, websocket.MessageBinary)
