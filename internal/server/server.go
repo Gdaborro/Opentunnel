@@ -109,12 +109,19 @@ func Handler(opt Options) http.Handler {
 		defer release()
 
 		if !isWebSocketUpgrade(r) {
-			http.NotFound(w, r)
+			// Not a tunnel after all: serve exactly what every other path
+			// serves. A Go-native "404 page not found" here would both
+			// fingerprint the server and mark the endpoint for active probers.
+			decoyHandler.ServeHTTP(w, r)
 			return
 		}
-		// Global kill switch: refuse new tunnels outright.
+		// Global kill switch: refuse new tunnels outright. Same front page as
+		// the rest of the site, 503 status only — no framework tell, no text
+		// naming what stopped.
 		if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
-			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write(decoy.IndexPage())
 			return
 		}
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{

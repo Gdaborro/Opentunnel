@@ -5,9 +5,45 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"opentunnel/internal/config"
+	"opentunnel/internal/transport"
+)
+
+// panelHTTP returns the process-wide pinned control-plane client and the
+// base URL for panel API calls. Status polls land on the same host as the
+// tunnel; a stock Go fingerprint there, beside Chrome-hello tunnel flows,
+// is a two-packet confession under TLS interception — so control traffic
+// rides the identical pin/parrot stack.
+func panelHTTP(cfg *config.ClientConf) (*http.Client, string, error) {
+	panelOnce.Do(func() {
+		cl, err := transport.NewPinnedHTTPClient(transport.PinnedHTTPOptions{
+			DialAddr:    cfg.DialHostPort(),
+			ServerName:  cfg.SNIHost(),
+			Fingerprint: cfg.Fingerprint,
+			Insecure:    cfg.Insecure,
+			Timeout:     20 * time.Second,
+			ChromeHello: true,
+		})
+		panelClientBuildErr = err
+		if err == nil {
+			panelClient = cl
+			panelBase = "https://" + cfg.SNIHost()
+		}
+	})
+	if panelClientBuildErr != nil {
+		return nil, "", panelClientBuildErr
+	}
+	return panelClient, panelBase, nil
+}
+
+var (
+	panelOnce           sync.Once
+	panelClient         *http.Client
+	panelBase           string
+	panelClientBuildErr error
 )
 
 func RegisterWithPanel(cfg *config.ClientConf, device *deviceFile) {
@@ -21,8 +57,10 @@ func RegisterWithPanel(cfg *config.ClientConf, device *deviceFile) {
 }
 
 func doRegister(cfg *config.ClientConf, device *deviceFile) error {
-	host := cfg.ServerAddr
-	panelURL := "https://" + host + "/api/token/request"
+	cl, base, err := panelHTTP(cfg)
+	if err != nil {
+		return err
+	}
 	// Include the device public key: bans bind to the key, not just the
 	// token, so a ban cannot be shed by re-registering on the same device.
 	pub := ""
@@ -32,7 +70,7 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 	body, _ := json.Marshal(map[string]string{
 		"token": device.Token, "fingerprint": device.Fingerprint, "device_name": device.DeviceName, "ssh_pubkey": pub,
 	})
-	resp, err := http.Post(panelURL, "application/json", bytes.NewReader(body))
+	resp, err := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -120,9 +158,23 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 }
 
 func checkTokenStatus(cfg *config.ClientConf, token string) (status, kickReason, banReason, kickExpires string, err error) {
-	host := cfg.ServerAddr
-	panelURL := "https://" + host
-	resp, err := http.Get(panelURL + "/api/token/status?token=" + token)
+	cl, base, perr := panelHTTP(cfg)
+	if perr != nil {
+		return "", "", "", "", perr
+	}
+	var resp *http.Response
+	// v0.9.22+: the token moved out of the URL — TLS-intercepting middleboxes
+	// decrypt and log the query line, which is where the credential used to
+	// ride. POST body first.
+	payload, _ := json.Marshal(map[string]string{"token": token})
+	resp, err = cl.Post(base+"/api/token/status", "application/json", bytes.NewReader(payload))
+	if err == nil && resp.StatusCode != http.StatusOK {
+		// Panels predating v0.9.22 answer every POST "not found" (they read
+		// the token from the query only). Legacy-GET fallback; the query form
+		// survives there until the server is updated.
+		_ = resp.Body.Close()
+		resp, err = cl.Get(base + "/api/token/status?token=" + token)
+	}
 	if err != nil {
 		return "", "", "", "", err
 	}

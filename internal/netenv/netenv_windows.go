@@ -10,13 +10,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
-	"golang.org/x/sys/windows"
+	"opentunnel/internal/version"
 )
 
 const regKeyPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
@@ -49,13 +52,13 @@ var (
 	wininet               = windows.NewLazySystemDLL("wininet.dll")
 	procInternetSetOption = wininet.NewProc("InternetSetOptionW")
 
-	user32         = windows.NewLazySystemDLL("user32.dll")
+	user32                 = windows.NewLazySystemDLL("user32.dll")
 	procSendMessageTimeout = user32.NewProc("SendMessageTimeoutW")
 )
 
 const (
-	wmSettingChange = 0x001A
-	hwndBroadcast   = 0xFFFF
+	wmSettingChange  = 0x001A
+	hwndBroadcast    = 0xFFFF
 	smwtoAbortIfHung = 0x0002
 )
 
@@ -95,11 +98,11 @@ type policySnap struct {
 }
 
 type snapshot struct {
-	ProxyEnable   uint32                 `json:"proxy_enable"`
-	ProxyServer   stringVal              `json:"proxy_server"`
-	ProxyOverride stringVal              `json:"proxy_override"`
-	AutoConfigURL stringVal              `json:"autoconfig_url"`
-	Policies      map[string]policySnap  `json:"policies,omitempty"`
+	ProxyEnable   uint32                `json:"proxy_enable"`
+	ProxyServer   stringVal             `json:"proxy_server"`
+	ProxyOverride stringVal             `json:"proxy_override"`
+	AutoConfigURL stringVal             `json:"autoconfig_url"`
+	Policies      map[string]policySnap `json:"policies,omitempty"`
 }
 
 // Manager owns the journal directory (%LOCALAPPDATA%\opentunnel).
@@ -110,7 +113,7 @@ func NewManager() (*Manager, error) {
 	if base == "" {
 		return nil, errors.New("netenv: LOCALAPPDATA is not set")
 	}
-	dir := filepath.Join(base, "opentunnel")
+	dir := filepath.Join(base, version.ProductName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -170,7 +173,7 @@ func isOtuProcess(pid uint32) bool {
 		return false
 	}
 	image := strings.ToLower(windows.UTF16ToString(buf[:size]))
-	return strings.Contains(image, "otu-client")
+	return strings.Contains(image, version.ProcessID)
 }
 
 // Begin snapshots current proxy settings, journals them to disk, then applies
@@ -200,7 +203,43 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 	if err := os.WriteFile(m.lockPath(), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 		return fmt.Errorf("netenv: write lock: %w", err)
 	}
+	backupSnapshot(raw)
 	return m.apply(proxyAddr, bypass)
+}
+
+// backupSnapshot mirrors the journaled snapshot into settings-backup next
+// to the executable, with a generated restore helper: the folder the client
+// runs from always contains a restorable copy of the machine's pre-tunnel
+// proxy state. Best effort only — read-only install dirs silently skip.
+func backupSnapshot(raw []byte) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(filepath.Dir(exe), "settings-backup")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	name := filepath.Join(dir, "network-settings-"+time.Now().Format("20060102-150405")+".json")
+	if err := os.WriteFile(name, raw, 0o600); err != nil {
+		return
+	}
+	// Rolling window: keep the newest three, prune the rest.
+	entries, _ := filepath.Glob(filepath.Join(dir, "network-settings-*.json"))
+	sort.Strings(entries) // timestamped names sort chronologically
+	for len(entries) > 3 {
+		_ = os.Remove(entries[0])
+		entries = entries[1:]
+	}
+	// Restore helper, rewritten each time so it always points at the
+	// freshest backup; the executable sits one level above settings-backup.
+	// It stops a running client first so the exit-time restore cannot race.
+	bat := "@echo off\r\n" +
+		"taskkill /IM " + filepath.Base(exe) + " /F >nul 2>&1\r\n" +
+		"\"%~dp0..\\" + filepath.Base(exe) + "\" --restore-from \"" + name + "\"\r\n" +
+		"echo Network settings restored from backup.\r\n" +
+		"pause\r\n"
+	_ = os.WriteFile(filepath.Join(dir, "restore-network.bat"), []byte(bat), 0o755)
 }
 
 func readString(k registry.Key, name string) stringVal {
@@ -350,6 +389,29 @@ func (m *Manager) Restore() error {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return fmt.Errorf("netenv: corrupt snapshot: %w", err)
 	}
+	return m.applySnapshot(s)
+}
+
+// RestoreFrom restores the machine's proxy state from a backup file
+// (settings-backup next to the executable) — the recovery path when the
+// journal is gone or the state drifted. The journal is cleared too, so a
+// later start cannot re-apply stale state.
+func (m *Manager) RestoreFrom(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("netenv: read backup: %w", err)
+	}
+	var s snapshot
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return fmt.Errorf("netenv: corrupt backup: %w", err)
+	}
+	return m.applySnapshot(s)
+}
+
+// applySnapshot writes a (possibly cleaned) snapshot back to the registry,
+// notifies running apps, and clears any journal so a later start cannot
+// re-apply stale state.
+func (m *Manager) applySnapshot(s snapshot) error {
 	if looksLikeOtuState(s.ProxyServer, s.ProxyOverride, s.ProxyEnable) {
 		// The "original" we captured was itself otu's residue from an
 		// earlier crashed session: fall back to a clean no-proxy state.

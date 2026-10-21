@@ -37,28 +37,32 @@ type Server struct {
 }
 
 type ClientConf struct {
-	ServerAddr  string   `toml:"server_addr"` // host[:port]
-	ServerIP    string   `toml:"server_ip"`   // optional literal IP to dial (SNI stays server_addr host; defeats DNS sinkholing)
+	ServerAddr      string   `toml:"server_addr"`      // host[:port]
+	ServerIP        string   `toml:"server_ip"`        // optional literal IP to dial (SNI stays server_addr host; defeats DNS sinkholing)
 	ServerFallbacks []string `toml:"server_fallbacks"` // extra entry host[:port]s, rotated when an entry fails
-	Token       string   `toml:"token"`
-	Fingerprint string   `toml:"fingerprint"` // SHA-256 hex pin of server cert (wstls only)
-	Insecure    bool     `toml:"insecure"`    // dev only
-	WSPath      string   `toml:"ws_path"`
-	Transport   string   `toml:"transport"`     // wstls (default) | ssh
-	SSHUser     string   `toml:"ssh_user"`      // for transport="ssh"
-	SSHKey      string   `toml:"ssh_key"`       // path to private key
-	SSHPort     string   `toml:"ssh_port"`      // default "22"
-	SSHInternal string   `toml:"ssh_internal"`  // loopback ws target on VPS, e.g. 127.0.0.1:8081
-	SSHHostKeys string   `toml:"ssh_host_keys"` // comma-separated SHA256:<b64> host-key pins for the ssh tier
-	Profile     string   `toml:"profile"`       // auto | fast | balanced | stealth
-	FallbackSSH *bool    `toml:"fallback_ssh"`  // add ssh last-resort tier to the ladder
-	Mux         *bool    `toml:"mux"`           // default true: multiplexed sessions
-	UDP         *bool    `toml:"udp"`           // default true: SOCKS5 UDP ASSOCIATE
-	SOCKSAddr   string   `toml:"socks_addr"`    // default 127.0.0.1:1080
-	HTTPAddr    string   `toml:"http_addr"`     // default 127.0.0.1:8118
-	BypassList  []string `toml:"bypass_list"`   // extra ProxyOverride entries
-	AutoUpdate  *bool    `toml:"auto_update"`   // default true: self-update from GitHub Releases
-	HostileSSH  *bool    `toml:"hostile_ssh"`   // default true: allow the SSH last-resort tier on TLS-intercepting networks
+	Token           string   `toml:"token"`
+	Fingerprint     string   `toml:"fingerprint"` // SHA-256 hex pin of server cert (wstls only)
+	Insecure        bool     `toml:"insecure"`    // dev only
+	WSPath          string   `toml:"ws_path"`
+	Transport       string   `toml:"transport"`     // wstls (default) | ssh
+	SSHUser         string   `toml:"ssh_user"`      // for transport="ssh"
+	SSHKey          string   `toml:"ssh_key"`       // path to private key
+	SSHPort         string   `toml:"ssh_port"`      // default "22"
+	SSHInternal     string   `toml:"ssh_internal"`  // loopback ws target on VPS, e.g. 127.0.0.1:8081
+	SSHHostKeys     string   `toml:"ssh_host_keys"` // comma-separated SHA256:<b64> host-key pins for the ssh tier
+	// SSHClientVersion is the SSH banner the ssh tier announces. Empty
+	// matches the server's whitelisted OpenSSH family (transport default);
+	// "-" reverts to Go's stock banner.
+	SSHClientVersion string   `toml:"ssh_client_version"`
+	Profile          string   `toml:"profile"`      // auto | fast | balanced | stealth
+	FallbackSSH      *bool    `toml:"fallback_ssh"` // add ssh last-resort tier to the ladder
+	Mux              *bool    `toml:"mux"`          // default true: multiplexed sessions
+	UDP              *bool    `toml:"udp"`          // default true: SOCKS5 UDP ASSOCIATE
+	SOCKSAddr        string   `toml:"socks_addr"`   // default 127.0.0.1:1080
+	HTTPAddr         string   `toml:"http_addr"`    // default 127.0.0.1:8118
+	BypassList       []string `toml:"bypass_list"`  // extra ProxyOverride entries
+	AutoUpdate       *bool    `toml:"auto_update"`  // default true: self-update from GitHub Releases
+	HostileSSH       *bool    `toml:"hostile_ssh"`  // default true: allow the SSH last-resort tier on TLS-intercepting networks
 }
 
 // SSHHostKeyPins splits ssh_host_keys into individual pins.
@@ -241,9 +245,15 @@ ssh_user = "tun"
 ssh_key = "tun.key"
 ssh_internal = "127.0.0.1:8081"
 ssh_host_keys = "SHA256:msXZMQ8kGmiZF6bt75T3aWtL2ebPnWtZ6+X1vs69Jas,SHA256:og9K+1+YtASuye2jO06RN3V6TA/eK+/zIMF8GHcsLyQ,SHA256:tWpmC5YfGj9UJD9iDb/FlkeCO/m/2pB59vGRSKvTl5o"
+# SSH banner the ssh tier announces (default matches the server's OpenSSH
+# family per the firewall probe; "-" reverts to Go's stock banner).
+# ssh_client_version = "SSH-2.0-OpenSSH_9.6p1"
 socks_addr = "127.0.0.1:1080"
 http_addr = "127.0.0.1:18080"
-bypass_list = ["cdn.aborro.dev", "vpn.aborro.dev", "*.aborro.dev", "localhost", "127.0.0.1"]
+# Bypass list stays neutral — operator domains no longer ride the visible
+# WinINET ProxyOverride (loop protection is built into the client itself:
+# targets matching a configured entry dial direct instead of tunneling).
+bypass_list = []
 `
 
 // WriteDefaultClientConfig writes DefaultClientTOML to path (0600).
@@ -273,6 +283,9 @@ hostile_ssh = true
 ssh_user = "ubuntu"
 ssh_key = 'C:\path\to\ssh-key'
 ssh_internal = "127.0.0.1:8081"
+# SSH banner announced by the ssh tier (default = whitelisted OpenSSH family;
+# "-" reverts to Go's stock banner).
+# ssh_client_version = "SSH-2.0-OpenSSH_9.6p1"
 socks_addr = "127.0.0.1:1080"
 http_addr = "127.0.0.1:8118"
 bypass_list = ["*.internal.example.com"]

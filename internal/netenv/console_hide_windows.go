@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	user32dll          = windows.NewLazySystemDLL("user32.dll")
+	user32dll            = windows.NewLazySystemDLL("user32.dll")
 	procGetConsoleWindow = user32dll.NewProc("GetConsoleWindow")
 	procShowWindow       = user32dll.NewProc("ShowWindow")
 )

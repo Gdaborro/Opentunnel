@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 
 	"golang.org/x/crypto/ssh"
+
+	"opentunnel/internal/version"
 )
 
 // TokenStore handles the client's persistent token and hard ban markers.
@@ -29,7 +31,7 @@ func NewTokenStore() (*TokenStore, error) {
 	if base == "" {
 		base = os.TempDir()
 	}
-	dir := filepath.Join(base, "opentunnel")
+	dir := filepath.Join(base, version.ProductName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}

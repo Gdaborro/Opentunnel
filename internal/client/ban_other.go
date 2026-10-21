@@ -17,4 +17,4 @@ func deviceFingerprint() string {
 
 func isRegistryBanned() bool                   { return false }
 func writeRegistryBan(reason, duration string) {}
-func clearRegistryBan()                         {}
+func clearRegistryBan()                        {}

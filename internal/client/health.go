@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"log"
 	"math"
-	"net/http"
 	"runtime"
 	"sync"
 	"time"
@@ -173,8 +172,12 @@ func (h *HealthReporter) reportOnce() {
 	}
 
 	body, _ := json.Marshal(payload)
-	url := "https://" + h.cfg.ServerAddr + "/api/token/health"
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	cl, base, cerr := panelHTTP(h.cfg)
+	if cerr != nil {
+		log.Printf("health: control client: %v", cerr)
+		return
+	}
+	resp, err := cl.Post(base+"/api/token/health", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("health: report failed: %v", err)
 		return

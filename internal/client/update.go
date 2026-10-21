@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/net/proxy"
 
+	"opentunnel/internal/transport"
 	"opentunnel/internal/version"
 )
 
@@ -53,7 +54,7 @@ func LatestRelease(ctx context.Context, socksAddr string) (*Release, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "otu-client/"+version.Version)
+	req.Header.Set("User-Agent", transport.BrowserUA)
 	resp, err := updateClient(socksAddr).Do(req)
 	if err != nil {
 		return nil, err
@@ -206,7 +207,7 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "otu-client/"+version.Version)
+	req.Header.Set("User-Agent", transport.BrowserUA)
 	resp, err := updateClient(socksAddr).Do(req)
 	if err != nil {
 		return err

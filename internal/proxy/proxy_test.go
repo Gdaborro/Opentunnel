@@ -27,12 +27,12 @@ func TestLogThrottledSuppressesRepeats(t *testing.T) {
 func TestBlockPageUsesShadcnDarkStyling(t *testing.T) {
 	page := serveBlockPageHTML(nil, errors.New("blocked: test category"))
 	for _, want := range []string{
-		`class="dark"`,          // dark theme root
-		"--card:oklch(0.205",    // preset dark card token
-		"--destructive:oklch(",  // preset destructive token
-		"badge-outline",         // real badge variant
-		"otu",                   // otu branding, no legacy name
-		"<svg",                  // lucide shield icon, no emoji
+		`class="dark"`,         // dark theme root
+		"--card:oklch(0.205",   // preset dark card token
+		"--destructive:oklch(", // preset destructive token
+		"badge-outline",        // real badge variant
+		"otu",                  // otu branding, no legacy name
+		"<svg",                 // lucide shield icon, no emoji
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("block page missing %q", want)

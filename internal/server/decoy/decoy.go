@@ -13,6 +13,19 @@ import (
 //go:embed all:site
 var siteFS embed.FS
 
+// IndexPage returns the home-page body (used for kill-switch 503s so the
+// outage reads like any other).
+func IndexPage() []byte {
+	data, _ := siteFS.ReadFile("site/index.html")
+	return data
+}
+
+// NotFoundPage returns the catch-all 404 body.
+func NotFoundPage() []byte {
+	data, _ := siteFS.ReadFile("site/404.html")
+	return data
+}
+
 // pages maps clean URLs to embedded files.
 var pages = map[string]string{
 	"/":         "site/index.html",

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 )
+
 func TestIsNewer(t *testing.T) {
 	cases := []struct {
 		current, remote string

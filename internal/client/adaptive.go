@@ -1,4 +1,4 @@
-﻿package client
+package client
 
 import (
 	"bufio"
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/url"
 	"strconv"
@@ -387,6 +388,7 @@ func isDNSError(err error) bool {
 	}
 	return strings.Contains(err.Error(), "no such host")
 }
+
 // Reset drops the client back to the fastest tier immediately: slow-start
 // probing, failure streaks and the re-probe cool-off are cleared. Used when
 // the panel reports approval â€” recovery must not wait out a 10-minute
@@ -464,10 +466,20 @@ func (a *Adaptive) OpenUDPRelay(ctx context.Context) (net.Conn, error) {
 // Throughput probe defaults: a small sample from a stock speedtest file.
 // 2 MB is enough to separate shaper-flat throughput from bursty congestion
 // while costing ~70 Kbps averaged over a 4-minute cadence.
-const (
-	DefaultProbeURL         = "https://proof.ovh.net/files/100Mb.dat"
-	DefaultProbeSampleBytes = 2 << 20
-)
+//
+// DefaultProbeURLs: public bulk-download endpoints, one picked per probe so
+// no single host sees a metronomic 2 MB pull every four minutes. All serve
+// large files and honor Range requests.
+var DefaultProbeURLs = []string{
+	"https://proof.ovh.net/files/100Mb.dat",
+	"https://speed.cloudflare.com/__down?bytes=104857600",
+	"https://speedtest.tele2.net/100MB.zip",
+}
+
+// DefaultProbeURL mirrors the first pool entry (kept for compatibility).
+const DefaultProbeURL = "https://proof.ovh.net/files/100Mb.dat"
+
+const DefaultProbeSampleBytes = 2 << 20
 
 // shapedFloorBps: sustained goodput under ~768 Kbps with a healthy handshake
 // reads as shaper-capped, not congested (congestion jitters and recovers;
@@ -481,7 +493,7 @@ const shapedFloorBps = 96 << 10
 func (a *Adaptive) ProbeThroughput(ctx context.Context) (ttfb time.Duration, bps float64, err error) {
 	u := a.ProbeURL
 	if u == "" {
-		u = DefaultProbeURL
+		u = DefaultProbeURLs[rand.Intn(len(DefaultProbeURLs))]
 	}
 	n := a.ProbeSampleBytes
 	if n <= 0 {
@@ -512,7 +524,7 @@ func (a *Adaptive) ProbeThroughput(ctx context.Context) (ttfb time.Duration, bps
 		return 0, 0, err
 	}
 	defer conn.Close()
-	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n\r\n", pu.RequestURI(), pu.Host); err != nil {
+	if _, err := io.WriteString(conn, probeRequest(pu.RequestURI(), pu.Host, n)); err != nil {
 		return 0, 0, err
 	}
 	br := bufio.NewReader(conn)
@@ -543,10 +555,23 @@ func (a *Adaptive) ProbeThroughput(ctx context.Context) (ttfb time.Duration, bps
 	return ttfb, float64(got) / time.Since(bodyStart).Seconds(), nil
 }
 
+// probeRequest builds the plain-HTTP request the throughput probe sends
+// through the tunnel. The User-Agent must match the tunnel's version story
+// (transport.BrowserUA — the old Chrome/126 string contradicted the
+// Chrome/133 hello on the same flow), and the Range header frames the fetch
+// as an ordinary resumable download.
+func probeRequest(uri, host string, sampleBytes int64) string {
+	return "GET " + uri + " HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Connection: close\r\n" +
+		"Range: bytes=0-" + strconv.FormatInt(sampleBytes-1, 10) + "\r\n" +
+		"User-Agent: " + transport.BrowserUA + "\r\n" +
+		"Accept-Language: en-US,en;q=0.9\r\n" +
+		"\r\n"
+}
+
 // isShaped reports the shaper signature: healthy handshake, flat starved
 // transfer. Anything else (slow setup, errors) is a different problem.
 func isShaped(ttfb time.Duration, bps float64) bool {
 	return ttfb < 2*time.Second && bps > 0 && bps < shapedFloorBps
 }
-
-

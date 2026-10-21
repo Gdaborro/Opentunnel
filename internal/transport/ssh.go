@@ -26,6 +26,12 @@ import (
 
 const DefaultSSHPort = "22"
 
+// DefaultSSHClientVersion: middleboxes whitelist by banner and the relay
+// runs real OpenSSH (probe docs record a clean OpenSSH_9.6p1 heading the
+// whitelist). Go's stock banner ("SSH-2.0-Go") is conspicuous next to one —
+// an all-day SSH session from a tool nobody ships. Override empty.
+const DefaultSSHClientVersion = "SSH-2.0-OpenSSH_9.6p1"
+
 // SSHOptions configures the ssh transport.
 type SSHOptions struct {
 	Host        string // VPS address (port optional, default 22)
@@ -38,6 +44,10 @@ type SSHOptions struct {
 	// "SHA256:<base64>" fingerprints. Empty = accept any host key (NOT
 	// recommended: an active attacker could steal the tunnel token).
 	HostKeyPins []string
+	// ClientVersion is the SSH banner this client announces. Empty uses
+	// DefaultSSHClientVersion (the whitelisted OpenSSH family); "-" forces
+	// Go's stock banner.
+	ClientVersion string
 }
 
 type sshTransport struct{ opt SSHOptions }
@@ -78,11 +88,19 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 		hostPort = net.JoinHostPort(hostPort, DefaultSSHPort)
 	}
 
+	clientVersion := t.opt.ClientVersion
+	if clientVersion == "" {
+		clientVersion = DefaultSSHClientVersion
+	}
+	if clientVersion == "-" {
+		clientVersion = "" // let x/crypto announce its stock banner
+	}
 	cfg := &ssh.ClientConfig{
 		User:            t.opt.User,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: t.hostKeyCallback(),
 		Timeout:         timeout,
+		ClientVersion:   clientVersion,
 	}
 	client, err := ssh.Dial("tcp", hostPort, cfg)
 	if err != nil {

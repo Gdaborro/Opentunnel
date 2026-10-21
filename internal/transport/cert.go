@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"opentunnel/internal/version"
 )
 
 // LoadOrCreateCert returns a TLS certificate, generating and persisting a
@@ -26,7 +28,7 @@ func LoadOrCreateCert(certFile, keyFile, host string) (*tls.Certificate, string,
 		if state == "" {
 			state = os.TempDir()
 		}
-		dir := filepath.Join(state, "opentunnel")
+		dir := filepath.Join(state, version.ProductName)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, "", err
 		}

@@ -39,7 +39,7 @@ type MuxPool struct {
 	maxSessions int
 	dialTimeout time.Duration
 	maxAge      time.Duration // per-session rotation age (tests shrink this)
-	softCap     int          // spill over to a new session past this many streams (tests shrink this)
+	softCap     int           // spill over to a new session past this many streams (tests shrink this)
 	suggestAge  time.Duration // self-tuned rotation age (0 = follow maxAge)
 	mu          sync.Mutex
 	sessions    []*muxEntry
@@ -193,7 +193,9 @@ func (p *MuxPool) retire() {
 
 // sweep retires on a timer so even idle pools (keepalive-only flows, the
 // quietest long-lived signature) rotate. One goroutine per pool; pools live
-// as long as the process.
+// as long as the process. Phase and interval are randomized per pool: a
+// whole fleet sweeping on the same wall-clock cadence would itself be a
+// correlatable signature.
 func (p *MuxPool) sweep() {
 	p.mu.Lock()
 	if p.sweeper {
@@ -203,9 +205,9 @@ func (p *MuxPool) sweep() {
 	p.sweeper = true
 	p.mu.Unlock()
 	go func() {
-		t := time.NewTicker(sweepEvery)
-		defer t.Stop()
-		for range t.C {
+		time.Sleep(time.Duration(rand.Int63n(int64(sweepEvery))))
+		for {
+			time.Sleep(sweepEvery + time.Duration(rand.Int63n(int64(time.Minute))))
 			p.retire()
 		}
 	}()
@@ -227,6 +229,7 @@ func overCap(e *muxEntry, cap int) bool {
 	}
 	return e.sess.NumStreams() >= cap
 }
+
 // pick returns the next healthy entry round-robin, pruning dead sessions.
 // Draining (retired) sessions stay listed until empty but take no new
 // streams; retire() runs first so expiry is enforced on activity too.

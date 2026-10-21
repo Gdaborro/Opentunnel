@@ -20,7 +20,7 @@ type Handler struct {
 	autoApprove bool
 	geo         *GeoIP // optional; nil = no country resolution
 
-	rlMu sync.Mutex
+	rlMu  sync.Mutex
 	rlMap map[string]*regLimit // per-IP registration rate limit
 
 	// OnApprove installs a device's SSH public key into the ssh tier's
@@ -451,7 +451,7 @@ func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		KillSwitch   *bool `json:"kill_switch"`
+		KillSwitch    *bool `json:"kill_switch"`
 		AutoAcceptMin *int  `json:"auto_accept_minutes"` // >0 open for N minutes; 0 close now
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || (req.KillSwitch == nil && req.AutoAcceptMin == nil) {
@@ -573,7 +573,19 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenStatus(w http.ResponseWriter, r *http.Request) {
+	// Token rides the query (legacy GET clients) or the JSON body (v0.9.22+
+	// POST). The body form exists so the credential never appears in an
+	// interceptable URL line.
 	token := r.URL.Query().Get("token")
+	if token == "" {
+		var req struct {
+			Token string `json:"token"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<12)
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			token = req.Token
+		}
+	}
 	var status, kickReason, banReason, kickExpires string
 	err := h.db.QueryRow(`SELECT status, COALESCE(kick_reason,''), COALESCE(ban_reason,''), COALESCE(kick_expires,'') FROM peers WHERE token=?`, token).
 		Scan(&status, &kickReason, &banReason, &kickExpires)
@@ -653,7 +665,7 @@ func (h *Handler) apiAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{
-		"alerts": h.db.Alerts(60),
+		"alerts":  h.db.Alerts(60),
 		"unacked": h.db.UnackedAlertCount(),
 	})
 }

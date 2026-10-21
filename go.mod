@@ -11,6 +11,7 @@ require (
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/xtaci/smux v1.5.57
 	golang.org/x/crypto v0.55.0
+	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/time v0.15.0
 	modernc.org/sqlite v1.57.0
@@ -32,7 +33,6 @@ require (
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

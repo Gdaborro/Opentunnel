@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,7 +34,7 @@ func crashLogPath() string {
 	if base == "" {
 		base = os.TempDir()
 	}
-	return filepath.Join(base, "opentunnel", "crash.log")
+	return filepath.Join(base, version.ProductName, "crash.log")
 }
 
 // setupCrashLog mirrors log output to crash.log (best effort; never fatal).
@@ -71,7 +72,7 @@ func singleInstance(mgr *netenv.Manager, socksAddr, httpAddr string) bool {
 		if err := mgr.Recover(); err != nil {
 			// Journal + live lock holder = another instance is running.
 			fmt.Println("otu is already running in the background.")
-			fmt.Println("Nothing to do - this window closes. Use stop-otu.bat to stop it.")
+			fmt.Println("Nothing to do - this window closes. Use " + version.StopHelper + " to stop it.")
 			time.Sleep(3 * time.Second)
 			return true
 		}
@@ -86,7 +87,7 @@ func singleInstance(mgr *netenv.Manager, socksAddr, httpAddr string) bool {
 			// unrelated app would otherwise fake a conflict).
 			if netenv.PortHeldByOtu(addr) {
 				fmt.Println("otu is already running in the background.")
-				fmt.Println("Nothing to do - this window closes. Use stop-otu.bat to stop it.")
+				fmt.Println("Nothing to do - this window closes. Use " + version.StopHelper + " to stop it.")
 				time.Sleep(3 * time.Second)
 				return true
 			}
@@ -142,6 +143,7 @@ func run() {
 	genConfig := flag.Bool("gen-config", false, "write a template config and exit")
 	autoProxy := flag.Bool("auto-proxy", false, "configure the Windows user-level system proxy automatically (restored on exit)")
 	restoreOnly := flag.Bool("restore", false, "restore previously saved network settings and exit")
+	restoreFrom := flag.String("restore-from", "", "restore network settings from a backup file (settings-backup) and exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	shareLink := flag.Bool("share-link", false, "print an otu:// share link for this config and exit")
 	qrOut := flag.String("qr", "", "with -share-link: also write a PNG QR code to this path")
@@ -200,11 +202,12 @@ func run() {
 		// the client then runs its own --restore to put network settings
 		// back immediately (no admin needed).
 		if exe, eerr := os.Executable(); eerr == nil {
-			stop := filepath.Join(filepath.Dir(exe), "stop-otu.bat")
+			stop := filepath.Join(filepath.Dir(exe), version.StopHelper)
 			if _, serr := os.Stat(stop); os.IsNotExist(serr) {
+				image := filepath.Base(exe)
 				bat := "@echo off\r\n" +
-					"taskkill /IM otu-client.exe /F >nul 2>&1\r\n" +
-					"\"%~dp0otu-client.exe\" --restore >nul 2>&1\r\n" +
+					"taskkill /IM " + image + " /F >nul 2>&1\r\n" +
+					"\"%~dp0" + image + "\" --restore >nul 2>&1\r\n" +
 					"echo otu stopped - your normal connection is restored.\r\n" +
 					"pause\r\n"
 				_ = os.WriteFile(stop, []byte(bat), 0o755)
@@ -213,7 +216,7 @@ func run() {
 	}
 
 	mgr, mgrErr := netenv.NewManager()
-	if mgrErr != nil && (*autoProxy || *restoreOnly) {
+	if mgrErr != nil && (*autoProxy || *restoreOnly || *restoreFrom != "") {
 		log.Fatalf("settings manager: %v", mgrErr)
 	}
 
@@ -231,6 +234,14 @@ func run() {
 			log.Fatalf("restore: %v", err)
 		}
 		fmt.Println("network settings restored.")
+		return
+	}
+
+	if *restoreFrom != "" {
+		if err := mgr.RestoreFrom(*restoreFrom); err != nil {
+			log.Fatalf("restore-from: %v", err)
+		}
+		fmt.Println("network settings restored from backup.")
 		return
 	}
 
@@ -410,12 +421,13 @@ func run() {
 			sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
 			dialer.UseTransportBuilder(func(profile string) transport.Transport {
 				return transport.NewSSH(transport.SSHOptions{
-					Host:        sshAddr,
-					User:        user,
-					KeyFile:     key,
-					InternalWS:  internal,
-					WSPath:      cfg.WSPath,
-					HostKeyPins: cfg.SSHHostKeyPins(),
+					Host:          sshAddr,
+					User:          user,
+					KeyFile:       key,
+					InternalWS:    internal,
+					WSPath:        cfg.WSPath,
+					HostKeyPins:   cfg.SSHHostKeyPins(),
+					ClientVersion: cfg.SSHClientVersion,
 				})
 			})
 			fmt.Println("[i] transport: ssh (tunnel inside SSH; AEAD still end-to-end)")
@@ -439,16 +451,17 @@ func run() {
 					if user == "" {
 						user = "ubuntu"
 					}
-				sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
-				pins := cfg.SSHHostKeyPins()
+					sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
+					pins := cfg.SSHHostKeyPins()
 					dialer.EnableSSHFallback(func() transport.Transport {
 						return transport.NewSSH(transport.SSHOptions{
-							Host:        sshAddr,
-							User:        user,
-							KeyFile:     cfg.SSHKey,
-							InternalWS:  internal,
-							WSPath:      cfg.WSPath,
-							HostKeyPins: pins,
+							Host:          sshAddr,
+							User:          user,
+							KeyFile:       cfg.SSHKey,
+							InternalWS:    internal,
+							WSPath:        cfg.WSPath,
+							HostKeyPins:   pins,
+							ClientVersion: cfg.SSHClientVersion,
 						})
 					})
 					fmt.Println("[i] ssh fallback tier enabled (last resort)")
@@ -494,7 +507,21 @@ func run() {
 			safeGo("update", func() { client.UpdateLoop(cfg.SOCKSAddr) })
 			fmt.Println("[i] auto-update: watching GitHub releases")
 		}
-		serveDialer = &proxy.BanDialer{Inner: dialer, Gate: banGate}
+		// Loop guard: entry hosts dial direct instead of entering the tunnel
+		// (the old WinINET bypass entries leaked operator domains into the
+		// machine's visible proxy settings).
+		loopHosts := map[string]bool{strings.ToLower(cfg.SNIHost()): true}
+		for _, fb := range cfg.ServerFallbacks {
+			if h, _, err := net.SplitHostPort(fb); err == nil {
+				loopHosts[strings.ToLower(h)] = true
+			} else {
+				loopHosts[strings.ToLower(fb)] = true
+			}
+		}
+		if h := cfg.SSHHostOnly(); h != "" {
+			loopHosts[strings.ToLower(h)] = true
+		}
+		serveDialer = &proxy.BanDialer{Inner: &proxy.DirectDialer{Inner: dialer, Hosts: loopHosts}, Gate: banGate}
 	}
 
 	httpAddr := cfg.HTTPAddr
@@ -551,7 +578,7 @@ func run() {
 		fmt.Println("   2. First time only: the admin must approve this device,")
 		fmt.Println("      then pages load automatically (can take a minute).")
 		fmt.Println("   3. This window hides itself in a few seconds and otu keeps")
-		fmt.Println("      running in the background. To stop, run stop-otu.bat")
+		fmt.Println("      running in the background. To stop, run " + version.StopHelper)
 		fmt.Println("      (next to otu-client.exe). Settings restore automatically.")
 		fmt.Println("================================================================")
 		// Close-proof: hide the console once the banner has been read so an

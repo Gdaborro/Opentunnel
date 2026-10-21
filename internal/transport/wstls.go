@@ -31,6 +31,11 @@ const (
 // bumping github.com/refraction-networking/utls.
 const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
+// BrowserUA is the shared view of browserUA: every HTTPS request this binary
+// makes — tunnel, control plane and updates alike — tells the same
+// Chrome-version story (see pinnedhttp.go).
+const BrowserUA = browserUA
+
 // WSTLSOptions configures the ws-tls transport.
 type WSTLSOptions struct {
 	ServerAddr  string // host[:port]; port 443 added if missing
@@ -126,9 +131,15 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 	// the toolchain). Deliberately NO Origin header: websocket servers
 	// (including older relays) reject mismatched Origins with 403, which
 	// would brick new clients against old servers mid-migration.
+	// Client hints match the version story of the parroted hello: a Chrome
+	// 133 hello with fetched-metadata headers absent (WS upgrades don't send
+	// Sec-Fetch-*) would be a JPEG-artifact inconsistency under interception.
 	hdr := http.Header{
-		"User-Agent":      {browserUA},
-		"Accept-Language": {"en-US,en;q=0.9"},
+		"User-Agent":         {browserUA},
+		"Accept-Language":    {"en-US,en;q=0.9"},
+		"sec-ch-ua":          {`"Not(A:Brand";v="24", "Chromium";v="133", "Google Chrome";v="133"`},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {`"Windows"`},
 	}
 	url := func(path string) string {
 		return wsScheme + "://" + hostPort + path
@@ -179,61 +190,67 @@ func newPinnedHTTPClient(cfg *tls.Config, timeout time.Duration, chrome bool) *h
 				if err != nil {
 					return nil, err
 				}
-				if !chrome {
-					tconn := tls.Client(raw, cfg)
-					if err := tconn.HandshakeContext(ctx); err != nil {
-						_ = raw.Close()
-						return nil, err
-					}
-					return tconn, nil
-				}
-				// Chrome ships ALPN h2+http/1.1; we speak HTTP/1.1 WebSocket
-				// upgrades only, so pin the spec's ALPN to http/1.1.
-				// (Networks that classify hellos are defeated by the ssh
-				// fallback tier, not by hello tricks.)
-				spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+				conn, err := tlsHandshake(ctx, raw, cfg, chrome)
 				if err != nil {
-					_ = raw.Close()
-					return nil, fmt.Errorf("transport: chrome spec: %w", err)
-				}
-				for _, ext := range spec.Extensions {
-					if alpn, ok := ext.(*utls.ALPNExtension); ok {
-						alpn.AlpnProtocols = []string{"http/1.1"}
-						break
-					}
-				}
-			ucfg := &utls.Config{
-				ServerName: cfg.ServerName,
-				// Pins govern trust; skip system roots exactly as in the
-				// non-uTLS path above.
-				InsecureSkipVerify:    true,
-				MinVersion:            tls.VersionTLS12,
-				VerifyPeerCertificate: cfg.VerifyPeerCertificate,
-				ClientSessionCache:    utlsCache,
-				// The static Chrome parrot carries no pre-shared-key slot,
-				// so there is nothing to resume into yet: skip instead of
-				// panicking (uTLS panics on cache-without-slot). Plain-TLS
-				// tiers resume normally; wiring PSK into the parrot spec is
-				// future work (see u_pre_shared_key.go Initializable).
-				PreferSkipResumptionOnNilExtension: true,
-			}
-				uconn := utls.UClient(raw, ucfg, utls.HelloCustom)
-				if err := uconn.ApplyPreset(&spec); err != nil {
-					_ = raw.Close()
-					return nil, fmt.Errorf("transport: apply chrome spec: %w", err)
-				}
-				if err := uconn.HandshakeContext(ctx); err != nil {
 					_ = raw.Close()
 					return nil, err
 				}
-				if proto := uconn.ConnectionState().NegotiatedProtocol; proto != "" && proto != "http/1.1" {
-					_ = raw.Close()
-					return nil, fmt.Errorf("transport: unexpected ALPN %q under Chrome hello", proto)
-				}
-				return uconn, nil
+				return conn, nil
 			},
 			ForceAttemptHTTP2: false,
 		},
 		Timeout: timeout,
 	}
+}
+
+// tlsHandshake upgrades raw with the pinned settings; chrome selects the uTLS
+// Chrome parrot over the stock Go handshake. WebSocket upgrades ride
+// HTTP/1.1, and a browser-plausible hello offering only h2 would tell a
+// different story than the headers that follow — so the spec's ALPN is pinned
+// to http/1.1. (Networks that classify hellos are defeated by the ssh
+// fallback tier, not by hello tricks.)
+func tlsHandshake(ctx context.Context, raw net.Conn, cfg *tls.Config, chrome bool) (net.Conn, error) {
+	if !chrome {
+		tconn := tls.Client(raw, cfg)
+		if err := tconn.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		return tconn, nil
+	}
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		return nil, fmt.Errorf("transport: chrome spec: %w", err)
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+			break
+		}
+	}
+	ucfg := &utls.Config{
+		ServerName: cfg.ServerName,
+		// Pins govern trust; skip system roots exactly as in the
+		// non-uTLS path above.
+		InsecureSkipVerify:    true,
+		MinVersion:            tls.VersionTLS12,
+		VerifyPeerCertificate: cfg.VerifyPeerCertificate,
+		ClientSessionCache:    utlsCache,
+		// The static Chrome parrot carries no pre-shared-key slot, so there
+		// is nothing to resume into yet: skip instead of panicking (uTLS
+		// panics on cache-without-slot). Plain-TLS tiers resume normally;
+		// wiring PSK into the parrot spec is future work (see
+		// u_pre_shared_key.go Initializable).
+		PreferSkipResumptionOnNilExtension: true,
+	}
+	uconn := utls.UClient(raw, ucfg, utls.HelloCustom)
+	if err := uconn.ApplyPreset(&spec); err != nil {
+		return nil, fmt.Errorf("transport: apply chrome spec: %w", err)
+	}
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	if proto := uconn.ConnectionState().NegotiatedProtocol; proto != "" && proto != "http/1.1" {
+		return nil, fmt.Errorf("transport: unexpected ALPN %q under Chrome hello", proto)
+	}
+	return uconn, nil
 }

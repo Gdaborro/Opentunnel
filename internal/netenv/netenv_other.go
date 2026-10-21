@@ -13,4 +13,5 @@ func (m *Manager) Recover() error   { return nil }
 func (m *Manager) Begin(addr string, bypass []string) error {
 	return errors.New("netenv: --auto-proxy is only supported on Windows")
 }
-func (m *Manager) Restore() error { return nil }
+func (m *Manager) Restore() error             { return nil }
+func (m *Manager) RestoreFrom(p string) error { return nil }
