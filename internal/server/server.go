@@ -59,7 +59,18 @@ type Options struct {
 		KillSwitch() bool
 		PeerLimits(token string) (maxBps, quotaBytes int64)
 		SetPeerIP(token, ip string)
+		// Control channel (v0.9.23): in-band status/health mirroring the
+		// panel's public token API for devices on TLS-intercepting networks.
+		RecordHealth(token, version, osName, arch string, cpuPct, memPct, tempC float64, uptimeS int64, latencyMs, jitterMs, probeLossPct float64)
+		BanReason(token string) string
+		TouchPeer(token string)
+		KnownPeer(token string) bool
 	}
+	// CurrentPin, when set, returns the relay's CURRENT leaf certificate
+	// fingerprint (hex). Every control response carries it so clients
+	// survive certificate rotation (LE renews ~every 60-90 days; a stale
+	// pin would otherwise brick every client at renewal).
+	CurrentPin func() string
 }
 
 func (o *Options) guard() *Guard {
@@ -474,6 +485,10 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 				serveUDPStream(s, o)
 				return
 			}
+			if atyp[0] == protocol.CtrlMarker {
+				serveCtrlStream(s, o)
+				return
+			}
 			relayTarget(atyp[0], s, o, token, peerStatus, peerReason)
 		}(stream)
 	}
@@ -483,6 +498,54 @@ var (
 	replayOnce    sync.Once
 	defaultReplay *protocol.ReplayCache
 )
+
+// serveCtrlStream answers one in-band control request (status poll or
+// health telemetry) on a mux stream. It exists because TLS-intercepting
+// networks make the pinned HTTPS control plane unreachable BY DESIGN —
+// inside the session the same data flows end-to-end encrypted, and the
+// panel keeps hearing from those devices.
+func serveCtrlStream(rw deadlineRW, opt Options) {
+	_ = rw.SetDeadline(time.Now().Add(20 * time.Second))
+	var req protocol.CtrlRequest
+	if err := protocol.ReadCtrlMessage(rw, &req); err != nil {
+		return
+	}
+	resp := protocol.CtrlResponse{}
+	if opt.CurrentPin != nil {
+		resp.Pin = opt.CurrentPin()
+	}
+	defer func() { _ = protocol.WriteCtrlMessage(rw, resp) }()
+	if opt.PanelDB == nil || req.Token == "" {
+		return
+	}
+	switch req.Op {
+	case "status":
+		if !opt.PanelDB.KnownPeer(req.Token) {
+			// Unknown/purged: the HTTPS contract answers 404, which the
+			// client decodes as "" and re-registers. Mirror that in-band
+			// so purged devices recover on every network.
+			resp.OK = true
+			resp.Status = ""
+			return
+		}
+		status, kickReason, kickExpires, err := opt.PanelDB.CheckToken(req.Token)
+		if err != nil {
+			return
+		}
+		resp.OK = true
+		resp.Status = status
+		resp.KickReason = kickReason
+		resp.KickExpires = kickExpires
+		resp.BanReason = opt.PanelDB.BanReason(req.Token)
+		opt.PanelDB.TouchPeer(req.Token)
+	case "health":
+		opt.PanelDB.RecordHealth(req.Token, req.Version, req.OS, req.Arch,
+			req.CPUPct, req.MemPct, req.TempC, req.UptimeS,
+			req.LatencyMs, req.JitterMs, req.ProbeLossPct)
+		opt.PanelDB.TouchPeer(req.Token)
+		resp.OK = true
+	}
+}
 
 // shortToken returns an 8-char log prefix without assuming token length
 // (tokens are client-chosen strings; slicing blindly could panic).

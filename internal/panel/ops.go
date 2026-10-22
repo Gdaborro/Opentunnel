@@ -24,6 +24,40 @@ type DeviceHealth struct {
 	At           string  `json:"at"`
 }
 
+// KnownPeer reports whether the panel has a row for the token. The
+// in-band control channel mirrors the HTTPS 404 contract with it: unknown
+// tokens must read as "" so purged devices re-register on every network.
+func (db *DB) KnownPeer(token string) bool {
+	if db == nil {
+		return false
+	}
+	var one int
+	db.QueryRow(`SELECT 1 FROM peers WHERE token=?`, token).Scan(&one)
+	return one == 1
+}
+
+// BanReason returns the admin's ban reason for a token ("" when the peer
+// is not banned or unknown). Feeds the in-band control channel so banned
+// devices see the same reason the HTTPS status endpoint reports.
+func (db *DB) BanReason(token string) string {
+	if db == nil {
+		return ""
+	}
+	var r string
+	db.QueryRow(`SELECT COALESCE(ban_reason,'') FROM peers WHERE token=?`, token).Scan(&r)
+	return r
+}
+
+// TouchPeer bumps last_seen (control-channel equivalent of a heartbeat:
+// the in-band status poll keeps the device "recent" in the panel exactly
+// like the HTTPS poll used to).
+func (db *DB) TouchPeer(token string) {
+	if db == nil {
+		return
+	}
+	db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, token)
+}
+
 // RecordHealth upserts a device telemetry sample.
 func (db *DB) RecordHealth(token, version, osName, arch string, cpuPct, memPct, tempC float64, uptimeS int64, latencyMs, jitterMs, probeLossPct float64) {
 	db.Exec(`INSERT INTO device_health(token,version,os,arch,cpu_pct,mem_pct,temp_c,uptime_s,latency_ms,jitter_ms,probe_loss_pct,at)

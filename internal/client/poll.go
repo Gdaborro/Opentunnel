@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"opentunnel/internal/config"
+	"opentunnel/internal/protocol"
 	"opentunnel/internal/transport"
 )
 
@@ -19,13 +21,18 @@ import (
 // rides the identical pin/parrot stack.
 func panelHTTP(cfg *config.ClientConf) (*http.Client, string, error) {
 	panelOnce.Do(func() {
+		// Rotation list: configured pins plus everything learned in-band,
+		// so the HTTPS fallback survives certificate renewal too.
+		fps := cfg.FingerprintSet()
+		fps = append(fps, LoadExtraPins()...)
 		cl, err := transport.NewPinnedHTTPClient(transport.PinnedHTTPOptions{
-			DialAddr:    cfg.DialHostPort(),
-			ServerName:  cfg.SNIHost(),
-			Fingerprint: cfg.Fingerprint,
-			Insecure:    cfg.Insecure,
-			Timeout:     20 * time.Second,
-			ChromeHello: true,
+			DialAddr:     cfg.DialHostPort(),
+			ServerName:   cfg.SNIHost(),
+			Fingerprint:  cfg.Fingerprint,
+			Fingerprints: fps,
+			Insecure:     cfg.Insecure,
+			Timeout:      20 * time.Second,
+			ChromeHello:  true,
 		})
 		panelClientBuildErr = err
 		if err == nil {
@@ -158,6 +165,18 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 }
 
 func checkTokenStatus(cfg *config.ClientConf, token string) (status, kickReason, banReason, kickExpires string, err error) {
+	// In-band first: on TLS-intercepting networks pinned HTTPS cannot
+	// connect by design, and the authenticated session is the covert
+	// path everywhere else too. Servers predating v0.9.23 close the
+	// stream, the exchange errors, and we fall through to HTTPS.
+	if fn := currentCtrl(); fn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), ctrlTimeout)
+		resp, cerr := fn(ctx, protocol.CtrlRequest{Op: "status", Token: token})
+		cancel()
+		if cerr == nil && resp != nil && resp.OK {
+			return resp.Status, resp.KickReason, resp.BanReason, resp.KickExpires, nil
+		}
+	}
 	cl, base, perr := panelHTTP(cfg)
 	if perr != nil {
 		return "", "", "", "", perr

@@ -16,6 +16,7 @@ import (
 	"github.com/shirou/gopsutil/v4/sensors"
 
 	"opentunnel/internal/config"
+	"opentunnel/internal/protocol"
 	"opentunnel/internal/version"
 )
 
@@ -133,19 +134,23 @@ func (h *HealthReporter) tunnelStats() (latencyMs, jitterMs, lossPct float64) {
 	return
 }
 
-func (h *HealthReporter) reportOnce() {
-	payload := map[string]any{
-		"token":   h.device.Token,
-		"version": version.Version,
-		"os":      runtime.GOOS,
-		"arch":    runtime.GOARCH,
-	}
+// healthSample is one collected telemetry reading; the in-band channel
+// and the pinned-HTTPS fallback send the same fields.
+type healthSample struct {
+	version, osName, arch string
+	cpuPct, memPct, tempC float64
+	uptimeS               int64
+	latencyMs, jitterMs   float64
+	lossPct               float64
+}
 
+func (h *HealthReporter) reportOnce() {
+	s := healthSample{version: version.Version, osName: runtime.GOOS, arch: runtime.GOARCH}
 	if pcts, err := cpu.Percent(time.Second, false); err == nil && len(pcts) > 0 {
-		payload["cpu_pct"] = math.Round(pcts[0]*10) / 10
+		s.cpuPct = math.Round(pcts[0]*10) / 10
 	}
 	if vm, err := mem.VirtualMemory(); err == nil {
-		payload["mem_pct"] = math.Round(vm.UsedPercent*10) / 10
+		s.memPct = math.Round(vm.UsedPercent*10) / 10
 	}
 	if temps, err := sensors.TemperaturesWithContext(context.Background()); err == nil {
 		var max float64
@@ -154,23 +159,51 @@ func (h *HealthReporter) reportOnce() {
 				max = t.Temperature
 			}
 		}
-		payload["temp_c"] = max
+		s.tempC = max
 	}
 	if up, err := host.Uptime(); err == nil {
-		payload["uptime_s"] = up
+		s.uptimeS = int64(up)
 	}
-
 	if h.probe != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		d, err := h.probe(ctx)
 		cancel()
 		h.recordProbe(d, err)
 		lat, jit, loss := h.tunnelStats()
-		payload["latency_ms"] = lat
-		payload["jitter_ms"] = math.Round(jit*10) / 10
-		payload["probe_loss_pct"] = math.Round(loss*10) / 10
+		s.latencyMs = lat
+		s.jitterMs = math.Round(jit*10) / 10
+		s.lossPct = math.Round(loss*10) / 10
 	}
 
+	// Tunnel first: the in-band channel keeps the panel informed on
+	// networks where pinned HTTPS cannot connect (TLS interception).
+	if fn := currentCtrl(); fn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), ctrlTimeout)
+		resp, err := fn(ctx, protocol.CtrlRequest{
+			Op: "health", Token: h.device.Token,
+			Version: s.version, OS: s.osName, Arch: s.arch,
+			CPUPct: s.cpuPct, MemPct: s.memPct, TempC: s.tempC, UptimeS: s.uptimeS,
+			LatencyMs: s.latencyMs, JitterMs: s.jitterMs, ProbeLossPct: s.lossPct,
+		})
+		cancel()
+		if err == nil && resp != nil && resp.OK {
+			return
+		}
+	}
+
+	payload := map[string]any{
+		"token":          h.device.Token,
+		"version":        s.version,
+		"os":             s.osName,
+		"arch":           s.arch,
+		"cpu_pct":        s.cpuPct,
+		"mem_pct":        s.memPct,
+		"temp_c":         s.tempC,
+		"uptime_s":       s.uptimeS,
+		"latency_ms":     s.latencyMs,
+		"jitter_ms":      s.jitterMs,
+		"probe_loss_pct": s.lossPct,
+	}
 	body, _ := json.Marshal(payload)
 	cl, base, cerr := panelHTTP(h.cfg)
 	if cerr != nil {

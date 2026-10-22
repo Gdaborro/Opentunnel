@@ -445,6 +445,56 @@ func (a *Adaptive) Current() string {
 	return a.tierName(a.idx)
 }
 
+// CtrlExchange runs one in-band control exchange on the current tier's
+// client (see control.go).
+func (a *Adaptive) CtrlExchange(ctx context.Context, req protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
+	a.mu.Lock()
+	idx := a.idx
+	a.mu.Unlock()
+	return a.build(idx).CtrlExchange(ctx, req)
+}
+
+// AddPin appends a rotation pin to the base config and every entry, then
+// drops the cached tier clients so new dials verify against it. Returns
+// true when anything changed.
+func (a *Adaptive) AddPin(fp string) bool {
+	fp = strings.TrimSpace(fp)
+	if fp == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed := false
+	if !pinKnown(a.base.Fingerprint, a.base.Fingerprints, fp) {
+		a.base.Fingerprints = append(a.base.Fingerprints, fp)
+		changed = true
+	}
+	for i := range a.entries {
+		e := &a.entries[i]
+		if !pinKnown(e.Fingerprint, e.Fingerprints, fp) {
+			e.Fingerprints = append(e.Fingerprints, fp)
+			changed = true
+		}
+	}
+	if changed {
+		a.clients = nil // rebuild transports with the extended pin set
+	}
+	return changed
+}
+
+// pinKnown reports whether fp is already accepted (primary or rotation set).
+func pinKnown(primary string, extra []string, fp string) bool {
+	if strings.EqualFold(strings.TrimSpace(primary), fp) {
+		return true
+	}
+	for _, p := range extra {
+		if strings.EqualFold(strings.TrimSpace(p), fp) {
+			return true
+		}
+	}
+	return false
+}
+
 // Probe measures tunnel setup latency on the current tier (transport dial +
 // handshake), then tears the connection down. Used for health telemetry.
 func (a *Adaptive) Probe(ctx context.Context) (time.Duration, error) {

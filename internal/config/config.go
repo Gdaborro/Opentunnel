@@ -42,14 +42,18 @@ type ClientConf struct {
 	ServerFallbacks []string `toml:"server_fallbacks"` // extra entry host[:port]s, rotated when an entry fails
 	Token           string   `toml:"token"`
 	Fingerprint     string   `toml:"fingerprint"` // SHA-256 hex pin of server cert (wstls only)
-	Insecure        bool     `toml:"insecure"`    // dev only
-	WSPath          string   `toml:"ws_path"`
-	Transport       string   `toml:"transport"`     // wstls (default) | ssh
-	SSHUser         string   `toml:"ssh_user"`      // for transport="ssh"
-	SSHKey          string   `toml:"ssh_key"`       // path to private key
-	SSHPort         string   `toml:"ssh_port"`      // default "22"
-	SSHInternal     string   `toml:"ssh_internal"`  // loopback ws target on VPS, e.g. 127.0.0.1:8081
-	SSHHostKeys     string   `toml:"ssh_host_keys"` // comma-separated SHA256:<b64> host-key pins for the ssh tier
+	// Fingerprints are additional accepted SHA-256 pins: the leaf changes
+	// at every Let's Encrypt renewal, and pins learned in-band from the
+	// relay rejoin here after restarts.
+	Fingerprints []string `toml:"fingerprints"`
+	Insecure     bool     `toml:"insecure"` // dev only
+	WSPath       string   `toml:"ws_path"`
+	Transport    string   `toml:"transport"`     // wstls (default) | ssh
+	SSHUser      string   `toml:"ssh_user"`      // for transport="ssh"
+	SSHKey       string   `toml:"ssh_key"`       // path to private key
+	SSHPort      string   `toml:"ssh_port"`      // default "22"
+	SSHInternal  string   `toml:"ssh_internal"`  // loopback ws target on VPS, e.g. 127.0.0.1:8081
+	SSHHostKeys  string   `toml:"ssh_host_keys"` // comma-separated SHA256:<b64> host-key pins for the ssh tier
 	// SSHClientVersion is the SSH banner the ssh tier announces. Empty
 	// matches the server's whitelisted OpenSSH family (transport default);
 	// "-" reverts to Go's stock banner.
@@ -71,6 +75,20 @@ func (c *ClientConf) SSHHostKeyPins() []string {
 	for _, p := range strings.Split(c.SSHHostKeys, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// FingerprintSet merges the primary fingerprint with the rotation list.
+func (c *ClientConf) FingerprintSet() []string {
+	out := make([]string, 0, 1+len(c.Fingerprints))
+	if fp := strings.TrimSpace(c.Fingerprint); fp != "" {
+		out = append(out, fp)
+	}
+	for _, fp := range c.Fingerprints {
+		if fp = strings.TrimSpace(fp); fp != "" {
+			out = append(out, fp)
 		}
 	}
 	return out
@@ -229,6 +247,10 @@ server_addr = "cdn.aborro.dev:443"
 # or looks shaped. Needs a second IP/hostname to matter.
 # server_fallbacks = []
 fingerprint = "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"
+# fingerprints: extra accepted pins for certificate rotation. The relay
+# announces its current pin in-band and clients learn it automatically;
+# this list is for pre-staging or manual pin updates.
+# fingerprints = []
 insecure = false
 ws_path = "/api/v1/stream"
 profile = "auto"

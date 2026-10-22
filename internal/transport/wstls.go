@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -42,9 +43,13 @@ type WSTLSOptions struct {
 	ServerName  string // optional SNI override; defaults to host part of ServerAddr
 	WSPath      string // defaults to DefaultWSPath
 	Fingerprint string // hex SHA-256 pin of the server certificate
-	Insecure    bool   // dev only: skip pin verification
-	DialTimeout time.Duration
-	ChromeHello bool // mimic Chrome's TLS ClientHello (uTLS)
+	// Fingerprints are additional accepted pins (rotation): the leaf
+	// changes at every Let's Encrypt renewal, and pins learned in-band
+	// from the relay rejoin here. Any listed pin verifies.
+	Fingerprints []string
+	Insecure     bool          // dev only: skip pin verification
+	DialTimeout  time.Duration // per-transport dial budget
+	ChromeHello  bool          // mimic Chrome's TLS ClientHello (uTLS)
 }
 
 type wsTLSTransport struct{ opt WSTLSOptions }
@@ -81,28 +86,67 @@ func (t *wsTLSTransport) tlsConfig(host string) (*tls.Config, error) {
 		cfg.ServerName = t.opt.ServerName
 	}
 	if !t.opt.Insecure {
-		pin, err := ParseFingerprint(t.opt.Fingerprint)
+		pins, err := t.opt.pinSet()
 		if err != nil {
 			return nil, err
 		}
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyPin(pin, rawCerts)
+			return VerifyPinSet(pins, rawCerts)
 		}
 	}
 	return cfg, nil
 }
 
-func verifyPin(pin []byte, rawCerts [][]byte) error {
+// pinSet parses every configured fingerprint (primary + rotation set)
+// into the accepted pin list. Fails closed: a non-insecure dial with no
+// usable pins refuses to talk rather than trusting an interceptor.
+func (o *WSTLSOptions) pinSet() ([][]byte, error) {
+	return buildPinSet(o.Fingerprint, o.Fingerprints)
+}
+
+func buildPinSet(primary string, extra []string) ([][]byte, error) {
+	var pins [][]byte
+	all := append([]string{primary}, extra...)
+	for _, fp := range all {
+		fp = strings.TrimSpace(fp)
+		if fp == "" {
+			continue
+		}
+		p, err := ParseFingerprint(fp)
+		if err != nil {
+			return nil, err
+		}
+		pins = append(pins, p)
+	}
+	if len(pins) == 0 {
+		return nil, errors.New("transport: no certificate pin configured (refusing unverified TLS)")
+	}
+	return pins, nil
+}
+
+// VerifyPinSet accepts the presented leaf when its SHA-256 matches ANY
+// configured pin (constant-shape comparison across the set).
+func VerifyPinSet(pins [][]byte, rawCerts [][]byte) error {
 	if len(rawCerts) == 0 {
 		return errors.New("transport: no certificates presented")
 	}
 	got := FingerprintCert(rawCerts[0])
-	for i := range pin {
-		if pin[i] != got[i] {
-			return errors.New("transport: server certificate fingerprint mismatch")
+	for _, pin := range pins {
+		if len(pin) != len(got) {
+			continue
+		}
+		match := true
+		for i := range pin {
+			if pin[i] != got[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return nil
 		}
 	}
-	return nil
+	return errors.New("transport: server certificate fingerprint mismatch")
 }
 
 func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {

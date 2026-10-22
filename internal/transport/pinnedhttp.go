@@ -20,9 +20,11 @@ type PinnedHTTPOptions struct {
 	DialAddr    string // TCP target host[:port]; port 443 added when missing
 	ServerName  string // TLS SNI + Host; defaults to the host part of DialAddr
 	Fingerprint string // hex SHA-256 pin of the server certificate
-	Insecure    bool   // dev only: skip pin verification entirely
-	Timeout     time.Duration
-	ChromeHello bool // mimic Chrome's ClientHello (uTLS)
+	// Fingerprints are additional accepted pins (rotation survivors).
+	Fingerprints []string
+	Insecure     bool // dev only: skip pin verification entirely
+	Timeout      time.Duration
+	ChromeHello  bool // mimic Chrome's ClientHello (uTLS)
 }
 
 // NewPinnedHTTPClient builds an http.Client that always dials DialAddr —
@@ -50,16 +52,16 @@ func NewPinnedHTTPClient(opt PinnedHTTPOptions) (*http.Client, error) {
 		ClientSessionCache: sessionCache,
 	}
 	if !opt.Insecure {
-		pin, err := ParseFingerprint(opt.Fingerprint)
-		if err != nil {
+		pins, perr := buildPinSet(opt.Fingerprint, opt.Fingerprints)
+		if perr != nil {
 			// Benign-looking half-configured pins must not degrade to
 			// unverified TLS: without a pin the caller gets a client that
 			// refuses to talk (error here), never one an interceptor can
 			// sit beneath.
-			return nil, fmt.Errorf("transport: pinned http client %s: %w", sni, err)
+			return nil, fmt.Errorf("transport: pinned http client %s: %w", sni, perr)
 		}
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyPin(pin, rawCerts)
+			return VerifyPinSet(pins, rawCerts)
 		}
 	}
 	d := &net.Dialer{Timeout: timeout}

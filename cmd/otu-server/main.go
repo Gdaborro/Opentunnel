@@ -6,6 +6,7 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -70,6 +72,12 @@ func main() {
 		log.Fatalf("certificate: %v", err)
 	}
 
+	// leafFP tracks the CURRENT leaf certificate fingerprint so the
+	// in-band control channel can announce it to clients: a fixed pin
+	// bricks every client at each Let's Encrypt renewal.
+	var leafFP atomic.Value // string (hex)
+	leafFP.Store(fingerprint)
+
 	var tlsCfg *tls.Config
 	var acmeDomains []string
 	if cfg.AcmeDomain != "" {
@@ -86,6 +94,17 @@ func main() {
 		}
 		tlsCfg = mgr.TLSConfig()
 		tlsCfg.MinVersion = tls.VersionTLS12
+		// Watch every served leaf: renewals swap the certificate under us
+		// and the control channel must always announce the live pin.
+		if inner := tlsCfg.GetCertificate; inner != nil {
+			tlsCfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				c, cerr := inner(hello)
+				if cerr == nil && c != nil && len(c.Certificate) > 0 {
+					leafFP.Store(hex.EncodeToString(transport.FingerprintCert(c.Certificate[0])))
+				}
+				return c, cerr
+			}
+		}
 		fingerprint = "(managed by Let's Encrypt — fetch with: openssl s_client -connect 127.0.0.1:443 -servername " +
 			acmeDomains[0] + " </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout)"
 		fmt.Printf("ACME enabled for %v\n", acmeDomains)
@@ -126,6 +145,7 @@ func main() {
 		WSPath:                 cfg.WSPath,
 		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
 		AllowLegacyMaster:      cfg.AllowLegacyMaster,
+		CurrentPin:             func() string { v, _ := leafFP.Load().(string); return v },
 	}
 	if panelDB != nil {
 		baseOpts.PanelDB = panelDB

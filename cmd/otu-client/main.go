@@ -20,6 +20,7 @@ import (
 	"opentunnel/internal/client"
 	"opentunnel/internal/config"
 	"opentunnel/internal/netenv"
+	"opentunnel/internal/protocol"
 	"opentunnel/internal/proxy"
 	"opentunnel/internal/share"
 	"opentunnel/internal/transport"
@@ -376,12 +377,17 @@ func run() {
 		serveDialer = &proxy.BanDialer{Gate: banGate}
 		fmt.Printf("[i] otu-client %s (ban notice mode)\n", version.Version)
 	} else {
+		// Pin set: configured primary + rotation list + pins learned
+		// in-band from the relay (survive LE renewals automatically).
+		fpSet := cfg.FingerprintSet()
+		fpSet = append(fpSet, client.LoadExtraPins()...)
 		baseOpts := transport.WSTLSOptions{
-			ServerAddr:  cfg.DialHostPort(),
-			ServerName:  cfg.SNIHost(),
-			WSPath:      cfg.WSPath,
-			Fingerprint: cfg.Fingerprint,
-			Insecure:    cfg.Insecure,
+			ServerAddr:   cfg.DialHostPort(),
+			ServerName:   cfg.SNIHost(),
+			WSPath:       cfg.WSPath,
+			Fingerprint:  cfg.Fingerprint,
+			Fingerprints: fpSet,
+			Insecure:     cfg.Insecure,
 		}
 		dialer = client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
 		dialer.AllowHostileSSH = cfg.AllowHostileSSH()
@@ -400,6 +406,33 @@ func run() {
 		}
 		dialer.SetEntries(entries)
 		dialer.Logger = log.Default()
+		// In-band control channel: status + health ride the authenticated
+		// session (the only path that works on TLS-intercepting networks),
+		// and every response carries the relay's current leaf pin so
+		// certificate rotation heals itself.
+		knownPins := map[string]bool{}
+		for _, fp := range fpSet {
+			knownPins[strings.ToLower(fp)] = true
+		}
+		learnPin := func(fp string) {
+			if fp = strings.ToLower(strings.TrimSpace(fp)); fp == "" || knownPins[fp] {
+				return
+			}
+			knownPins[fp] = true
+			client.SaveExtraPin(fp)
+			dialer.AddPin(fp)
+			fmt.Println("[+] relay certificate rotated — new pin learned automatically")
+		}
+		client.SetControlChannel(func(ctx context.Context, req protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
+			if dialer == nil {
+				return nil, fmt.Errorf("client: tunnel not ready")
+			}
+			resp, err := dialer.CtrlExchange(ctx, req)
+			if err == nil && resp != nil {
+				learnPin(resp.Pin)
+			}
+			return resp, err
+		})
 		// If the panel no longer knows our device token (purged after
 		// inactivity), re-register and wait for approval again.
 		dialer.OnAuthRejected = func() { client.RegisterWithPanel(cfg, device) }

@@ -44,6 +44,7 @@ func startPanelServer(t *testing.T) (addr, fp string, db *panel.DB) {
 			Token:                  "master-secret-not-in-exe",
 			PanelDB:                db,
 			AllowRestrictedTargets: true, // tests dial loopback targets
+			CurrentPin:             func() string { return certFP },
 		}),
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{*cert}},
 	}
