@@ -73,8 +73,21 @@ func main() {
 	}
 	ph := panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo)
 
+	// permitopen pins device-key forwarding to the relay's internal ws
+	// listener (the ssh tier's direct-tcpip target). Default matches the
+	// relay's listen_internal; custom deployments stay consistent.
+	permitTarget := "127.0.0.1:8081"
+	if cfg.ListenInternal != "" {
+		permitTarget = cfg.ListenInternal
+	}
+
 	// Approving a device also installs its SSH public key into the ssh
-	// tier's authorized_keys (same logic as the relay's hook).
+	// tier's authorized_keys (same logic as the relay's hook). Keys carry
+	// least-privilege options: no shell/exec/pty/agent/X11, forwarding
+	// ONLY to the internal ws listener the ssh tier dials. Without the
+	// options every device key is an unrestricted proxy through the VPS
+	// (SOCKS egress to anything, loopback panel/sshd reachable) — verified
+	// by pentest 2026-10-23.
 	ph.WithApproveHook(func(token string) {
 		pub := ph.SSHKeyPath(token)
 		if pub == "" {
@@ -94,7 +107,7 @@ func main() {
 		}
 		defer f.Close()
 		if !strings.Contains(readFileString(akPath), strings.TrimSpace(pub)) {
-			f.WriteString(strings.TrimSpace(pub) + "\n")
+			f.WriteString(`restrict,port-forwarding,permitopen="` + permitTarget + `" ` + strings.TrimSpace(pub) + "\n")
 		}
 	})
 

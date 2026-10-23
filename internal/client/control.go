@@ -10,7 +10,7 @@ import (
 	"context"
 	"errors"
 	"net"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"opentunnel/internal/protocol"
@@ -54,18 +54,24 @@ func (c *Client) CtrlExchange(ctx context.Context, req protocol.CtrlRequest) (*p
 	return &resp, nil
 }
 
-// ctrlChannel holds the installed in-band exchange (zero = HTTPS only).
-var ctrlChannel atomic.Value
+// ctrlFn holds the installed in-band exchange (nil = HTTPS only).
+var (
+	ctrlMu sync.Mutex
+	ctrlFn func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error)
+)
 
 // SetControlChannel installs the tunnel-riding control exchange consulted
 // by the status poll and health reporter before their pinned-HTTPS
-// fallbacks. nil-safe: without an installer every call falls back.
+// fallbacks. nil uninstalls (tests, shutdown).
 func SetControlChannel(fn func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error)) {
-	ctrlChannel.Store(fn)
+	ctrlMu.Lock()
+	ctrlFn = fn
+	ctrlMu.Unlock()
 }
 
 // currentCtrl returns the installed exchange or nil.
 func currentCtrl() func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
-	fn, _ := ctrlChannel.Load().(func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error))
-	return fn
+	ctrlMu.Lock()
+	defer ctrlMu.Unlock()
+	return ctrlFn
 }

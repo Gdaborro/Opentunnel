@@ -39,6 +39,11 @@ type HealthReporter struct {
 	probes    int
 	fails     int
 	reports   int // report cycles (drives the throughput cadence)
+
+	// lastFail throttles the report-failure log to transitions only: a
+	// pending device on an intercepting network (no tunnel, pinned HTTPS
+	// refused) would otherwise print the same failure every cycle.
+	lastFail bool
 }
 
 const probeWindow = 20 // rolling window size for loss/jitter
@@ -187,6 +192,10 @@ func (h *HealthReporter) reportOnce() {
 		})
 		cancel()
 		if err == nil && resp != nil && resp.OK {
+			if h.lastFail {
+				h.lastFail = false
+				log.Printf("health: reporting again (in-band)")
+			}
 			return
 		}
 	}
@@ -207,17 +216,30 @@ func (h *HealthReporter) reportOnce() {
 	body, _ := json.Marshal(payload)
 	cl, base, cerr := panelHTTP(h.cfg)
 	if cerr != nil {
-		log.Printf("health: control client: %v", cerr)
+		if !h.lastFail {
+			h.lastFail = true
+			log.Printf("health: control client: %v", cerr)
+		}
 		return
 	}
 	resp, err := cl.Post(base+"/api/token/health", "application/json", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("health: report failed: %v", err)
+		if !h.lastFail {
+			h.lastFail = true
+			log.Printf("health: report failed: %v", err)
+		}
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Printf("health: server returned %s", resp.Status)
+		if !h.lastFail {
+			h.lastFail = true
+			log.Printf("health: server returned %s", resp.Status)
+		}
 		return
+	}
+	if h.lastFail {
+		h.lastFail = false
+		log.Printf("health: reporting again")
 	}
 }
