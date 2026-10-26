@@ -2,7 +2,9 @@ package client
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -178,23 +180,33 @@ func socksDialContext(ctx context.Context, socksAddr, network, addr string) (net
 	}
 }
 
-// SelfUpdate downloads the release asset for this platform, verifies it,
-// swaps the running binary, and re-executes. Returns after spawning the
-// new process; the caller should exit.
+// SelfUpdate downloads the release asset for this platform, verifies it
+// (Ed25519 signature against the baked-in release key, then the sha256
+// line from the notes), swaps the running binary, and re-executes. The
+// signature is the trust anchor: release metadata, download URL and the
+// sha256 line all ride channels a middlebox can rewrite, but a forged
+// binary cannot produce a valid signature for the offline private key.
 func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	assetName := updateAssetWin
 	if runtime.GOOS != "windows" {
 		return errors.New("auto-update: unsupported platform " + runtime.GOOS)
 	}
-	var url string
+	var url, sigURL string
 	for _, a := range rel.Assets {
-		if a.Name == assetName {
+		switch a.Name {
+		case assetName:
 			url = a.URL
-			break
+		case assetName + ".sig":
+			sigURL = a.URL
 		}
 	}
 	if url == "" {
 		return fmt.Errorf("auto-update: release %s has no %s asset", rel.TagName, assetName)
+	}
+	if sigURL == "" {
+		// Unsigned releases are refused outright: an interceptor who can
+		// strip the signature can strip anything else in the feed.
+		return fmt.Errorf("auto-update: release %s is unsigned — refusing install", rel.TagName)
 	}
 
 	exe, err := os.Executable()
@@ -203,12 +215,38 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	}
 	tmp := exe + ".new"
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	fetch := func(u string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", transport.BrowserUA)
+		return updateClient(socksAddr).Do(req)
+	}
+
+	// Signature first: tiny, and refusing early avoids a wasted download.
+	sresp, err := fetch(sigURL)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", transport.BrowserUA)
-	resp, err := updateClient(socksAddr).Do(req)
+	sigRaw, err := io.ReadAll(io.LimitReader(sresp.Body, 4096))
+	sresp.Body.Close()
+	if err != nil {
+		return err
+	}
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sigRaw)))
+	if err != nil {
+		return fmt.Errorf("auto-update: bad signature encoding: %w", err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("auto-update: bad signature length %d", len(sig))
+	}
+	pub, err := base64.StdEncoding.DecodeString(ReleasePubKey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return errors.New("auto-update: embedded release key is corrupt")
+	}
+
+	resp, err := fetch(url)
 	if err != nil {
 		return err
 	}
@@ -216,26 +254,27 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("auto-update: download %s", resp.Status)
 	}
-	// Refuse absurd downloads even if a release asset were misconfigured:
-	// the client is ~11 MB, so 64 MB is a generous ceiling.
-	if resp.ContentLength > 64<<20 {
-		return fmt.Errorf("auto-update: asset too large (%d bytes)", resp.ContentLength)
-	}
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
 		return err
 	}
 	hasher := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(out, hasher), resp.Body); err != nil {
-		out.Close()
+	// Hard cap enforced DURING the copy: a chunked response (ContentLength
+	// -1) used to bypass the old header-only check. Anything beyond the
+	// ceiling aborts the install before the swap.
+	const maxAsset = 64 << 20
+	n, err := io.Copy(io.MultiWriter(out, hasher), io.LimitReader(resp.Body, maxAsset+1))
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		os.Remove(tmp)
 		return err
 	}
-	if err := out.Close(); err != nil {
+	if n > maxAsset {
 		os.Remove(tmp)
-		return err
+		return fmt.Errorf("auto-update: asset exceeds %d bytes — refusing", maxAsset)
 	}
-
 	if want := expectedSHA256(rel.Body); want != "" {
 		if got := hex.EncodeToString(hasher.Sum(nil)); got != want {
 			os.Remove(tmp)
@@ -244,6 +283,16 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	} else {
 		os.Remove(tmp)
 		return errors.New("auto-update: release notes missing sha256 — refusing install")
+	}
+	// The signature covers the downloaded file bytes.
+	fileData, err := os.ReadFile(tmp)
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pub), fileData, sig) {
+		os.Remove(tmp)
+		return errors.New("auto-update: release signature verification failed — refusing install")
 	}
 
 	// Windows allows renaming a running exe: current -> .old, new -> current.
@@ -264,7 +313,7 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("auto-update: re-exec failed (new binary in place): %w", err)
 	}
-	log.Printf("auto-update: updated to %s — restarting", rel.TagName)
+	log.Printf("auto-update: updated to %s (signature verified) — restarting", rel.TagName)
 	return nil
 }
 

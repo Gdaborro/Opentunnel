@@ -141,15 +141,16 @@ func main() {
 			}
 			tlsCfg = mgr.TLSConfig()
 			tlsCfg.MinVersion = tls.VersionTLS12
+			transport.RealisticTLS(tlsCfg)
 		} else {
 			cert, _, cerr := transport.LoadOrCreateCert(cfg.CertFile, cfg.KeyFile, cfg.Host)
 			if cerr != nil {
 				log.Fatalf("panel tls: %v", cerr)
 			}
-			tlsCfg = &tls.Config{
+			tlsCfg = transport.RealisticTLS(&tls.Config{
 				MinVersion:   tls.VersionTLS12,
 				Certificates: []tls.Certificate{*cert},
-			}
+			})
 		}
 		tlsSrv := &http.Server{
 			Addr:              *tlsListen,

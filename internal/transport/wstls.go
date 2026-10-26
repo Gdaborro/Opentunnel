@@ -175,15 +175,32 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 	// the toolchain). Deliberately NO Origin header: websocket servers
 	// (including older relays) reject mismatched Origins with 403, which
 	// would brick new clients against old servers mid-migration.
-	// Client hints match the version story of the parroted hello: a Chrome
-	// 133 hello with fetched-metadata headers absent (WS upgrades don't send
-	// Sec-Fetch-*) would be a JPEG-artifact inconsistency under interception.
+	// Client hints AND fetch metadata match the parroted hello. Browsers
+	// always send Origin and Sec-Fetch-{Dest,Mode,Site} on WebSocket
+	// handshakes (W3C Fetch Metadata) — an upgrade carrying browser-only
+	// client hints but none of those is a contradiction a consistency-
+	// checking DPI flags. The story told here: the site's own page (Origin
+	// = this host) opening its realtime channel, same-origin. With a
+	// server_ip override the origin keeps the SNI hostname (browsers never
+	// send IP-literal origins); otherwise it carries an explicit port
+	// exactly when browsers send one.
+	originHost := t.opt.ServerName
+	if originHost == "" {
+		originHost = hostPort
+		if strings.HasSuffix(originHost, ":443") {
+			originHost = strings.TrimSuffix(originHost, ":443")
+		}
+	}
 	hdr := http.Header{
 		"User-Agent":         {browserUA},
 		"Accept-Language":    {"en-US,en;q=0.9"},
 		"sec-ch-ua":          {`"Not(A:Brand";v="24", "Chromium";v="133", "Google Chrome";v="133"`},
 		"sec-ch-ua-mobile":   {"?0"},
 		"sec-ch-ua-platform": {`"Windows"`},
+		"origin":             {"https://" + originHost},
+		"sec-fetch-dest":     {"websocket"},
+		"sec-fetch-mode":     {"websocket"},
+		"sec-fetch-site":     {"same-origin"},
 	}
 	url := func(path string) string {
 		return wsScheme + "://" + hostPort + path

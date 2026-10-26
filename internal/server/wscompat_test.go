@@ -60,9 +60,10 @@ func (k killSwitchStub) PeerLimits(string) (int64, int64)   { return 0, 0 }
 func (k killSwitchStub) SetPeerIP(string, string)           {}
 func (k killSwitchStub) RecordHealth(string, string, string, string, float64, float64, float64, int64, float64, float64, float64) {
 }
-func (k killSwitchStub) BanReason(string) string { return "" }
-func (k killSwitchStub) TouchPeer(string)        {}
-func (k killSwitchStub) KnownPeer(string) bool   { return true }
+func (k killSwitchStub) BanReason(string) string    { return "" }
+func (k killSwitchStub) TouchPeer(string)           {}
+func (k killSwitchStub) KnownPeer(string) bool      { return true }
+func (k killSwitchStub) RecordVisit(string, string) {}
 
 // TestTunnelPathServesDecoyWithoutUpgrade: a plain GET on the tunnel path
 // must answer with the site's own 404 page — the Go-native "404 page not

@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -34,11 +35,19 @@ const (
 	sweepEvery  = 5 * time.Minute
 )
 
+// rotationBytesBase bounds a session's total transfer: no single flow
+// should carry gigabytes either — browsing sessions never do, and a
+// multi-GB SSH stream is a tunneling signature on its own. ~120-200 MB
+// reads as a large file copy (git/rsync/SFTP), the most ordinary heavy
+// SSH pattern there is. Randomized per session like the age window.
+const rotationBytesBase = 160 << 20
+
 type MuxPool struct {
 	factory     func(ctx context.Context) (net.Conn, error)
 	maxSessions int
 	dialTimeout time.Duration
 	maxAge      time.Duration // per-session rotation age (tests shrink this)
+	maxBytes    int64         // per-session rotation byte cap (0 = default; tests shrink this)
 	softCap     int           // spill over to a new session past this many streams (tests shrink this)
 	suggestAge  time.Duration // self-tuned rotation age (0 = follow maxAge)
 	mu          sync.Mutex
@@ -55,10 +64,12 @@ type MuxPool struct {
 }
 
 type muxEntry struct {
-	sess     *smux.Session
-	born     time.Time
-	retireAt time.Time
-	draining bool
+	sess        *smux.Session
+	born        time.Time
+	retireAt    time.Time
+	retireBytes int64
+	bytes       *atomic.Int64 // wire bytes crossing the underlying conn
+	draining    bool
 }
 
 // minRotationAge floors self-tuning: rotation never gets twitchier than this.
@@ -119,8 +130,28 @@ func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions
 		maxSessions: maxSessions,
 		dialTimeout: dialTimeout,
 		maxAge:      rotationAge,
+		maxBytes:    rotationBytesBase,
 		softCap:     softCapStreams,
 	}
+}
+
+// countingConn tallies wire bytes crossing the session's underlying
+// transport so byte-based rotation sees what the network sees.
+type countingConn struct {
+	net.Conn
+	n *atomic.Int64
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	k, err := c.Conn.Read(p)
+	c.n.Add(int64(k))
+	return k, err
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	k, err := c.Conn.Write(p)
+	c.n.Add(int64(k))
+	return k, err
 }
 
 func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
@@ -128,22 +159,33 @@ func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	sess, err := smux.Client(conn, muxConfig())
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
 	now := time.Now()
 	p.mu.Lock()
 	maxAge := p.effAge()
+	maxBytes := p.maxBytes
 	p.mu.Unlock()
 	var extra time.Duration
 	if maxAge > 0 {
 		extra = time.Duration(rand.Int63n(int64(maxAge) / 4))
 	}
+	if maxBytes <= 0 {
+		maxBytes = rotationBytesBase
+	}
+	// Slack defeats metronomic rotation: sessions retire unpredictably
+	// inside the window, never on a schedule — and byte caps drift so
+	// flow sizes never repeat exactly.
+	retireBytes := maxBytes + rand.Int63n(maxBytes/4)
+	counter := &atomic.Int64{}
+	sess, err := smux.Client(&countingConn{Conn: conn, n: counter}, muxConfig())
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
 	return &muxEntry{
-		sess: sess,
-		born: now,
+		sess:        sess,
+		born:        now,
+		bytes:       counter,
+		retireBytes: retireBytes,
 		// Slack defeats metronomic rotation: sessions retire
 		// unpredictably inside the window, never on a schedule.
 		retireAt: now.Add(maxAge).Add(extra),
@@ -169,7 +211,7 @@ func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
 			alive = append(alive, e)
 			continue
 		}
-		if now.After(e.retireAt) {
+		if now.After(e.retireAt) || (e.bytes != nil && e.bytes.Load() > e.retireBytes) {
 			e.draining = true
 		}
 		alive = append(alive, e)

@@ -58,6 +58,16 @@ func (db *DB) TouchPeer(token string) {
 	db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, token)
 }
 
+// RecordVisit upserts the (token, domain) visit counter for the
+// monitoring page. Domain only, never URLs.
+func (db *DB) RecordVisit(token, domain string) {
+	if db == nil || token == "" || domain == "" {
+		return
+	}
+	db.Exec(`INSERT INTO visits(token,domain,hits,last_seen) VALUES(?,?,1,datetime('now'))
+		ON CONFLICT(token,domain) DO UPDATE SET hits=hits+1, last_seen=datetime('now')`, token, domain)
+}
+
 // RecordHealth upserts a device telemetry sample.
 func (db *DB) RecordHealth(token, version, osName, arch string, cpuPct, memPct, tempC float64, uptimeS int64, latencyMs, jitterMs, probeLossPct float64) {
 	db.Exec(`INSERT INTO device_health(token,version,os,arch,cpu_pct,mem_pct,temp_c,uptime_s,latency_ms,jitter_ms,probe_loss_pct,at)

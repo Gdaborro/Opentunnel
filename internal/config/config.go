@@ -34,6 +34,17 @@ type Server struct {
 	// GeoIPDB is the path to an offline MaxMind country mmdb used by the
 	// panel map. Empty = no country resolution.
 	GeoIPDB string `toml:"geoip_db"`
+	// PinProbeHost: when set, the relay periodically dials this host's
+	// TLS endpoint (i.e. through the CDN front) to learn the certificate
+	// clients actually see, and announces it in-band so pin rotation (CDN
+	// edge certs, LE renewals) heals without operator action. Set it to
+	// the public tunnel hostname once the domain is CDN-fronted.
+	PinProbeHost string `toml:"pin_probe_host"`
+	// TrustCloudflareIPs: honor CF-Connecting-IP when the TCP peer is a
+	// Cloudflare edge IP, so per-IP guards, GeoIP and rate limits see the
+	// real client behind the CDN. Spoofed headers from non-CF peers are
+	// ignored.
+	TrustCloudflareIPs bool `toml:"trust_cf_ips"`
 }
 
 type ClientConf struct {
@@ -54,6 +65,13 @@ type ClientConf struct {
 	SSHPort      string   `toml:"ssh_port"`      // default "22"
 	SSHInternal  string   `toml:"ssh_internal"`  // loopback ws target on VPS, e.g. 127.0.0.1:8081
 	SSHHostKeys  string   `toml:"ssh_host_keys"` // comma-separated SHA256:<b64> host-key pins for the ssh tier
+	// SSHDialHostOverride is a direct hostname for the ssh tier to dial
+	// (empty = derive from server_addr). Needed once the tunnel domain is
+	// CDN-fronted — CDNs do not proxy port 22, so the ssh tier must dial a
+	// plain A record. A name like git.aborro.dev reads as ordinary
+	// developer traffic: bulk SSH to a git host is the most common heavy
+	// SSH pattern there is.
+	SSHDialHostOverride string `toml:"ssh_dial_host"`
 	// SSHClientVersion is the SSH banner the ssh tier announces. Empty
 	// matches the server's whitelisted OpenSSH family (transport default);
 	// "-" reverts to Go's stock banner.
@@ -156,8 +174,13 @@ func (c *ClientConf) SNIHost() string {
 	return host
 }
 
-// SSHDialHost mirrors DialHostPort for the SSH tier (same IP literal).
+// SSHDialHost returns the host the ssh tier dials: the dedicated override
+// first (CDN fronts do not proxy port 22), then the sinkhole-proof IP
+// literal, then the server_addr host.
 func (c *ClientConf) SSHDialHost() string {
+	if c.SSHDialHostOverride != "" {
+		return c.SSHDialHostOverride
+	}
 	if c.ServerIP != "" {
 		return c.ServerIP
 	}
@@ -267,6 +290,11 @@ ssh_user = "tun"
 ssh_key = "tun.key"
 ssh_internal = "127.0.0.1:8081"
 ssh_host_keys = "SHA256:msXZMQ8kGmiZF6bt75T3aWtL2ebPnWtZ6+X1vs69Jas,SHA256:og9K+1+YtASuye2jO06RN3V6TA/eK+/zIMF8GHcsLyQ,SHA256:tWpmC5YfGj9UJD9iDb/FlkeCO/m/2pB59vGRSKvTl5o"
+# Direct hostname the ssh tier dials (empty = derive from server_addr).
+# Once the tunnel domain is CDN-fronted (CDNs don't proxy port 22), point
+# this at a plain A record like git.aborro.dev — bulk SSH to a git host is
+# the most ordinary heavy-SSH pattern there is.
+# ssh_dial_host = "git.aborro.dev"
 # SSH banner the ssh tier announces (default matches the server's OpenSSH
 # family per the firewall probe; "-" reverts to Go's stock banner).
 # ssh_client_version = "SSH-2.0-OpenSSH_9.6p1"

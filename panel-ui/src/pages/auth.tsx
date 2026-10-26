@@ -152,11 +152,18 @@ export function AuthPage({
                 )}
               </FieldGroup>
             </form>
+            {/* On-origin panel art: an external stock-photo CDN used to
+                receive a request (admin IP + panel existence) on every
+                login page view. A pure-CSS gradient makes the same
+                visual shape with zero third-party traffic. */}
             <div className="relative hidden bg-muted md:block">
-              <img
-                src="https://images.unsplash.com/photo-1451187580459-43490279c0fa?q=80&w=2072&auto=format&fit=crop"
-                alt="Network operations"
-                className="absolute inset-0 h-full w-full object-cover dark:brightness-[0.25] dark:grayscale"
+              <div
+                aria-hidden="true"
+                className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,oklch(0.35_0.12_260)_0%,oklch(0.16_0.03_260)_55%,oklch(0.12_0.02_260)_100%)] dark:brightness-[0.7]"
+              />
+              <div
+                aria-hidden="true"
+                className="absolute inset-0 opacity-30 bg-[repeating-linear-gradient(115deg,transparent_0px,transparent_54px,oklch(0.9_0_0/0.05)_54px,oklch(0.9_0_0/0.05)_55px)]"
               />
             </div>
           </CardContent>

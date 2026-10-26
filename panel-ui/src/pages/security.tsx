@@ -286,7 +286,8 @@ export function Security() {
           </CardTitle>
           <CardDescription>
             Software versions across the network — outdated clients are flagged
-            for update (clients self-update from signed GitHub releases)
+            for update (clients self-update from Ed25519-signed GitHub
+            releases; the signature key is baked into every binary)
           </CardDescription>
         </CardHeader>
         <CardContent>

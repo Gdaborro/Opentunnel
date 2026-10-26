@@ -1,8 +1,12 @@
 package server
 
 import (
+	"context"
 	"io"
 	"net"
+	"sync/atomic"
+
+	"golang.org/x/time/rate"
 
 	"opentunnel/internal/protocol"
 )
@@ -15,8 +19,34 @@ import (
 //	server → client: [u16][ATYP addr port][payload]  (source)
 //
 // Destinations pass the same SSRF filter and blocklist as TCP targets.
-func serveUDPStream(rw io.ReadWriteCloser, opt Options) {
+// Identity rules apply identically to the TCP relay (pentest 2026-10-25):
+// banned/kicked devices get nothing, bytes are accounted per device, and
+// per-device bandwidth caps pace datagram writes.
+func serveUDPStream(rw io.ReadWriteCloser, opt Options, token, peerStatus string) {
 	defer rw.Close()
+
+	switch peerStatus {
+	case "banned", "kicked", "kicked-silent":
+		// Identity enforcement used to stop at the TCP relay: UDP streams
+		// kept flowing for banned/kicked devices with zero accounting.
+		return
+	}
+
+	// Per-device cap: datagrams used to leave unmeasured; the same token
+	// bucket that paces TCP streams now paces datagram writes.
+	var lim *rate.Limiter
+	if opt.PanelDB != nil && token != "" {
+		if maxBps, _ := opt.PanelDB.PeerLimits(token); maxBps > 0 {
+			lim = rate.NewLimiter(rate.Limit(maxBps), int(maxBps))
+		}
+	}
+
+	var up, down atomic.Int64
+	if opt.PanelDB != nil && token != "" {
+		defer func() {
+			opt.PanelDB.RecordTraffic(token, up.Load(), down.Load())
+		}()
+	}
 
 	pc, err := net.ListenPacket("udp", "")
 	if err != nil {
@@ -33,6 +63,7 @@ func serveUDPStream(rw io.ReadWriteCloser, opt Options) {
 			if err != nil {
 				return
 			}
+			down.Add(int64(n))
 			src := udpAddrToAddress(from)
 			if src == nil {
 				continue
@@ -70,7 +101,14 @@ func serveUDPStream(rw io.ReadWriteCloser, opt Options) {
 		if !opt.AllowRestrictedTargets && isRestrictedIP(raddr.IP) {
 			continue
 		}
-		if _, err := pc.WriteTo(payload, raddr); err != nil {
+		if lim != nil {
+			if werr := lim.WaitN(context.Background(), len(payload)); werr != nil {
+				continue
+			}
+		}
+		n, err := pc.WriteTo(payload, raddr)
+		up.Add(int64(n))
+		if err != nil {
 			if _, ok := err.(net.Error); !ok {
 				return
 			}

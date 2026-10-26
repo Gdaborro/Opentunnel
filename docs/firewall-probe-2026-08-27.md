@@ -1,17 +1,17 @@
-# Firewall Probe — St Edwards College (2026-08-27)
+# Firewall Probe — the monitored network (2026-08-27)
 
-**Target VPS:** `158.178.137.23` (Oracle Cloud, `vpn.aborro.dev` via Let's Encrypt)
+**Target VPS:** `203.0.113.10` (Oracle Cloud, `vpn.aborro.dev` via Let's Encrypt)
 
 ## What was tested from the firewalled network
 
 | Test | Result | Meaning |
 |---|---|---|
 | **TCP 22** (SSH) | **OPEN** — clean SSH banner `OpenSSH_9.6p1`, SSH handshake succeeds | Whitelisted, not MITM'd |
-| **TCP 443, 8443** (TLS) | OPEN but **MITM'd** — `issuer=St Edwards College` for *every* TLS fingerprint (Go, uTLS Chrome/Firefox/iOS/Edge/QQ) | Transparent TLS interception; pin check correctly rejects |
+| **TCP 443, 8443** (TLS) | OPEN but **MITM'd** — `issuer=the monitored network` for *every* TLS fingerprint (Go, uTLS Chrome/Firefox/iOS/Edge/QQ) | Transparent TLS interception; pin check correctly rejects |
 | **TCP 53,80,853,993,995,587,465,2083,2053,8080,25565,51820,1194** | **TIMEOUT** (filtered) | Default-deny, only 22/443/8443 allowed to unknown IPs |
 | **UDP to VPS** (3478,51820,8080,2083,2053,1194,51821) | **TIMEOUT** (all) | UDP to this IP blocked |
 | **UDP to 8.8.8.8:53** | **PASS** (61B) | UDP not globally blocked — just to this VPS IP /24 |
-| **TLS SNI spoof to VPS** (`www.google.com` SNI to `158.178.137.23:443`) | **FAIL** `remote error: tls: internal error` | SNI/IP mismatch blocked, not proxied |
+| **TLS SNI spoof to VPS** (`www.google.com` SNI to `203.0.113.10:443`) | **FAIL** `remote error: tls: internal error` | SNI/IP mismatch blocked, not proxied |
 | **Plain TCP to :443** (`HELLO`) | 0 bytes | Expects TLS, not plain |
 | **Plain HTTP to :22** | SSH banner | Port 22 is truly SSH |
 
@@ -31,7 +31,7 @@
 - SNI spoofing a whitelisted domain to this IP is blocked, not forwarded
 
 Options to get a non-SSH transport:
-1. **Move the relay to a whitelisted IP** (e.g., host it behind Vercel/Cloudflare where `aborro.dev` already resolves to `216.198.79.1` — that IP is likely whitelisted as "Education/Hosting")
+1. **Move the relay to a whitelisted IP** (e.g., host it behind Vercel/Cloudflare where `aborro.dev` already resolves to `198.51.100.1` — that IP is likely whitelisted as "Education/Hosting")
 2. **Run the tunnel on port 22 but speak a non-SSH protocol that *starts* with `SSH-2.0-`** — essentially a fake SSH banner, then switch to our own framing. Firewall that only checks port would still pass it, but it would no longer need a private key.
 
 Both are doable. For now the cleanest path that keeps the panel's promise ("no private key to hand out") is to keep SSH as the outer transport but **make each client generate its own keypair**.

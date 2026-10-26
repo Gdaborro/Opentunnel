@@ -1,10 +1,12 @@
 package panel
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -53,19 +55,27 @@ func (h *Handler) SSHKeyPath(token string) string {
 	return pub
 }
 
-// regAllowed enforces a per-IP registration rate limit so a banned device
-// cannot hammer /api/token/request with fresh identities.
-func (h *Handler) regAllowed(ip string) bool {
+// rateAllowed enforces a per-IP windowed limit for the named bucket so no
+// public endpoint can be hammered (registration spam, status-oracle
+// enumeration, heartbeat floods). Keys are (bucket|ip).
+func (h *Handler) rateAllowed(ip string, max int, window time.Duration, bucket string) bool {
+	key := bucket + "|" + ip
 	h.rlMu.Lock()
 	defer h.rlMu.Unlock()
 	now := time.Now()
-	r := h.rlMap[ip]
-	if r == nil || now.Sub(r.windowStart) > regLimitWindow {
+	r := h.rlMap[key]
+	if r == nil || now.Sub(r.windowStart) > window {
 		r = &regLimit{windowStart: now}
-		h.rlMap[ip] = r
+		h.rlMap[key] = r
 	}
 	r.count++
-	return r.count <= regLimitMax
+	return r.count <= max
+}
+
+// regAllowed enforces a per-IP registration rate limit so a banned device
+// cannot hammer /api/token/request with fresh identities.
+func (h *Handler) regAllowed(ip string) bool {
+	return h.rateAllowed(ip, regLimitMax, regLimitWindow, "reg")
 }
 
 func (h *Handler) Mount(mux *http.ServeMux) {
@@ -124,12 +134,35 @@ func (h *Handler) apiSetup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "already setup", http.StatusForbidden)
 		return
 	}
+	// First-run gate: on a fresh deploy every unauthenticated visitor
+	// would otherwise race the operator to own the panel. Setup requires
+	// the operator's one-time bootstrap secret (env OTU_SETUP_TOKEN on
+	// the panel process) — without it the door stays closed.
+	want := os.Getenv("OTU_SETUP_TOKEN")
+	if want == "" {
+		http.Error(w, "setup locked: set OTU_SETUP_TOKEN on the panel process and restart to create the first admin", http.StatusForbidden)
+		return
+	}
+	got := r.Header.Get("X-Setup-Token")
 	var creds struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		SetupTok string `json:"setup_token"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&creds); err != nil {
 		http.Error(w, "bad request", 400)
+		return
+	}
+	if got == "" {
+		got = creds.SetupTok
+	}
+	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+		// Slow failed gates down so the secret can't be brute-forced.
+		if !h.rateAllowed(clientIP(r), 5, 15*time.Minute, "setup") {
+			http.Error(w, "too many attempts", http.StatusTooManyRequests)
+			return
+		}
+		http.Error(w, "invalid setup token", http.StatusForbidden)
 		return
 	}
 	if len(creds.Username) < 3 || len(creds.Password) < 8 {
@@ -142,6 +175,7 @@ func (h *Handler) apiSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	sid := h.auth.CreateSession(creds.Username)
 	h.auth.SetSessionCookie(w, sid)
+	h.db.RecordEvent("setup", "first admin created ("+creds.Username+")")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -159,6 +193,11 @@ func (h *Handler) apiLogin(w http.ResponseWriter, r *http.Request) {
 	ok, _ := h.auth.Login(creds.Username, creds.Password)
 	if !ok {
 		h.auth.RecordLoginFail(ip)
+		if h.auth.LoginLocked(ip) {
+			// Visible, not silent: a lockout flood is an attack signal the
+			// admin should see on the panel, not discover afterwards.
+			h.db.RecordAlert("warning", "panel", "login lockout triggered for IP "+ip)
+		}
 		http.Error(w, "invalid credentials", 401)
 		return
 	}
@@ -176,8 +215,15 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/login", 302)
 }
 
-// clientIP extracts the IP portion of the request's remote address.
+// clientIP resolves the caller's IP. The relay's reverse proxy stamps
+// X-Otu-Client-IP on every proxied request (an unspoofable view — it
+// overwrites anything the outside sent, and includes the CDN-resolved
+// address when the relay is fronted). Direct requests (tests, emergency
+// panel access on loopback) fall back to RemoteAddr.
 func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Otu-Client-IP"); net.ParseIP(v) != nil {
+		return v
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -573,6 +619,14 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenStatus(w http.ResponseWriter, r *http.Request) {
+	// Status is how devices learn their admission state — but an
+	// unauthenticated oracle that answers at line speed also enumerates
+	// tokens and leaks ban/kick reasons. 60 queries per IP per minute is
+	// ~4x a poll cadence and far below enumeration speed.
+	if !h.rateAllowed(clientIP(r), 60, time.Minute, "status") {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
 	// Token rides the query (legacy GET clients) or the JSON body (v0.9.22+
 	// POST). The body form exists so the credential never appears in an
 	// interceptable URL line.
@@ -599,10 +653,20 @@ func (h *Handler) tokenStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenHeartbeat(w http.ResponseWriter, r *http.Request) {
+	// Heartbeats are one tiny token per minute per device; anything bigger
+	// or faster is a flood (a 64MB JSON POST used to be accepted here).
+	if !h.rateAllowed(clientIP(r), 30, time.Minute, "hb") {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
 	var req struct {
 		Token string `json:"token"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if json.NewDecoder(r.Body).Decode(&req) != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
 	h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
 	w.Write([]byte(`{"ok":true}`))
 }

@@ -8,7 +8,7 @@ exact reverse commands. Rule of thumb: binaries are file swaps behind
 ## Server (relay) binary
 
 ```sh
-ssh ubuntu@158.178.137.23
+ssh ubuntu@<your-vps-ip>
 sudo install -m 755 /usr/local/bin/otu-server.bak-0.9.17 /usr/local/bin/otu-server
 sudo systemctl restart opentunnel.service
 systemctl is-active opentunnel.service

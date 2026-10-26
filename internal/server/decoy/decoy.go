@@ -5,9 +5,12 @@
 package decoy
 
 import (
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"net/http"
 	"strings"
+	"time"
 )
 
 //go:embed all:site
@@ -37,8 +40,14 @@ var pages = map[string]string{
 
 // Handler serves the decoy site. If customHTML is non-nil it is served for
 // every path (legacy single-page decoy behaviour used by tests).
+//
+// Realism (pentest 2026-10-25): every response carries a Server header
+// (Go's http server emits none — no real nginx/Apache/IIS site is
+// headerless), and static assets carry ETag/Last-Modified/Accept-Ranges
+// like every origin in the world.
 func Handler(customHTML []byte) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Server", "nginx")
 		if customHTML != nil {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write(customHTML)
@@ -50,21 +59,13 @@ func Handler(customHTML []byte) http.Handler {
 		}
 		switch p {
 		case "/favicon.ico", "/favicon.svg":
-			w.Header().Set("Content-Type", "image/svg+xml")
-			w.Header().Set("Cache-Control", "public, max-age=86400")
-			data, _ := siteFS.ReadFile("site/favicon.svg")
-			_, _ = w.Write(data)
+			serveAsset(w, "site/favicon.svg", "image/svg+xml", "public, max-age=86400")
 			return
 		case "/robots.txt":
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			data, _ := siteFS.ReadFile("site/robots.txt")
-			_, _ = w.Write(data)
+			serveAsset(w, "site/robots.txt", "text/plain; charset=utf-8", "")
 			return
 		case "/style.css":
-			w.Header().Set("Content-Type", "text/css; charset=utf-8")
-			w.Header().Set("Cache-Control", "public, max-age=3600")
-			data, _ := siteFS.ReadFile("site/style.css")
-			_, _ = w.Write(data)
+			serveAsset(w, "site/style.css", "text/css; charset=utf-8", "public, max-age=3600")
 			return
 		}
 		if file, ok := pages[p]; ok {
@@ -78,4 +79,28 @@ func Handler(customHTML []byte) http.Handler {
 		data, _ := siteFS.ReadFile("site/404.html")
 		_, _ = w.Write(data)
 	})
+}
+
+// siteEpoch is the plausible "last deploy" timestamp for static assets.
+// Embedded files carry no modtime, so the decoy presents a consistent
+// one instead of Go's omission.
+var siteEpoch = time.Date(2026, 8, 27, 2, 5, 0, 0, time.UTC)
+
+// serveAsset emits an embedded file with the header shape every real
+// static origin sends: ETag (content hash), Last-Modified, Accept-Ranges.
+func serveAsset(w http.ResponseWriter, name, ctype, cache string) {
+	data, err := siteFS.ReadFile(name)
+	if err != nil {
+		http.NotFound(w, nil)
+		return
+	}
+	sum := sha256.Sum256(data)
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:8])+`"`)
+	w.Header().Set("Last-Modified", siteEpoch.UTC().Format(http.TimeFormat))
+	w.Header().Set("Accept-Ranges", "bytes")
+	if cache != "" {
+		w.Header().Set("Cache-Control", cache)
+	}
+	_, _ = w.Write(data)
 }

@@ -18,7 +18,17 @@ type Guard struct {
 	banBase       time.Duration
 	banMax        time.Duration
 	lastCleanupNs int64
+
+	// tokenActive bounds concurrent sessions per device identity for
+	// peers arriving over loopback (the ssh tier's forward path): per-IP
+	// caps and bans do not apply to loopback, so an identity must not be
+	// able to exhaust the relay through that exemption.
+	tokenActive map[string]int
 }
+
+// maxSessionsPerToken caps concurrent authenticated sessions per device
+// (loopback arrivals). 4 covers the mux pool's dial churn with room.
+const maxSessionsPerToken = 4
 
 type failRecord struct {
 	count    int
@@ -38,11 +48,37 @@ func NewGuard(maxPerIP, maxTotal int, banBase, banMax time.Duration) *Guard {
 		active:        make(map[string]int),
 		fails:         make(map[string]*failRecord),
 		bans:          make(map[string]time.Time),
+		tokenActive:   make(map[string]int),
 		maxPerIP:      maxPerIP,
 		total:         make(chan struct{}, maxTotal),
 		banBase:       banBase,
 		banMax:        banMax,
 		lastCleanupNs: time.Now().UnixNano(),
+	}
+}
+
+// AcquireTokenSession admits one session for a device identity arriving
+// over loopback. The returned release function must be called when the
+// session finishes; release==nil means over the per-identity cap.
+func (g *Guard) AcquireTokenSession(token string) (release func()) {
+	if token == "" {
+		return func() {}
+	}
+	g.mu.Lock()
+	if g.tokenActive[token] >= maxSessionsPerToken {
+		g.mu.Unlock()
+		return nil
+	}
+	g.tokenActive[token]++
+	g.mu.Unlock()
+	return func() {
+		g.mu.Lock()
+		if n := g.tokenActive[token]; n <= 1 {
+			delete(g.tokenActive, token)
+		} else {
+			g.tokenActive[token] = n - 1
+		}
+		g.mu.Unlock()
 	}
 }
 

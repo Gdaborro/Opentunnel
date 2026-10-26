@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -78,6 +79,38 @@ func main() {
 	var leafFP atomic.Value // string (hex)
 	leafFP.Store(fingerprint)
 
+	// Pin self-check (CDN front): the certificate clients SEE is the edge's,
+	// not necessarily the origin's. When pin_probe_host is set, the relay
+	// dials its own public HTTPS endpoint through the CDN on a jittered
+	// schedule, learns the client-visible leaf, and announces THAT pin
+	// in-band — renewals and edge rotations heal without operator action.
+	// While enabled, the direct-serve wrapper below stays off (it would
+	// clobber the edge pin with the origin pin).
+	if cfg.PinProbeHost != "" {
+		probePin := func() {
+			conn, derr := tls.Dial("tcp", net.JoinHostPort(cfg.PinProbeHost, "443"), &tls.Config{
+				ServerName:         cfg.PinProbeHost,
+				InsecureSkipVerify: true, // we only fingerprint the presented leaf
+				MinVersion:         tls.VersionTLS12,
+			})
+			if derr != nil {
+				return
+			}
+			state := conn.ConnectionState()
+			_ = conn.Close()
+			if len(state.PeerCertificates) > 0 {
+				leafFP.Store(hex.EncodeToString(transport.FingerprintCert(state.PeerCertificates[0].Raw)))
+			}
+		}
+		probePin()
+		go func() {
+			for {
+				time.Sleep(30*time.Minute + time.Duration(rand.Int63n(int64(30*time.Minute))))
+				probePin()
+			}
+		}()
+	}
+
 	var tlsCfg *tls.Config
 	var acmeDomains []string
 	if cfg.AcmeDomain != "" {
@@ -94,25 +127,29 @@ func main() {
 		}
 		tlsCfg = mgr.TLSConfig()
 		tlsCfg.MinVersion = tls.VersionTLS12
-		// Watch every served leaf: renewals swap the certificate under us
-		// and the control channel must always announce the live pin.
-		if inner := tlsCfg.GetCertificate; inner != nil {
-			tlsCfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				c, cerr := inner(hello)
-				if cerr == nil && c != nil && len(c.Certificate) > 0 {
-					leafFP.Store(hex.EncodeToString(transport.FingerprintCert(c.Certificate[0])))
+		transport.RealisticTLS(tlsCfg)
+		// Watch every served leaf while no CDN probe is configured: the
+		// control channel must always announce the live pin. (With
+		// pin_probe_host set, the probe above is the sole authority.)
+		if cfg.PinProbeHost == "" {
+			if inner := tlsCfg.GetCertificate; inner != nil {
+				tlsCfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+					c, cerr := inner(hello)
+					if cerr == nil && c != nil && len(c.Certificate) > 0 {
+						leafFP.Store(hex.EncodeToString(transport.FingerprintCert(c.Certificate[0])))
+					}
+					return c, cerr
 				}
-				return c, cerr
 			}
 		}
 		fingerprint = "(managed by Let's Encrypt — fetch with: openssl s_client -connect 127.0.0.1:443 -servername " +
 			acmeDomains[0] + " </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout)"
 		fmt.Printf("ACME enabled for %v\n", acmeDomains)
 	} else {
-		tlsCfg = &tls.Config{
+		tlsCfg = transport.RealisticTLS(&tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			Certificates: []tls.Certificate{*cert},
-		}
+		})
 	}
 	fmt.Println("========================================================")
 	fmt.Printf("  certificate fingerprint (pin this in the client):\n    %s\n", fingerprint)
@@ -145,6 +182,7 @@ func main() {
 		WSPath:                 cfg.WSPath,
 		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
 		AllowLegacyMaster:      cfg.AllowLegacyMaster,
+		TrustCloudflareIPs:     cfg.TrustCloudflareIPs,
 		CurrentPin:             func() string { v, _ := leafFP.Load().(string); return v },
 	}
 	if panelDB != nil {
@@ -183,10 +221,18 @@ func main() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			io.WriteString(w, "panel process unavailable — retry in a moment; the relay itself is fine\n")
 		}
+		// Stamp the REAL client IP (TCP peer, or CF-Connecting-IP behind
+		// the CDN front) before proxying: the panel's per-IP rate limits
+		// and login lockout key on it, and the header overwrites anything
+		// the outside sent — unspoofable from beyond the relay.
+		stampIP := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Header.Set("X-Otu-Client-IP", server.ResolveClientIP(r, cfg.TrustCloudflareIPs))
+			proxy.ServeHTTP(w, r)
+		})
 		mux := http.NewServeMux()
-		mux.Handle("/admin/", proxy)
-		mux.Handle("/admin", proxy)
-		mux.Handle("/api/token/", proxy)
+		mux.Handle("/admin/", stampIP)
+		mux.Handle("/admin", stampIP)
+		mux.Handle("/api/token/", stampIP)
 		mux.Handle("/", baseHandler)
 		handler = mux
 	}

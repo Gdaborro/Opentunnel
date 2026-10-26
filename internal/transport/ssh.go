@@ -32,6 +32,34 @@ const DefaultSSHPort = "22"
 // an all-day SSH session from a tool nobody ships. Override empty.
 const DefaultSSHClientVersion = "SSH-2.0-OpenSSH_9.6p1"
 
+// Stock Ubuntu 24.04 OpenSSH client's advertised algorithms, in order. A
+// Go-ordered proposal is a fingerprint of its own; the ssh tier must look
+// like every other admin connecting from a Linux box. MAC list omits
+// umac-* (x/crypto does not implement them) — invisible in practice
+// because every listed cipher is AEAD. Keep in sync with the relay's sshd.
+var (
+	sshKEXAlgos = []string{
+		"curve25519-sha256", "curve25519-sha256@libssh.org",
+		"ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
+		"diffie-hellman-group-exchange-sha256", "diffie-hellman-group16-sha512",
+		"diffie-hellman-group18-sha512", "diffie-hellman-group14-sha256",
+	}
+	sshCipherAlgos = []string{
+		"chacha20-poly1305@openssh.com", "aes128-ctr", "aes192-ctr", "aes256-ctr",
+		"aes128-gcm@openssh.com", "aes256-gcm@openssh.com",
+	}
+	sshMACAlgos = []string{
+		"hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com",
+		"hmac-sha2-256", "hmac-sha2-512",
+	}
+	sshHostKeyAlgos = []string{
+		"ssh-ed25519-cert-v01@openssh.com", "ssh-ed25519",
+		"rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-512",
+		"rsa-sha2-256-cert-v01@openssh.com", "rsa-sha2-256",
+		"ecdsa-sha2-nistp256-cert-v01@openssh.com", "ecdsa-sha2-nistp256",
+	}
+)
+
 // SSHOptions configures the ssh transport.
 type SSHOptions struct {
 	Host        string // VPS address (port optional, default 22)
@@ -101,6 +129,11 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 		HostKeyCallback: t.hostKeyCallback(),
 		Timeout:         timeout,
 		ClientVersion:   clientVersion,
+		// Stock-client algorithm proposals (see the lists above).
+		KeyExchanges:      sshKEXAlgos,
+		Ciphers:           sshCipherAlgos,
+		MACs:              sshMACAlgos,
+		HostKeyAlgorithms: sshHostKeyAlgos,
 	}
 	client, err := ssh.Dial("tcp", hostPort, cfg)
 	if err != nil {
@@ -124,11 +157,12 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 	}
 	// Same legacy fallback as the outer tiers: a fresh config dials the
 	// boring path, which relays predating the migration don't mount (their
-	// mux answers the decoy 404 instead of 101).
+	// mux answers the decoy 404 instead of 101). No subprotocol offered:
+	// this rides inside SSH, and the outer tiers stopped announcing one
+	// (a named subprotocol is a one-packet identification for a censor).
 	dial := func(path string) (*websocket.Conn, *http.Response, error) {
 		return websocket.Dial(dctx, fmt.Sprintf("ws://%s%s", t.opt.InternalWS, path), &websocket.DialOptions{
-			HTTPClient:   httpClient,
-			Subprotocols: []string{"otu1"},
+			HTTPClient: httpClient,
 		})
 	}
 	wsConn, resp, err := dialWSWithLegacyFallback(dial, t.opt.wsPathOrDefault())

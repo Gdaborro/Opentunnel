@@ -4,13 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="robots" content="noindex, nofollow" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-    />
+    <!-- No third-party fonts: every request the login page makes must stay
+         on-origin. Google Fonts + Unsplash told third parties an admin was
+         opening the panel, from which network, and that it exists. -->
     <title>otu — network operations</title>
+    <style>
+      html { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

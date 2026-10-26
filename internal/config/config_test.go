@@ -52,8 +52,8 @@ func TestDialHostPortAndSNI(t *testing.T) {
 	if got := c.SNIHost(); got != "cdn.aborro.dev" {
 		t.Fatalf("sni=%q", got)
 	}
-	c.ServerIP = "158.178.137.23"
-	if got := c.DialHostPort(); got != "158.178.137.23:443" {
+	c.ServerIP = "203.0.113.23"
+	if got := c.DialHostPort(); got != "203.0.113.23:443" {
 		t.Fatalf("IP literal dial=%q", got)
 	}
 	if got := c.SNIHost(); got != "cdn.aborro.dev" {

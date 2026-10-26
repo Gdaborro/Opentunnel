@@ -103,6 +103,12 @@ type snapshot struct {
 	ProxyOverride stringVal             `json:"proxy_override"`
 	AutoConfigURL stringVal             `json:"autoconfig_url"`
 	Policies      map[string]policySnap `json:"policies,omitempty"`
+	// OtuAppliedServer records the proxy address otu applied AFTER this
+	// snapshot was taken. Restore compares EXACTLY (a prefix heuristic
+	// used to match 127.0.0.1:1080 — the standard SOCKS port — plus
+	// "<local>;", i.e. virtually every proxy config ever, and wiped
+	// users' real Privoxy/Clash settings instead of restoring them).
+	OtuAppliedServer string `json:"otu_applied_server,omitempty"`
 }
 
 // Manager owns the journal directory (%LOCALAPPDATA%\opentunnel).
@@ -192,6 +198,12 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 	snap.AutoConfigURL = readString(k, "AutoConfigURL")
 	_ = k.Close()
 	snap.Policies = snapshotPolicies()
+	// Journal the address we are ABOUT to apply: a crashed session can
+	// journal otu's own settings as the "original", and restore must be
+	// able to tell — by exact match, not by heuristic (the old prefix
+	// check matched 127.0.0.1:1080 + "<local>;", i.e. any real proxy
+	// config, and wiped it instead of restoring it).
+	snap.OtuAppliedServer = proxyAddr
 
 	raw, err := json.Marshal(&snap)
 	if err != nil {
@@ -357,25 +369,6 @@ func bypassList(override string) string {
 	return strings.Join(parts, ",")
 }
 
-// looksLikeOtuState reports whether a snapshotted proxy state is actually
-// otu's own footprint (server = our local proxy + our bypass entries). A
-// previous crashed session can journal otu's settings as the "original";
-// restoring that would leave otu's server string behind (enabled=0, but
-// still a trace). In that case we clear instead.
-func looksLikeOtuState(server stringVal, override stringVal, enable uint32) bool {
-	if !server.Exists || server.Data == "" {
-		return false
-	}
-	if !strings.HasPrefix(server.Data, "127.0.0.1:1") {
-		return false
-	}
-	// Enable can be 0 in a contaminated chain (a crashed session that was
-	// force-restored before the next journal), so the server+bypass
-	// signature alone decides.
-	o := override.Data
-	return strings.Contains(o, "cdn.aborro.dev") || strings.Contains(o, "<local>;")
-}
-
 // Restore reapplies the journaled original settings and removes the journal.
 func (m *Manager) Restore() error {
 	raw, err := os.ReadFile(m.snapPath())
@@ -412,9 +405,13 @@ func (m *Manager) RestoreFrom(path string) error {
 // notifies running apps, and clears any journal so a later start cannot
 // re-apply stale state.
 func (m *Manager) applySnapshot(s snapshot) error {
-	if looksLikeOtuState(s.ProxyServer, s.ProxyOverride, s.ProxyEnable) {
-		// The "original" we captured was itself otu's residue from an
-		// earlier crashed session: fall back to a clean no-proxy state.
+	// Contamination check by EXACT match: a crashed session can journal
+	// otu's own settings as the "original" (apply happens after the
+	// journal write). The journal records the address otu applied; only
+	// when the "original" equals it do we fall back to clean no-proxy.
+	// The old heuristic matched any 127.0.0.1:108x + "<local>;" config —
+	// standard Privoxy/Clash territory — and wiped real settings.
+	if s.OtuAppliedServer != "" && s.ProxyServer.Exists && s.ProxyServer.Data == s.OtuAppliedServer {
 		s.ProxyServer = stringVal{}
 		s.ProxyOverride = stringVal{}
 		s.ProxyEnable = 0

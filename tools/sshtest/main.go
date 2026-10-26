@@ -14,7 +14,7 @@ import (
 )
 
 func main() {
-	host := os.Args[1] // e.g. 158.178.137.23:22
+	host := os.Args[1] // e.g. 203.0.113.10:22
 	user := os.Args[2]
 	keyFile := os.Args[3]
 	target := os.Args[4] // e.g. 127.0.0.1:8081

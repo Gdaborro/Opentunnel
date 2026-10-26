@@ -65,12 +65,17 @@ type Options struct {
 		BanReason(token string) string
 		TouchPeer(token string)
 		KnownPeer(token string) bool
+		RecordVisit(token, domain string)
 	}
 	// CurrentPin, when set, returns the relay's CURRENT leaf certificate
 	// fingerprint (hex). Every control response carries it so clients
 	// survive certificate rotation (LE renews ~every 60-90 days; a stale
 	// pin would otherwise brick every client at renewal).
 	CurrentPin func() string
+	// TrustCloudflareIPs resolves real client IPs from CF-Connecting-IP
+	// when the TCP peer is a Cloudflare edge (CDN front). Guards, GeoIP
+	// and rate limits then see the client, not the CDN.
+	TrustCloudflareIPs bool
 }
 
 func (o *Options) guard() *Guard {
@@ -111,7 +116,8 @@ func Handler(opt Options) http.Handler {
 	decoyHandler := decoy.Handler(opt.DecoyHTML)
 	mux.Handle("/", decoyHandler)
 	wsHandler := func(w http.ResponseWriter, r *http.Request) {
-		release := opt.guard().Acquire(addrHost(r.RemoteAddr))
+		peerIP := ResolveClientIP(r, opt.TrustCloudflareIPs)
+		release := opt.guard().Acquire(peerIP)
 		if release == nil {
 			// Over limit or banned: indistinguishable from the normal site.
 			decoyHandler.ServeHTTP(w, r)
@@ -136,7 +142,11 @@ func Handler(opt Options) http.Handler {
 			return
 		}
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols: []string{"otu1"},
+			// NO subprotocol negotiation: echoing a purpose-built
+			// subprotocol back answers "is this opentunnel?" in a single
+			// packet — the cheapest active probe there is. Clients stopped
+			// offering "otu1" long ago; offering none and confirming none
+			// reads as an ordinary realtime channel.
 			// Tunnel auth happens in-band after upgrade; rejecting on
 			// Origin would only brick legit clients (and old relays must
 			// keep accepting new ones mid-migration).
@@ -147,7 +157,7 @@ func Handler(opt Options) http.Handler {
 		}
 		defer conn.Close(websocket.StatusInternalError, "")
 		stream := websocket.NetConn(r.Context(), conn, websocket.MessageBinary)
-		handleSession(stream, opt)
+		handleSession(stream, opt, peerIP)
 	}
 	mux.HandleFunc(path, wsHandler)
 	if path != protocol.LegacyWSPath {
@@ -168,6 +178,13 @@ func (o Options) verifyHandshakeToken(tok string) byte {
 	if o.AllowLegacyMaster && subtle.ConstantTimeCompare([]byte(tok), []byte(o.Token)) == 1 {
 		return protocol.StatusOK // migration window for pre-device-token clients
 	}
+	if !o.PanelDB.KnownPeer(tok) {
+		// Unknown tokens are distinguishable now, and guessing gets
+		// punished (guard strikes) instead of riding the pending path.
+		// Purged devices re-register on the next dial and return to the
+		// pending flow without further strikes.
+		return protocol.StatusBadToken
+	}
 	status, _, _, _ := o.PanelDB.CheckToken(tok)
 	switch status {
 	case "approved", "kicked": // kicked: grace + block page handled in-channel
@@ -183,7 +200,10 @@ func (o Options) verifyHandshakeToken(tok string) byte {
 	}
 }
 
-func handleSession(stream net.Conn, opt Options) {
+// handleSession authenticates one tunnel stream. peerIP is the resolved
+// client address (behind a CDN front the TCP peer is the edge, not the
+// client) and drives guard bans and the panel's device-IP view.
+func handleSession(stream net.Conn, opt Options, peerIP string) {
 	defer stream.Close()
 	metrics.SessionStarted()
 	defer metrics.SessionEnded()
@@ -194,12 +214,22 @@ func handleSession(stream net.Conn, opt Options) {
 		// Punish only genuine auth failures: pending/banned/expired peers
 		// retry as part of normal flow and must not trip IP bans.
 		if status == protocol.StatusBadToken || status == protocol.StatusBadVersion || err != nil {
-			opt.guard().Punish(addrHost(stream.RemoteAddr()))
+			opt.guard().Punish(peerIP)
 		}
 		if err != nil {
 			opt.logger().Printf("server: handshake rejected: %v", err)
 		}
 		return
+	}
+
+	// Loopback arrivals are the ssh tier's forward path, exempt from the
+	// per-IP caps — bound them per identity instead.
+	if isLoopbackIP(peerIP) {
+		releaseTok := opt.guard().AcquireTokenSession(authTok)
+		if releaseTok == nil {
+			return // over the per-identity session cap
+		}
+		defer releaseTok()
 	}
 
 	salt, err := protocol.ReadSalt(stream)
@@ -234,11 +264,20 @@ func handleSession(stream net.Conn, opt Options) {
 		opt.logger().Printf("server: bad client token: %v", err)
 		return
 	}
+	// Identity binding (pentest 2026-10-25): in panel mode the session's
+	// accounting identity IS the token that authenticated the handshake —
+	// it derived the AEAD keys. The in-band field stays on the wire for
+	// protocol compatibility but can no longer move quota attribution,
+	// last_ip or ban records onto another device (presenting a peer's
+	// approved token used to ride that peer's quota).
+	if opt.PanelDB != nil {
+		clientToken = authTok
+	}
 	if clientToken == "" {
 		clientToken = authTok // very old clients: handshake token doubles as panel token
 	}
 	if opt.PanelDB != nil {
-		go opt.PanelDB.SetPeerIP(clientToken, addrHost(stream.RemoteAddr()))
+		go opt.PanelDB.SetPeerIP(clientToken, peerIP)
 	}
 	var peerStatus = "approved"
 	var peerReason string
@@ -293,7 +332,7 @@ func handleSession(stream net.Conn, opt Options) {
 	case protocol.MuxMarker:
 		opt.serveMuxSession(sec, clientToken, peerStatus, peerReason)
 	case protocol.UdpMarker:
-		serveUDPStream(sec, opt)
+		serveUDPStream(sec, opt, clientToken, peerStatus)
 	default:
 		relayTarget(mode[0], sec, opt, clientToken, peerStatus, peerReason)
 	}
@@ -353,16 +392,9 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 			return
 		}
 	}
-	// Record aggregated visited site (privacy: domain only, no URL, count per peer)
+	// Record aggregated visited site (privacy: domain only, no URL, count per peer).
 	if opt.PanelDB != nil && token != "" && target.Domain != "" {
-		go func(tok, dom string) {
-			if db, ok := opt.PanelDB.(interface {
-				Exec(string, ...interface{}) (interface{}, error)
-			}); ok {
-				_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS visits(token TEXT, domain TEXT, hits INTEGER DEFAULT 1, last_seen DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(token, domain))`)
-				_, _ = db.Exec(`INSERT INTO visits(token,domain,hits,last_seen) VALUES(?,?,1,datetime('now')) ON CONFLICT(token,domain) DO UPDATE SET hits=hits+1, last_seen=datetime('now')`, tok, dom)
-			}
-		}(token, target.Domain)
+		opt.PanelDB.RecordVisit(token, target.Domain)
 		// Abuse protection: per-peer rate limit - if same peer hits >100 domains in 10s, temp kick
 		// (handled via Guard, but we also log)
 		opt.logger().Printf("visit %s -> %s", shortToken(token), target.Domain)
@@ -482,7 +514,7 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 				return
 			}
 			if atyp[0] == protocol.UdpMarker {
-				serveUDPStream(s, o)
+				serveUDPStream(s, o, token, peerStatus)
 				return
 			}
 			if atyp[0] == protocol.CtrlMarker {
