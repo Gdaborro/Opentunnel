@@ -34,20 +34,34 @@ var profileOrder = []string{ProfileFast, ProfileBalanced, ProfileStealth}
 // SshTierName is the virtual last-resort tier riding inside real SSH.
 const SshTierName = "ssh"
 
-// tierCount returns how many tiers exist including the optional SSH fallback.
-// In hostile mode the SSH tier is hidden unless explicitly allowed: an
-// all-day SSH session is the most conspicuous state on an intercepting net.
+// H3TierName is the HTTP/3 tier: QUIC to :443 survives TLS interception
+// (middleboxes cannot re-sign what they cannot terminate), sits between
+// the ws-tls profiles and the ssh last resort, and carries bulk traffic
+// on hostile networks so SSH doesn't have to.
+const H3TierName = "h3"
+
+// tierCount returns how many tiers exist including the optional h3 and
+// ssh fallbacks. In hostile mode the SSH tier is hidden unless explicitly
+// allowed: an all-day SSH session is the most conspicuous state on an
+// intercepting net. The h3 tier stays: it reads as ordinary HTTP/3.
 func (a *Adaptive) tierCount() int {
-	if a.sshFallback != nil && (!a.hostile || a.AllowHostileSSH) {
-		return len(profileOrder) + 1
+	n := len(profileOrder)
+	if a.h3Fallback != nil {
+		n++
 	}
-	return len(profileOrder)
+	if a.sshFallback != nil && (!a.hostile || a.AllowHostileSSH) {
+		n++
+	}
+	return n
 }
 
 // tierName maps a tier index to a display/build name.
 func (a *Adaptive) tierName(idx int) string {
 	if idx < len(profileOrder) {
 		return profileOrder[idx]
+	}
+	if a.h3Fallback != nil && idx == len(profileOrder) {
+		return H3TierName
 	}
 	return SshTierName
 }
@@ -89,8 +103,13 @@ type Adaptive struct {
 	transportBuilder func(profile string) transport.Transport
 
 	// sshFallback, when set, adds a final last-resort tier that tunnels
-	// inside real SSH â€” used when every ws-tls tier is intercepted.
+	// inside real SSH — used when every ws-tls tier is intercepted.
 	sshFallback func() transport.Transport
+
+	// h3Fallback, when set, adds the HTTP/3 tier between the ws-tls
+	// profiles and ssh: QUIC cannot be transparently intercepted, so the
+	// pinned handshake reaches the relay untouched on MITM networks.
+	h3Fallback func() transport.Transport
 
 	// AllowHostileSSH permits the SSH tier while hostile mode is active
 	// (TLS-intercepting network). Default true preserves connectivity;
@@ -136,6 +155,14 @@ func (a *Adaptive) EnableSSHFallback(builder func() transport.Transport) {
 	a.clients = nil // rebuilt lazily with the new setting
 }
 
+// EnableH3 adds the HTTP/3 tier to the ladder (between ws-tls and ssh).
+func (a *Adaptive) EnableH3(builder func() transport.Transport) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.h3Fallback = builder
+	a.clients = nil // rebuilt lazily with the new setting
+}
+
 // UseTransportBuilder overrides how per-profile transports are constructed.
 func (a *Adaptive) UseTransportBuilder(f func(profile string) transport.Transport) {
 	a.mu.Lock()
@@ -174,19 +201,28 @@ func NewAdaptive(token string, base transport.WSTLSOptions, profile string, dial
 func defaultFactory(a *Adaptive, idx int) *Client {
 	name := a.tierName(idx)
 	var tr transport.Transport
-	if idx >= len(profileOrder) && a.sshFallback != nil {
+	switch {
+	case idx < len(profileOrder):
+		if a.transportBuilder != nil {
+			tr = a.transportBuilder(name)
+		} else {
+			opt := a.base
+			opt.ChromeHello = true // every tier mimics Chrome (see const block)
+			tr = transport.NewWSTLS(opt)
+		}
+	case a.h3Fallback != nil && idx == len(profileOrder):
+		tr = a.h3Fallback()
+	case a.sshFallback != nil:
 		tr = a.sshFallback()
-	} else if a.transportBuilder != nil {
-		tr = a.transportBuilder(name)
-	} else {
+	default:
 		opt := a.base
-		opt.ChromeHello = true // every tier mimics Chrome (see const block)
+		opt.ChromeHello = true
 		tr = transport.NewWSTLS(opt)
 	}
 	return NewWithOptions(tr, Options{
 		Token:          a.token,
 		DialTimeout:    a.dialTimeout,
-		Profile:        "balanced", // under ssh, mild padding; harmless elsewhere
+		Profile:        "balanced", // under h3/ssh, mild padding; harmless elsewhere
 		Mux:            a.mux,
 		OnAuthRejected: a.OnAuthRejected,
 	})

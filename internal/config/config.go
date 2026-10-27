@@ -75,16 +75,21 @@ type ClientConf struct {
 	// SSHClientVersion is the SSH banner the ssh tier announces. Empty
 	// matches the server's whitelisted OpenSSH family (transport default);
 	// "-" reverts to Go's stock banner.
-	SSHClientVersion string   `toml:"ssh_client_version"`
-	Profile          string   `toml:"profile"`      // auto | fast | balanced | stealth
-	FallbackSSH      *bool    `toml:"fallback_ssh"` // add ssh last-resort tier to the ladder
-	Mux              *bool    `toml:"mux"`          // default true: multiplexed sessions
-	UDP              *bool    `toml:"udp"`          // default true: SOCKS5 UDP ASSOCIATE
-	SOCKSAddr        string   `toml:"socks_addr"`   // default 127.0.0.1:1080
-	HTTPAddr         string   `toml:"http_addr"`    // default 127.0.0.1:8118
-	BypassList       []string `toml:"bypass_list"`  // extra ProxyOverride entries
-	AutoUpdate       *bool    `toml:"auto_update"`  // default true: self-update from GitHub Releases
-	HostileSSH       *bool    `toml:"hostile_ssh"`  // default true: allow the SSH last-resort tier on TLS-intercepting networks
+	SSHClientVersion string `toml:"ssh_client_version"`
+	Profile          string `toml:"profile"`      // auto | fast | balanced | stealth
+	FallbackSSH      *bool  `toml:"fallback_ssh"` // add ssh last-resort tier to the ladder
+	Mux              *bool  `toml:"mux"`          // default true: multiplexed sessions
+	UDP              *bool  `toml:"udp"`          // default true: SOCKS5 UDP ASSOCIATE
+	// H3Tier adds the HTTP/3 transport between ws-tls and ssh (default
+	// true): QUIC to :443 cannot be transparently intercepted, so pinned
+	// handshakes reach the relay on MITM networks and bulk traffic moves
+	// off SSH there. UDP-blocked networks fail through to ssh in ~8s.
+	H3Tier     *bool    `toml:"h3_tier"`
+	SOCKSAddr  string   `toml:"socks_addr"`  // default 127.0.0.1:1080
+	HTTPAddr   string   `toml:"http_addr"`   // default 127.0.0.1:8118
+	BypassList []string `toml:"bypass_list"` // extra ProxyOverride entries
+	AutoUpdate *bool    `toml:"auto_update"` // default true: self-update from GitHub Releases
+	HostileSSH *bool    `toml:"hostile_ssh"` // default true: allow the SSH last-resort tier on TLS-intercepting networks
 }
 
 // SSHHostKeyPins splits ssh_host_keys into individual pins.
@@ -142,6 +147,10 @@ func (c *ClientConf) TransportKind() string {
 
 // MuxEnabled reports the effective multiplexing setting (default true).
 func (c *ClientConf) MuxEnabled() bool { return c.Mux == nil || *c.Mux }
+
+// H3TierEnabled reports whether the HTTP/3 tier rides the ladder
+// (default true: it only engages after every ws-tls profile has failed).
+func (c *ClientConf) H3TierEnabled() bool { return c.H3Tier == nil || *c.H3Tier }
 
 // UDPEnabled reports the effective UDP relay setting (default true).
 func (c *ClientConf) UDPEnabled() bool { return c.UDP == nil || *c.UDP }
@@ -279,6 +288,12 @@ ws_path = "/api/v1/stream"
 profile = "auto"
 mux = true
 udp = true
+# HTTP/3 tier (default on): QUIC to :443 cannot be transparently
+# intercepted, so pinned handshakes get through on MITM networks — bulk
+# traffic rides "ordinary h3 browsing" instead of SSH there. Only
+# engages after every ws-tls profile has failed; UDP-blocked networks
+# fall through to ssh in seconds.
+h3_tier = true
 # Last-resort tier for networks that intercept TLS: tunnel inside real SSH.
 # Drop tun.key next to this config to enable it (skipped when missing).
 fallback_ssh = true

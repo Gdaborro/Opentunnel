@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme/autocert"
 
 	"opentunnel/internal/config"
@@ -283,6 +284,28 @@ func main() {
 			}
 		}()
 		log.Printf("internal (plain) listener on %s", cfg.ListenInternal)
+	}
+
+	// HTTP/3 listener (v0.9.26): same handler mux over QUIC on the UDP
+	// side of the port — the transport that survives TLS interception.
+	// Optional: a busy/special UDP port just means the h3 tier is absent.
+	if _, port, perr := net.SplitHostPort(cfg.Listen); perr == nil {
+		udpAddr, uerr := net.ResolveUDPAddr("udp", net.JoinHostPort("", port))
+		if uerr == nil {
+			if udpConn, ulerr := net.ListenUDP("udp", udpAddr); ulerr == nil {
+				h3TLS := tlsCfg.Clone()
+				h3TLS.NextProtos = []string{"h3"}
+				h3srv := &http3.Server{TLSConfig: h3TLS, Handler: handler}
+				go func() {
+					log.Printf("h3 (HTTP/3) listener on udp/%s", port)
+					if herr := h3srv.Serve(udpConn); herr != nil && herr != http.ErrServerClosed {
+						log.Printf("h3 listener: %v", herr)
+					}
+				}()
+			} else {
+				log.Printf("h3 listener: udp bind: %v (h3 tier disabled)", ulerr)
+			}
+		}
 	}
 
 	log.Printf("otu-server listening on %s", cfg.Listen)

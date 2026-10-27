@@ -508,6 +508,20 @@ func run() {
 		if cfg.MuxEnabled() {
 			dialer.EnableMux()
 		}
+		// HTTP/3 tier: QUIC survives TLS interception, engages only
+		// after every ws-tls profile fails, and reads as ordinary h3.
+		if cfg.H3TierEnabled() {
+			h3opts := transport.H3Options{
+				ServerAddr:   cfg.DialHostPort(),
+				ServerName:   cfg.SNIHost(),
+				Path:         cfg.WSPath,
+				Fingerprint:  cfg.Fingerprint,
+				Fingerprints: fpSet,
+				Insecure:     cfg.Insecure,
+			}
+			dialer.EnableH3(func() transport.Transport { return transport.NewH3(h3opts) })
+			fmt.Println("[i] h3 tier enabled (QUIC — engages after ws-tls)")
+		}
 		if cfg.Profile == "auto" {
 			fmt.Println("[i] adaptive mode: fast -> balanced -> stealth only as needed")
 		} else {

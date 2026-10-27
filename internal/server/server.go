@@ -117,6 +117,35 @@ func Handler(opt Options) http.Handler {
 	mux.Handle("/", decoyHandler)
 	wsHandler := func(w http.ResponseWriter, r *http.Request) {
 		peerIP := ResolveClientIP(r, opt.TrustCloudflareIPs)
+		// HTTP/3 arrivals (ProtoMajor 3): the h3 transport tier tunnels
+		// the protocol over a streaming request — no WebSocket upgrade
+		// exists on that path. Same guard, same session machinery.
+		if r.ProtoMajor == 3 {
+			release := opt.guard().Acquire(peerIP)
+			if release == nil {
+				decoyHandler.ServeHTTP(w, r)
+				return
+			}
+			defer release()
+			if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write(decoy.IndexPage())
+				return
+			}
+			flusher, _ := w.(http.Flusher)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			// Respond immediately: the client's dial cannot complete
+			// until headers arrive, and the protocol handshake bytes
+			// only flow after the dial returns. Headers first, then the
+			// session machinery reads from the request body.
+			w.WriteHeader(http.StatusOK)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			handleSession(&h3ServerConn{Reader: r.Body, Writer: w, Flusher: flusher}, opt, peerIP)
+			return
+		}
 		release := opt.guard().Acquire(peerIP)
 		if release == nil {
 			// Over limit or banned: indistinguishable from the normal site.
