@@ -55,7 +55,7 @@ func main() {
 	defer conn.Close()
 	fmt.Printf("h3 dial OK in %.1fs (pinned QUIC handshake through)\n", time.Since(t0).Seconds())
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := protocol.WriteHandshake(conn, dev.Token); err != nil {
+	if err := protocol.WriteHandshake(conn, token); err != nil {
 		fmt.Println("handshake write:", err)
 		os.Exit(1)
 	}
