@@ -5,8 +5,10 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -87,6 +89,10 @@ func main() {
 	// in-band — renewals and edge rotations heal without operator action.
 	// While enabled, the direct-serve wrapper below stays off (it would
 	// clobber the edge pin with the origin pin).
+	// refreshH3Cert reloads the h3 listener's certificate from the ACME
+	// cache (set below once the cache dir is known); the pin probe's
+	// cadence keeps it current across renewals.
+	var refreshH3Cert func()
 	if cfg.PinProbeHost != "" {
 		probePin := func() {
 			conn, derr := tls.Dial("tcp", net.JoinHostPort(cfg.PinProbeHost, "443"), &tls.Config{
@@ -102,6 +108,9 @@ func main() {
 			if len(state.PeerCertificates) > 0 {
 				leafFP.Store(hex.EncodeToString(transport.FingerprintCert(state.PeerCertificates[0].Raw)))
 			}
+			if refreshH3Cert != nil {
+				refreshH3Cert()
+			}
 		}
 		probePin()
 		go func() {
@@ -114,6 +123,7 @@ func main() {
 
 	var tlsCfg *tls.Config
 	var acmeDomains []string
+	var acmeDir string
 	if cfg.AcmeDomain != "" {
 		stateDir := os.Getenv("TMPDIR")
 		if stateDir == "" {
@@ -121,8 +131,9 @@ func main() {
 		}
 		// Support comma-separated domains for zero-downtime migration.
 		acmeDomains = splitAndTrim(cfg.AcmeDomain)
+		acmeDir = filepath.Join(stateDir, "acme")
 		mgr := &autocert.Manager{
-			Cache:      autocert.DirCache(filepath.Join(stateDir, "acme")),
+			Cache:      autocert.DirCache(acmeDir),
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(acmeDomains...),
 		}
@@ -288,13 +299,49 @@ func main() {
 
 	// HTTP/3 listener (v0.9.26): same handler mux over QUIC on the UDP
 	// side of the port — the transport that survives TLS interception.
-	// Optional: a busy/special UDP port just means the h3 tier is absent.
+	// The h3 TLS config serves the CURRENT ECDSA chain directly: autocert
+	// picks its RSA cert for some hellos (quic-go's included), and QUIC
+	// clients pin the chain the TCP listener serves — serving the RSA
+	// twin breaks their pins. Refreshed alongside the pin probe.
 	if _, port, perr := net.SplitHostPort(cfg.Listen); perr == nil {
-		udpAddr, uerr := net.ResolveUDPAddr("udp", net.JoinHostPort("", port))
-		if uerr == nil {
+		if udpAddr, uerr := net.ResolveUDPAddr("udp", net.JoinHostPort("", port)); uerr == nil {
 			if udpConn, ulerr := net.ListenUDP("udp", udpAddr); ulerr == nil {
+				var h3Cert atomic.Pointer[tls.Certificate]
+				loadH3Cert := func() {
+					if acmeDir == "" || len(acmeDomains) == 0 {
+						return
+					}
+					// The autocert cache entry is a combined PEM: private
+					// key block first, then the certificate chain (the
+					// format autocert itself parses in cacheGet).
+					data, cerr := autocert.DirCache(acmeDir).Get(context.Background(), acmeDomains[0])
+					if cerr != nil {
+						return
+					}
+					cert, kerr := tls.X509KeyPair(data, data)
+					if kerr != nil {
+						log.Printf("h3: certificate reload failed: %v", kerr)
+						return
+					}
+					h3Cert.Store(&cert)
+					log.Printf("h3: certificate loaded (%s)", acmeDomains[0])
+				}
+				refreshH3Cert = loadH3Cert
 				h3TLS := tlsCfg.Clone()
 				h3TLS.NextProtos = []string{"h3"}
+				if acmeDir != "" {
+					// Bypass autocert's hello-driven ECDSA/RSA selection:
+					// the h3 path always serves the pinned, current ECDSA
+					// chain (the one the TCP listener and every client pin).
+					h3TLS.GetConfigForClient = nil
+					h3TLS.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+						if c := h3Cert.Load(); c != nil {
+							return c, nil
+						}
+						return nil, errors.New("h3: certificate not loaded yet")
+					}
+					loadH3Cert()
+				} // static-cert deployments serve tlsCfg.Certificates as-is
 				h3srv := &http3.Server{TLSConfig: h3TLS, Handler: handler}
 				go func() {
 					log.Printf("h3 (HTTP/3) listener on udp/%s", port)
