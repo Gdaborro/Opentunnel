@@ -24,6 +24,18 @@ type DeviceHealth struct {
 	At           string  `json:"at"`
 }
 
+// SSHPubKey returns the authorized-key-format public key registered for a
+// token ("" when none). The relay verifies v5 handshake signatures
+// against it.
+func (db *DB) SSHPubKey(token string) string {
+	if db == nil {
+		return ""
+	}
+	var pub string
+	db.QueryRow(`SELECT COALESCE(ssh_pubkey,'') FROM peers WHERE token=?`, token).Scan(&pub)
+	return pub
+}
+
 // KnownPeer reports whether the panel has a row for the token. The
 // in-band control channel mirrors the HTTPS 404 contract with it: unknown
 // tokens must read as "" so purged devices re-register on every network.

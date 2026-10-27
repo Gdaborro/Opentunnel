@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -185,6 +186,9 @@ type h3ClientConn struct {
 	body   io.ReadCloser
 	tr     *http3.Transport
 	cancel context.CancelFunc
+
+	dlMu    sync.Mutex
+	dlTimer *time.Timer
 }
 
 func (c *h3ClientConn) Read(p []byte) (int, error) { return c.body.Read(p) }
@@ -196,6 +200,12 @@ func (c *h3ClientConn) Write(p []byte) (int, error) {
 	return n, nil
 }
 func (c *h3ClientConn) Close() error {
+	c.dlMu.Lock()
+	if c.dlTimer != nil {
+		c.dlTimer.Stop()
+		c.dlTimer = nil
+	}
+	c.dlMu.Unlock()
 	_ = c.pw.CloseWithError(errors.New("transport: closed"))
 	_ = c.body.Close()
 	// The transport owns the pooled QUIC connection; closing it tears
@@ -205,11 +215,34 @@ func (c *h3ClientConn) Close() error {
 	c.cancel()
 	return nil
 }
-func (c *h3ClientConn) LocalAddr() net.Addr                { return dummyH3Addr{} }
-func (c *h3ClientConn) RemoteAddr() net.Addr               { return dummyH3Addr{} }
-func (c *h3ClientConn) SetDeadline(t time.Time) error      { return nil }
-func (c *h3ClientConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *h3ClientConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *h3ClientConn) LocalAddr() net.Addr  { return dummyH3Addr{} }
+func (c *h3ClientConn) RemoteAddr() net.Addr { return dummyH3Addr{} }
+
+// SetDeadline arms an absolute deadline that FORCE-CLOSES the stream on
+// expiry (audit round three, N-4: the no-op shim let a stalled handshake
+// hold the mux dial forever). The mux session factory clears the deadline
+// once the session is authenticated, so this only ever bounds setup.
+func (c *h3ClientConn) SetDeadline(t time.Time) error {
+	c.dlMu.Lock()
+	defer c.dlMu.Unlock()
+	if c.dlTimer != nil {
+		c.dlTimer.Stop()
+		c.dlTimer = nil
+	}
+	if t.IsZero() {
+		return nil
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		go func() { _ = c.Close() }()
+		return nil
+	}
+	c.dlTimer = time.AfterFunc(d, func() { _ = c.Close() })
+	return nil
+}
+
+func (c *h3ClientConn) SetReadDeadline(t time.Time) error  { return c.SetDeadline(t) }
+func (c *h3ClientConn) SetWriteDeadline(t time.Time) error { return c.SetDeadline(t) }
 
 type dummyH3Addr struct{}
 

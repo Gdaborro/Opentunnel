@@ -11,7 +11,9 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
@@ -19,6 +21,8 @@ import (
 
 func main() {
 	gen := flag.Bool("gen", false, "generate a new keypair at -key (refuses to overwrite)")
+	manifest := flag.Bool("manifest", false, "sign a release manifest (requires -tag): binds the tag to the asset hash")
+	tag := flag.String("tag", "", "release tag, e.g. v0.9.27 (with -manifest)")
 	keyPath := flag.String("key", "release.ed25519", "private key path (raw 64-byte seed+pub)")
 	flag.Parse()
 
@@ -59,11 +63,28 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	sig := ed25519.Sign(ed25519.PrivateKey(raw), data)
-	out := flag.Arg(0) + ".sig"
+
+	var msg []byte
+	var out string
+	if *manifest {
+		if *tag == "" {
+			fmt.Fprintln(os.Stderr, "-manifest requires -tag")
+			os.Exit(1)
+		}
+		sum := sha256.Sum256(data)
+		// MUST match internal/client.ReleaseMsg byte for byte.
+		msg = []byte("otu-release:" + *tag + ":" + hex.EncodeToString(sum[:]))
+		out = "manifest.sig"
+	} else {
+		// Legacy bare-file signature: still produced for every release so
+		// pre-0.9.27 clients (which verify file bytes only) keep updating.
+		msg = data
+		out = flag.Arg(0) + ".sig"
+	}
+	sig := ed25519.Sign(ed25519.PrivateKey(raw), msg)
 	if err := os.WriteFile(out, []byte(base64.StdEncoding.EncodeToString(sig)+"\n"), 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("signed %s -> %s\n", flag.Arg(0), out)
+	fmt.Printf("signed %s -> %s (%s)\n", flag.Arg(0), out, map[bool]string{true: "manifest", false: "bare"}[*manifest])
 }

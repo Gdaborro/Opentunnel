@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -272,13 +273,45 @@ func (h *Handler) apiPeers(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(peers)
 }
 
+// validTokenCharset reports whether a token is safe to use in URL paths
+// and DB keys. Tokens are opaque credentials minted by clients
+// (base64url of 32 random bytes) — anything containing a slash, brace or
+// other structural character is not a token, it is an injection attempt
+// (audit round three, H-1: a registered token of "12345678/approve" made
+// the panel's ban-click execute approve via the path-split router).
+var tokenCharset = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
+
+func validTokenCharset(s string) bool { return tokenCharset.MatchString(s) }
+
+// requirePOST answers 405 for anything but POST on endpoints whose
+// action semantics are POST-native (registration, peer actions): a GET
+// reachable action path multiplies CSRF/delivery vectors for no benefit.
+func requirePOST(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	return true
+}
+
 func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) {
+		return
+	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/peers/"), "/")
-	if len(parts) < 2 {
+	if len(parts) != 2 {
 		http.Error(w, "bad request", 400)
 		return
 	}
 	token, action := parts[0], parts[1]
+	if !validTokenCharset(token) {
+		// Poisoned peer row (pre-fix registration): refuse to act on it
+		// through the URL router at all — the admin action cannot be
+		// redirected by a crafted token.
+		http.Error(w, "invalid token", 400)
+		return
+	}
 	short := token
 	if len(short) > 8 {
 		short = short[:8]
@@ -549,6 +582,9 @@ func (h *Handler) apiCategories(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) {
+		return
+	}
 	if !h.regAllowed(clientIP(r)) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
@@ -567,6 +603,14 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Token) < 16 || len(req.Token) > 1024 {
 		http.Error(w, "token must be 16-1024 chars", 400)
+		return
+	}
+	// Charset gate (H-1): a token carrying "/" or other path-structural
+	// characters could not be a client-minted credential, and letting it
+	// into the store turns every admin action URL into an injection
+	// surface. First line of defense; the action handler re-checks.
+	if !validTokenCharset(req.Token) {
+		http.Error(w, "invalid token characters", 400)
 		return
 	}
 	// Bounded fields: a hostile registrant must not be able to stuff
@@ -653,6 +697,9 @@ func (h *Handler) tokenStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) {
+		return
+	}
 	// Heartbeats are one tiny token per minute per device; anything bigger
 	// or faster is a flood (a 64MB JSON POST used to be accepted here).
 	if !h.rateAllowed(clientIP(r), 30, time.Minute, "hb") {
@@ -674,6 +721,9 @@ func (h *Handler) tokenHeartbeat(w http.ResponseWriter, r *http.Request) {
 // tokenHealth ingests client telemetry (device posture for NAC/inventory).
 // Public but rate-limited per IP; unknown tokens are ignored.
 func (h *Handler) tokenHealth(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) {
+		return
+	}
 	if !h.regAllowed(clientIP(r)) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return

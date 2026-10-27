@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -69,9 +70,15 @@ type SSHOptions struct {
 	WSPath      string // defaults to /ws
 	DialTimeout time.Duration
 	// HostKeyPins pins the server host key(s) as ssh-keygen-style
-	// "SHA256:<base64>" fingerprints. Empty = accept any host key (NOT
-	// recommended: an active attacker could steal the tunnel token).
+	// "SHA256:<base64>" fingerprints. Empty fails CLOSED (audit round
+	// three, F-2 residual): without pins any middlebox serving an SSH
+	// banner can MITM the tier, relay the OTU1 handshake, harvest the
+	// device token and derive the AEAD keys. InsecureHostKeys=true is
+	// the explicit dev-only escape hatch.
 	HostKeyPins []string
+	// InsecureHostKeys accepts any host key when no pins are configured.
+	// Never set outside local testing.
+	InsecureHostKeys bool
 	// ClientVersion is the SSH banner this client announces. Empty uses
 	// DefaultSSHClientVersion (the whitelisted OpenSSH family); "-" forces
 	// Go's stock banner.
@@ -194,11 +201,19 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 	}, nil
 }
 
-// hostKeyCallback returns a pin-verifying callback, or the insecure fallback
-// when no pins are configured (the client main warns loudly in that case).
+// hostKeyCallback returns a pin-verifying callback. With no pins
+// configured the tier fails CLOSED unless InsecureHostKeys is set: an
+// unpinned ssh tier lets a middlebox terminate SSH, relay the OTU1
+// handshake, harvest the device token and derive the session's AEAD keys
+// (audit round three, F-2 residual).
 func (t *sshTransport) hostKeyCallback() ssh.HostKeyCallback {
 	if len(t.opt.HostKeyPins) == 0 {
-		return ssh.InsecureIgnoreHostKey()
+		if t.opt.InsecureHostKeys {
+			return ssh.InsecureIgnoreHostKey()
+		}
+		return func(_ string, _ net.Addr, _ ssh.PublicKey) error {
+			return errors.New("transport: ssh host keys are not pinned (set ssh_host_keys, or ssh_insecure = true for local testing only)")
+		}
 	}
 	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
 		sum := sha256.Sum256(key.Marshal())

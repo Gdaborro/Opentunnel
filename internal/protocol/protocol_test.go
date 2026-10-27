@@ -225,7 +225,7 @@ func TestTargetExchangeRoundtrip(t *testing.T) {
 		t.Fatalf("target read: %v %+v", err, got)
 	}
 	runWithTimeout(t, func() {
-		if err := WriteTargetResponse(s1, StatusOK); err != nil {
+		if err := WriteTargetResponse(s1, ProtoVersionLegacy, StatusOK); err != nil {
 			t.Errorf("write ok response: %v", err)
 		}
 	})
@@ -243,7 +243,7 @@ func TestTargetExchangeRoundtrip(t *testing.T) {
 	defer c2.Close()
 	defer s2.Close()
 	go func() {
-		_ = WriteTargetResponse(s2, StatusDialFailed)
+		_ = WriteTargetResponse(s2, ProtoVersionLegacy, StatusDialFailed)
 		s2.Close()
 	}()
 	if err := ReadTargetResponse(c2); err == nil {

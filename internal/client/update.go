@@ -118,6 +118,9 @@ func expectedSHA256(body string) string {
 }
 
 // CheckUpdate returns the release to install, or nil when up to date.
+// Releases below MinUpdateTag are refused even when validly signed: the
+// floor is what blocks a middleman from pinning the fleet to an old,
+// genuinely-signed, known-vulnerable build (audit round three, N-3).
 func CheckUpdate(ctx context.Context, socksAddr string) (*Release, error) {
 	rel, err := LatestRelease(ctx, socksAddr)
 	if err != nil {
@@ -126,7 +129,28 @@ func CheckUpdate(ctx context.Context, socksAddr string) (*Release, error) {
 	if !isNewer(version.Version, rel.TagName) {
 		return nil, nil
 	}
+	if belowMinTag(rel.TagName) {
+		return nil, fmt.Errorf("auto-update: release %s is below the minimum supported version %s — refusing", rel.TagName, MinUpdateTag)
+	}
 	return rel, nil
+}
+
+// belowMinTag reports whether tag sorts strictly below MinUpdateTag.
+// Unparseable tags are treated as below (refuse what cannot be checked).
+func belowMinTag(tag string) bool {
+	mMaj, mMin, mPat, ok1 := parseVersion(MinUpdateTag)
+	rMaj, rMin, rPat, ok2 := parseVersion(tag)
+	if !ok1 || !ok2 {
+		return true
+	}
+	switch {
+	case rMaj != mMaj:
+		return rMaj < mMaj
+	case rMin != mMin:
+		return rMin < mMin
+	default:
+		return rPat < mPat
+	}
 }
 
 // updateClient builds an HTTP client for update traffic: direct connection
@@ -191,12 +215,15 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("auto-update: unsupported platform " + runtime.GOOS)
 	}
+	if belowMinTag(rel.TagName) {
+		return fmt.Errorf("auto-update: release %s is below the minimum supported version %s — refusing", rel.TagName, MinUpdateTag)
+	}
 	var url, sigURL string
 	for _, a := range rel.Assets {
 		switch a.Name {
 		case assetName:
 			url = a.URL
-		case assetName + ".sig":
+		case "manifest.sig":
 			sigURL = a.URL
 		}
 	}
@@ -205,8 +232,11 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	}
 	if sigURL == "" {
 		// Unsigned releases are refused outright: an interceptor who can
-		// strip the signature can strip anything else in the feed.
-		return fmt.Errorf("auto-update: release %s is unsigned — refusing install", rel.TagName)
+		// strip the signature can strip anything else in the feed. The
+		// manifest signature binds the TAG to the binary hash, so a
+		// forged tag over a real old binary fails verification too
+		// (audit round three, N-3).
+		return fmt.Errorf("auto-update: release %s has no manifest signature — refusing install", rel.TagName)
 	}
 
 	exe, err := os.Executable()
@@ -275,24 +305,18 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 		os.Remove(tmp)
 		return fmt.Errorf("auto-update: asset exceeds %d bytes — refusing", maxAsset)
 	}
-	if want := expectedSHA256(rel.Body); want != "" {
-		if got := hex.EncodeToString(hasher.Sum(nil)); got != want {
-			os.Remove(tmp)
-			return fmt.Errorf("auto-update: sha256 mismatch (got %s)", got[:12])
-		}
-	} else {
+	got := hex.EncodeToString(hasher.Sum(nil))
+	if want := expectedSHA256(rel.Body); want != "" && got != want {
 		os.Remove(tmp)
-		return errors.New("auto-update: release notes missing sha256 — refusing install")
+		return fmt.Errorf("auto-update: sha256 mismatch (got %s)", got[:12])
 	}
-	// The signature covers the downloaded file bytes.
-	fileData, err := os.ReadFile(tmp)
-	if err != nil {
+	// The manifest signature covers "otu-release:<tag>:<asset sha256>":
+	// the tag from the (interceptable) feed is cryptographically bound to
+	// the binary hash, so neither a forged tag nor a swapped asset can
+	// pass — only a tuple the offline release key actually signed.
+	if !ed25519.Verify(ed25519.PublicKey(pub), ReleaseMsg(rel.TagName, got), sig) {
 		os.Remove(tmp)
-		return err
-	}
-	if !ed25519.Verify(ed25519.PublicKey(pub), fileData, sig) {
-		os.Remove(tmp)
-		return errors.New("auto-update: release signature verification failed — refusing install")
+		return errors.New("auto-update: release manifest signature verification failed — refusing install")
 	}
 
 	// Windows allows renaming a running exe: current -> .old, new -> current.

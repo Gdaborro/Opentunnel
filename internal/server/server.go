@@ -5,7 +5,9 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/subtle"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/xtaci/smux"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
 
 	"opentunnel/internal/metrics"
@@ -66,6 +69,10 @@ type Options struct {
 		TouchPeer(token string)
 		KnownPeer(token string) bool
 		RecordVisit(token, domain string)
+		// V5 handshake binding: the SSH public key registered for a token
+		// (proof-of-possession check) and security alerting.
+		SSHPubKey(token string) string
+		RecordAlert(severity, kind, message string)
 	}
 	// CurrentPin, when set, returns the relay's CURRENT leaf certificate
 	// fingerprint (hex). Every control response carries it so clients
@@ -229,6 +236,25 @@ func (o Options) verifyHandshakeToken(tok string) byte {
 	}
 }
 
+// verifyHandshakeSig checks a v5 handshake's Ed25519 proof-of-possession
+// against the SSH public key registered for the token ("ssh-ed25519 AAAA…"
+// authorized-key format — the same key the ssh tier authorizes).
+func verifyHandshakeSig(pubkeyAuthorized string, hs *protocol.Handshake) bool {
+	pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(strings.TrimSpace(pubkeyAuthorized)))
+	if err != nil {
+		return false
+	}
+	cpk, ok := pk.(ssh.CryptoPublicKey)
+	if !ok {
+		return false
+	}
+	ed, ok := cpk.CryptoPublicKey().(ed25519.PublicKey)
+	if !ok {
+		return false
+	}
+	return ed25519.Verify(ed, protocol.HandshakeMsg(hs.Token, hs.Salt), hs.Sig)
+}
+
 // handleSession authenticates one tunnel stream. peerIP is the resolved
 // client address (behind a CDN front the TCP peer is the edge, not the
 // client) and drives guard bans and the panel's device-IP view.
@@ -238,18 +264,56 @@ func handleSession(stream net.Conn, opt Options, peerIP string) {
 	defer metrics.SessionEnded()
 
 	_ = stream.SetDeadline(time.Now().Add(15 * time.Second))
-	status, authTok, err := protocol.ReadAndVerifyHandshake(stream, stream, opt.verifyHandshakeToken)
-	if err != nil || status != protocol.StatusOK {
-		// Punish only genuine auth failures: pending/banned/expired peers
-		// retry as part of normal flow and must not trip IP bans.
-		if status == protocol.StatusBadToken || status == protocol.StatusBadVersion || err != nil {
-			opt.guard().Punish(peerIP)
+	hs, err := protocol.ReadHandshake(stream)
+	if err != nil {
+		var st byte = protocol.StatusBadVersion
+		if errors.Is(err, protocol.ErrBadToken) {
+			st = protocol.StatusBadToken
 		}
-		if err != nil {
-			opt.logger().Printf("server: handshake rejected: %v", err)
+		opt.guard().Punish(peerIP)
+		opt.logger().Printf("server: handshake rejected: %v", err)
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			_ = protocol.WriteHandshakeStatus(stream, protocol.ProtoVersion, st)
 		}
 		return
 	}
+	status := opt.verifyHandshakeToken(hs.Token)
+	// v5 proof-of-possession (audit round three, N-1/N-2): a session
+	// presenting a valid token must also prove possession of the device
+	// key registered for it. A harvested bearer token alone used to
+	// authenticate; now it answers BadToken. Peers without a key on file
+	// (ancient registrations) pass with a log line — all panel-era
+	// registrations carry the key.
+	if status == protocol.StatusOK && hs.Version >= protocol.ProtoVersion {
+		pub := ""
+		if opt.PanelDB != nil {
+			pub = opt.PanelDB.SSHPubKey(hs.Token)
+		}
+		if pub == "" {
+			opt.logger().Printf("server: no registered key for %s — v5 signature not enforced this session", shortToken(hs.Token))
+		} else if !verifyHandshakeSig(pub, hs) {
+			opt.guard().Punish(peerIP)
+			if opt.PanelDB != nil {
+				opt.PanelDB.RecordAlert("critical", "security",
+					"handshake signature mismatch for device "+shortToken(hs.Token)+" — possible stolen token")
+			}
+			opt.logger().Printf("server: v5 signature mismatch for %s", shortToken(hs.Token))
+			_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
+			return
+		}
+	}
+	if err := protocol.WriteHandshakeStatus(stream, hs.Version, status); err != nil {
+		return
+	}
+	if status != protocol.StatusOK {
+		// Punish only genuine auth failures: pending/banned/expired peers
+		// retry as part of normal flow and must not trip IP bans.
+		if status == protocol.StatusBadToken {
+			opt.guard().Punish(peerIP)
+		}
+		return
+	}
+	authTok := hs.Token
 
 	// Loopback arrivals are the ssh tier's forward path, exempt from the
 	// per-IP caps — bound them per identity instead.
@@ -261,9 +325,13 @@ func handleSession(stream net.Conn, opt Options, peerIP string) {
 		defer releaseTok()
 	}
 
-	salt, err := protocol.ReadSalt(stream)
-	if err != nil {
-		return // silent close for malformed sessions
+	// v5 carries the salt inside the handshake; v4 sends it right after.
+	salt := hs.Salt
+	if salt == nil {
+		salt, err = protocol.ReadSalt(stream)
+		if err != nil {
+			return // silent close for malformed sessions
+		}
 	}
 	cache := opt.ReplayCache
 	if cache == nil {
@@ -359,38 +427,38 @@ func handleSession(stream net.Conn, opt Options, peerIP string) {
 	}
 	switch mode[0] {
 	case protocol.MuxMarker:
-		opt.serveMuxSession(sec, clientToken, peerStatus, peerReason)
+		opt.serveMuxSession(sec, clientToken, peerStatus, peerReason, hs.Version)
 	case protocol.UdpMarker:
 		serveUDPStream(sec, opt, clientToken, peerStatus)
 	default:
-		relayTarget(mode[0], sec, opt, clientToken, peerStatus, peerReason)
+		relayTarget(mode[0], sec, opt, clientToken, peerStatus, peerReason, hs.Version)
 	}
 }
 
 // relayTarget performs the classic single-target exchange on rw and pipes it
 // to the dialed upstream until both directions finish. Used by legacy
 // sessions and by every multiplexed stream. Traffic is recorded per-token.
-func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string) {
+func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string, ver byte) {
 	defer rw.Close()
 	// Global kill switch: block every new stream while suspended.
 	if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
-		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
 		_ = protocol.WriteToken(rw, "blocked:service suspended (kill switch)")
 		return
 	}
 	// ISP-level ban/kick handling
 	if peerStatus == "banned" {
-		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
 		_ = protocol.WriteToken(rw, "banned:"+peerReason)
 		return
 	}
 	if peerStatus == "kicked" {
-		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
 		_ = protocol.WriteToken(rw, "kicked:"+peerReason)
 		return
 	}
 	if peerStatus == "kicked-silent" {
-		_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
 		_ = protocol.WriteToken(rw, "kicked-silent")
 		return
 	}
@@ -410,7 +478,7 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 		}
 		if name != "" && opt.PanelDB.IsBlocked(name) {
 			opt.logger().Printf("blocked %s for %s", name, shortToken(token))
-			_ = protocol.WriteTargetResponse(rw, protocol.StatusBlocked)
+			_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
 			// Send the rule (not just the domain): the client block page
 			// states the reason, e.g. "ads category".
 			why := opt.PanelDB.BlockWhy(name)
@@ -435,13 +503,13 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	}
 	upstream, err := dialer.Dial("tcp", target.HostPort())
 	if err != nil {
-		_ = protocol.WriteTargetResponse(rw, protocol.StatusDialFailed)
+		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusDialFailed)
 		opt.logger().Printf("server: dial %s failed: %v", target, err)
 		return
 	}
 	defer upstream.Close()
 
-	if err := protocol.WriteTargetResponse(rw, protocol.StatusOK); err != nil {
+	if err := protocol.WriteTargetResponse(rw, ver, protocol.StatusOK); err != nil {
 		return
 	}
 	// No data-phase deadlines: the upstream dial already has a 10 s timeout,
@@ -514,7 +582,7 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 
 // serveMuxSession upgrades an authenticated secure stream into a smux
 // session; every stream inside carries one relayTarget exchange.
-func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peerReason string) {
+func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peerReason string, ver byte) {
 	sess, err := smux.Server(sec, protocol.MuxConfig())
 	if err != nil {
 		o.logger().Printf("server: mux setup failed: %v", err)
@@ -550,7 +618,7 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 				serveCtrlStream(s, o)
 				return
 			}
-			relayTarget(atyp[0], s, o, token, peerStatus, peerReason)
+			relayTarget(atyp[0], s, o, token, peerStatus, peerReason, ver)
 		}(stream)
 	}
 }

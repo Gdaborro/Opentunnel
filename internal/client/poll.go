@@ -88,11 +88,28 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 		"token": device.Token, "fingerprint": device.Fingerprint, "device_name": device.DeviceName, "ssh_pubkey": pub,
 	})
 	// Pinned channel first; on intercepting networks it refuses the MITM
-	// cert by design. Registration carries no live credential (the token
-	// is worthless until approved, and identities are write-once), so the
-	// system-trusted fallback is the bootstrap path there. Without it a
-	// fresh device at school can never deliver its ssh key — and every
-	// tier stays dead (no ws-tls through the MITM, no authorized ssh key).
+	// cert by design. The system-trusted fallback exists ONLY for devices
+	// the panel has never approved (fresh bootstraps): for those the
+	// payload carries no live credential. An ever-approved device's token
+	// IS the live bearer credential, so its registration never crosses an
+	// interceptable channel (audit round three, N-1 Window A: the old
+	// unconditional fallback handed the token to the middlebox at every
+	// client start).
+	if ts, terr := NewTokenStore(); terr == nil && ts.EverApproved(device.Fingerprint) {
+		cl, base, err := panelHTTP(cfg)
+		if err != nil {
+			return err
+		}
+		resp, perr := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body))
+		if perr != nil {
+			return perr
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusForbidden {
+			return fmt.Errorf("banned")
+		}
+		return nil
+	}
 	if cl, base, err := panelHTTP(cfg); err == nil {
 		if resp, perr := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body)); perr == nil {
 			defer resp.Body.Close()
@@ -150,8 +167,16 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 	// pending devices behind TLS interception have no pinned channel and
 	// no tunnel yet, and their token grants nothing until approved). An
 	// approved device's token is a live credential: it never takes the
-	// plain path — in-band and pinned only.
-	bootstrap := *last == "" || *last == "pending" || *last == "expired"
+	// plain path — in-band and pinned only. The gate consults the durable
+	// ever-approved marker (fingerprint-keyed), not just this process's
+	// memory: on the first poll after startup, `last` is empty for every
+	// device, and an approved one must not leak its token on the first
+	// iteration (audit round three, N-1 Window B).
+	everApproved := false
+	if ts, terr := NewTokenStore(); terr == nil {
+		everApproved = ts.EverApproved(device.Fingerprint)
+	}
+	bootstrap := !everApproved && (*last == "" || *last == "pending" || *last == "expired")
 	status, kickReason, banReason, kickExpires, err := checkTokenStatus(cfg, device.Token, bootstrap)
 	if err != nil {
 		return // transient network error — keep the last known state
@@ -160,6 +185,14 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 		return
 	}
 	*last = status
+	if ts, terr := NewTokenStore(); terr == nil {
+		// Durable approval marker (fingerprint-keyed): from now on this
+		// device's token never crosses a system-trusted channel again,
+		// across restarts and re-registrations.
+		if status == "approved" {
+			ts.MarkApproved(device.Fingerprint)
+		}
+	}
 	switch status {
 	case "approved":
 		fmt.Println("[+] Access granted — this device is online.")
@@ -214,7 +247,7 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 	}
 	var pinnedErr error
 	if cl, base, perr := panelHTTP(cfg); perr == nil {
-		st, kr, br, ke, ferr := fetchStatus(cl, base, token)
+		st, kr, br, ke, ferr := fetchStatus(cl, base, token, true)
 		if ferr == nil {
 			return st, kr, br, ke, nil
 		}
@@ -225,19 +258,22 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 	if allowPlainFallback {
 		// Bootstrap fallback (see checkOnce): system-trusted TLS so a
 		// new device can register and learn its approval on intercepted
-		// networks. The token is not yet a live credential here.
-		return fetchStatus(plainHTTPClient(), "https://"+cfg.SNIHost(), token)
+		// networks. The token is not yet a live credential here — and
+		// the legacy query-GET form is never used on this path (the
+		// token would ride the URL line straight into proxy logs).
+		return fetchStatus(plainHTTPClient(), "https://"+cfg.SNIHost(), token, false)
 	}
 	return "", "", "", "", pinnedErr
 }
 
 // fetchStatus asks the panel for a token's admission state over the given
-// client: POST body (v0.9.22+) with the legacy query-GET fallback for
-// panels predating body parsing.
-func fetchStatus(cl *http.Client, base, token string) (status, kickReason, banReason, kickExpires string, err error) {
+// client: POST body (v0.9.22+). The legacy query-GET fallback applies only
+// to the PINNED channel against panels predating body parsing; the plain
+// client never puts the token in a URL.
+func fetchStatus(cl *http.Client, base, token string, allowLegacyGet bool) (status, kickReason, banReason, kickExpires string, err error) {
 	payload, _ := json.Marshal(map[string]string{"token": token})
 	resp, err := cl.Post(base+"/api/token/status", "application/json", bytes.NewReader(payload))
-	if err == nil && resp.StatusCode != http.StatusOK {
+	if err == nil && allowLegacyGet && resp.StatusCode != http.StatusOK {
 		// Panels predating v0.9.22 answer every POST "not found" (they
 		// read the token from the query only). Legacy-GET fallback; the
 		// query form survives there until the server is updated.

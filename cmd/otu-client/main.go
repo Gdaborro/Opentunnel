@@ -315,8 +315,16 @@ func run() {
 	}
 
 	if !graceStart {
-		// Register with panel (fire-and-forget; panel will create pending peer)
-		safeGo("register", func() { client.RegisterWithPanel(cfg, device) })
+		// Register with panel (fire-and-forget; panel will create pending
+		// peer). Skipped once the device has ever been approved: an
+		// approved device's startup re-registration is pointless, and on
+		// intercepting networks it was the window that leaked the live
+		// token to the middlebox at every start (audit round three, N-1
+		// Window A). The re-register paths that matter (purged token →
+		// OnAuthRejected) still fire on demand.
+		if !tokenStore.EverApproved(device.Fingerprint) {
+			safeGo("register", func() { client.RegisterWithPanel(cfg, device) })
+		}
 		// A mid-session ban switches to notice mode (ban page everywhere)
 		// for the grace period instead of dropping instantly; an unban
 		// landing mid-grace cancels the shutdown and clears the gate.
@@ -454,18 +462,19 @@ func run() {
 			sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
 			dialer.UseTransportBuilder(func(profile string) transport.Transport {
 				return transport.NewSSH(transport.SSHOptions{
-					Host:          sshAddr,
-					User:          user,
-					KeyFile:       key,
-					InternalWS:    internal,
-					WSPath:        cfg.WSPath,
-					HostKeyPins:   cfg.SSHHostKeyPins(),
-					ClientVersion: cfg.SSHClientVersion,
+					Host:             sshAddr,
+					User:             user,
+					KeyFile:          key,
+					InternalWS:       internal,
+					WSPath:           cfg.WSPath,
+					HostKeyPins:      cfg.SSHHostKeyPins(),
+					ClientVersion:    cfg.SSHClientVersion,
+					InsecureHostKeys: cfg.Insecure,
 				})
 			})
 			fmt.Println("[i] transport: ssh (tunnel inside SSH; AEAD still end-to-end)")
-			if len(cfg.SSHHostKeyPins()) == 0 {
-				fmt.Println("[!] WARNING: no ssh_host_keys pinned — the ssh tier will accept any host key")
+			if len(cfg.SSHHostKeyPins()) == 0 && !cfg.Insecure {
+				fmt.Println("[!] ssh_host_keys missing: the ssh tier is pinned-closed and will refuse to connect (add ssh_host_keys, or insecure=true for local testing)")
 			}
 		default:
 			fmt.Println("[i] transport: ws-tls")
@@ -486,20 +495,25 @@ func run() {
 					}
 					sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
 					pins := cfg.SSHHostKeyPins()
-					dialer.EnableSSHFallback(func() transport.Transport {
-						return transport.NewSSH(transport.SSHOptions{
-							Host:          sshAddr,
-							User:          user,
-							KeyFile:       cfg.SSHKey,
-							InternalWS:    internal,
-							WSPath:        cfg.WSPath,
-							HostKeyPins:   pins,
-							ClientVersion: cfg.SSHClientVersion,
+					if len(pins) == 0 && !cfg.Insecure {
+						// Fail-closed tier would only produce dial errors;
+						// skip it with the reason instead (audit round
+						// three, F-2 residual).
+						fmt.Println("[!] ssh_host_keys missing — ssh fallback tier disabled (add ssh_host_keys to enable it)")
+					} else {
+						dialer.EnableSSHFallback(func() transport.Transport {
+							return transport.NewSSH(transport.SSHOptions{
+								Host:             sshAddr,
+								User:             user,
+								KeyFile:          cfg.SSHKey,
+								InternalWS:       internal,
+								WSPath:           cfg.WSPath,
+								HostKeyPins:      pins,
+								ClientVersion:    cfg.SSHClientVersion,
+								InsecureHostKeys: cfg.Insecure,
+							})
 						})
-					})
-					fmt.Println("[i] ssh fallback tier enabled (last resort)")
-					if len(pins) == 0 {
-						fmt.Println("[!] WARNING: no ssh_host_keys pinned — the ssh tier will accept any host key")
+						fmt.Println("[i] ssh fallback tier enabled (last resort)")
 					}
 				}
 			}

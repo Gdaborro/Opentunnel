@@ -42,6 +42,29 @@ func (s *TokenStore) TokenPath() string      { return filepath.Join(s.Dir, "devi
 func (s *TokenStore) BanPath() string        { return filepath.Join(s.Dir, "ban.json") }
 func (s *TokenStore) SSHPrivatePath() string { return filepath.Join(s.Dir, "device_ssh") }
 func (s *TokenStore) SSHPublicPath() string  { return filepath.Join(s.Dir, "device_ssh.pub") }
+func (s *TokenStore) approvedPath() string   { return filepath.Join(s.Dir, "approved.flag") }
+
+// MarkApproved records that this device identity has been approved by the
+// panel at least once, keyed on the device FINGERPRINT (not the token):
+// a forced token rotation or re-registration cannot reset the marker, so
+// a middleman-forged "you are a fresh device" state cannot re-open the
+// bootstrap channels for a device the panel already trusts.
+func (s *TokenStore) MarkApproved(fingerprint string) {
+	if fingerprint == "" {
+		return
+	}
+	_ = os.WriteFile(s.approvedPath(), []byte(fingerprint), 0o600)
+}
+
+// EverApproved reports whether an approval verdict ever arrived over a
+// trusted channel (pinned HTTPS or in-band) for this device fingerprint.
+func (s *TokenStore) EverApproved(fingerprint string) bool {
+	data, err := os.ReadFile(s.approvedPath())
+	if err != nil {
+		return false
+	}
+	return string(data) == fingerprint && fingerprint != ""
+}
 
 func (s *TokenStore) LoadOrCreate() (*deviceFile, error) {
 	// An existing identity always loads: the panel (not the local marker)

@@ -26,7 +26,18 @@ const (
 	//   MuxMarker  -> this connection carries smux streams
 	//   UdpMarker  -> this stream relays UDP datagrams
 	//   otherwise  -> the byte IS an ATYP: legacy single-target request
-	ProtoVersion = 4
+	// ProtoVersion 4: per-device control tokens, in-band control channels.
+	// ProtoVersion 5: the handshake carries the session salt AND an Ed25519
+	// signature over (token, salt) made with the device's registered key:
+	// a stolen bearer token alone no longer authenticates (audit round
+	// three, N-1/N-2 — the token harvest and first-registration
+	// substitution both die on missing proof-of-possession).
+	ProtoVersion = 5
+
+	// ProtoVersionLegacy is still ACCEPTED by servers during the fleet
+	// migration window; clients fall back to it when a server answers
+	// BadVersion (pre-0.9.27 relays).
+	ProtoVersionLegacy = 4
 
 	StatusOK          = 0
 	StatusBadToken    = 1
