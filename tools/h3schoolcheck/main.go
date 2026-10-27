@@ -40,8 +40,15 @@ func main() {
 		token = dev.Token
 	}
 	t0 := time.Now()
+	// OTU_H3_ADDR overrides the dial target (SNI stays) so the check can
+	// run against a live listener on loopback — hairpin NAT makes the
+	// public IP unreachable from the server's own host on some clouds.
+	dialAddr := os.Getenv("OTU_H3_ADDR")
+	if dialAddr == "" {
+		dialAddr = "cdn.aborro.dev:443"
+	}
 	tr := transport.NewH3(transport.H3Options{
-		ServerAddr:  "cdn.aborro.dev:443",
+		ServerAddr:  dialAddr,
 		ServerName:  "cdn.aborro.dev",
 		Path:        "/api/v1/stream",
 		Fingerprint: "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1",
