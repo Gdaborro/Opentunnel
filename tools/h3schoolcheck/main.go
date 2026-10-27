@@ -17,18 +17,27 @@ import (
 )
 
 func main() {
-	base := os.Getenv("LOCALAPPDATA")
-	if base == "" {
-		fmt.Println("no LOCALAPPDATA")
-		os.Exit(1)
+	// Token sources, in order: env (OTU_TOKEN), CLI arg, then this
+	// machine's device.json (the usual Windows client machine case).
+	token := os.Getenv("OTU_TOKEN")
+	if token == "" && len(os.Args) > 1 {
+		token = os.Args[1]
 	}
-	var dev struct {
-		Token string `json:"token"`
-	}
-	raw, err := os.ReadFile(filepath.Join(base, "opentunnel", "device.json"))
-	if err != nil || json.Unmarshal(raw, &dev) != nil || dev.Token == "" {
-		fmt.Println("no device token:", err)
-		os.Exit(1)
+	if token == "" {
+		base := os.Getenv("LOCALAPPDATA")
+		if base == "" {
+			fmt.Println("no token: set OTU_TOKEN, pass one, or run on a client machine")
+			os.Exit(1)
+		}
+		var dev struct {
+			Token string `json:"token"`
+		}
+		raw, err := os.ReadFile(filepath.Join(base, "opentunnel", "device.json"))
+		if err != nil || json.Unmarshal(raw, &dev) != nil || dev.Token == "" {
+			fmt.Println("no device token:", err)
+			os.Exit(1)
+		}
+		token = dev.Token
 	}
 	t0 := time.Now()
 	tr := transport.NewH3(transport.H3Options{
