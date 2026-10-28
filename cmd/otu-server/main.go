@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -95,19 +96,19 @@ func main() {
 	var refreshH3Cert func()
 	if cfg.PinProbeHost != "" {
 		probePin := func() {
-			conn, derr := tls.Dial("tcp", net.JoinHostPort(cfg.PinProbeHost, "443"), &tls.Config{
-				ServerName:         cfg.PinProbeHost,
-				InsecureSkipVerify: true, // we only fingerprint the presented leaf
-				MinVersion:         tls.VersionTLS12,
-			})
+			// Standard chain verification against the host's system roots
+			// (audit round four): an on-path attacker or DNS spoofer who
+			// redirects this dial cannot obtain a publicly-trusted
+			// certificate for the probe hostname — ACME validates from
+			// clean resolvers — so only a genuinely-validated leaf may
+			// move the pin the whole fleet learns in-band. On failure the
+			// previous pin is kept and the problem is logged loudly.
+			fp, derr := probeVerifiedLeaf(net.JoinHostPort(cfg.PinProbeHost, "443"), cfg.PinProbeHost, nil)
 			if derr != nil {
+				log.Printf("pin probe: %s failed verification (%v) — keeping previous pin", cfg.PinProbeHost, derr)
 				return
 			}
-			state := conn.ConnectionState()
-			_ = conn.Close()
-			if len(state.PeerCertificates) > 0 {
-				leafFP.Store(hex.EncodeToString(transport.FingerprintCert(state.PeerCertificates[0].Raw)))
-			}
+			leafFP.Store(fp)
 			if refreshH3Cert != nil {
 				refreshH3Cert()
 			}
@@ -195,6 +196,7 @@ func main() {
 		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
 		AllowLegacyMaster:      cfg.AllowLegacyMaster,
 		TrustCloudflareIPs:     cfg.TrustCloudflareIPs,
+		RequireV5After:         cfg.RequireV5Time(),
 		CurrentPin:             func() string { v, _ := leafFP.Load().(string); return v },
 	}
 	if panelDB != nil {
@@ -361,6 +363,28 @@ func main() {
 			log.Fatalf("listen: %v", err)
 		}
 	}
+}
+
+// probeVerifiedLeaf dials addr with FULL TLS verification (chain against
+// roots — nil = system roots — plus hostname match), returning the leaf
+// fingerprint hex. The h3-cert refresh and in-band pin announcement run
+// only on verified results: an unverified probe would let an on-path
+// attacker poison the fleet's trust set (audit round four).
+func probeVerifiedLeaf(addr, serverName string, roots *x509.CertPool) (string, error) {
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
+		ServerName: serverName,
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    roots,
+	})
+	if err != nil {
+		return "", err
+	}
+	state := conn.ConnectionState()
+	_ = conn.Close()
+	if len(state.PeerCertificates) == 0 {
+		return "", errors.New("probe: no certificates presented")
+	}
+	return hex.EncodeToString(transport.FingerprintCert(state.PeerCertificates[0].Raw)), nil
 }
 
 func splitAndTrim(s string) []string {

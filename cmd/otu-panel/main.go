@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -74,22 +76,22 @@ func main() {
 	ph := panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo)
 
 	// permitopen pins device-key forwarding to the relay's internal ws
-	// listener (the ssh tier's direct-tcpip target). Default matches the
-	// relay's listen_internal; custom deployments stay consistent.
+	// listener (the ssh tier's direct-tcpip target); permitlisten="" denies
+	// remote forwards entirely (the client never uses -R). Defaults match
+	// the relay's listen_internal; custom deployments stay consistent.
 	permitTarget := "127.0.0.1:8081"
 	if cfg.ListenInternal != "" {
 		permitTarget = cfg.ListenInternal
 	}
 
-	// Approving a device also installs its SSH public key into the ssh
-	// tier's authorized_keys (same logic as the relay's hook). Keys carry
-	// least-privilege options: no shell/exec/pty/agent/X11, forwarding
-	// ONLY to the internal ws listener the ssh tier dials. Without the
-	// options every device key is an unrestricted proxy through the VPS
-	// (SOCKS egress to anything, loopback panel/sshd reachable) — verified
-	// by pentest 2026-10-23.
+	// Approving a device installs/refreshes its SSH public key in the ssh
+	// tier's authorized_keys with least-privilege options: no
+	// shell/exec/pty/agent/X11, forwarding ONLY to the internal ws
+	// listener, no remote forwards. The rewrite is idempotent and heals
+	// legacy rows: a bare or stale-option line for the same key is
+	// replaced with the current canonical form (audit rounds two/three).
 	ph.WithApproveHook(func(token string) {
-		pub := ph.SSHKeyPath(token)
+		pub := strings.TrimSpace(ph.SSHKeyPath(token))
 		if pub == "" {
 			return
 		}
@@ -100,14 +102,30 @@ func main() {
 		if _, err := os.Stat(akPath); err != nil {
 			return
 		}
-		f, err := os.OpenFile(akPath, os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			log.Printf("panel: authorize ssh key for %s: %v", token[:8], err)
-			return
+		canonical := `restrict,port-forwarding,permitopen="` + permitTarget + `",permitlisten="" ` + pub
+		content := readFileString(akPath)
+		if strings.Contains(content, canonical) {
+			return // already current
 		}
-		defer f.Close()
-		if !strings.Contains(readFileString(akPath), strings.TrimSpace(pub)) {
-			f.WriteString(`restrict,port-forwarding,permitopen="` + permitTarget + `" ` + strings.TrimSpace(pub) + "\n")
+		lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+		if len(lines) == 1 && lines[0] == "" {
+			lines = nil
+		}
+		replaced := false
+		for i, l := range lines {
+			if strings.Contains(l, pub) {
+				lines[i] = canonical
+				replaced = true
+			}
+		}
+		if !replaced {
+			lines = append(lines, canonical)
+		}
+		out := strings.Join(lines, "\n") + "\n"
+		tmp := akPath + ".tmp"
+		if err := os.WriteFile(tmp, []byte(out), 0o600); err != nil || os.Rename(tmp, akPath) != nil {
+			_ = os.Remove(tmp)
+			log.Printf("panel: authorize ssh key for %s: write failed", token[:8])
 		}
 	})
 
@@ -126,7 +144,11 @@ func main() {
 
 	// Optional dedicated TLS listener for emergencies: presents the ACME
 	// certificate from the shared cache (trusted by browsers) or falls back
-	// to the pinned self-signed pair.
+	// to the pinned self-signed pair. READ-ONLY on the cache (audit round
+	// three): running a second autocert Manager here raced the relay's
+	// renewer on one LE account — duplicate issuances risk the weekly
+	// rate limit and a renewal lockout. The relay is the sole renewer; the
+	// panel just serves whatever chain the cache holds.
 	if *tlsListen != "" {
 		var tlsCfg *tls.Config
 		if cfg.AcmeDomain != "" {
@@ -134,14 +156,34 @@ func main() {
 			for i := range domains {
 				domains[i] = strings.TrimSpace(domains[i])
 			}
-			mgr := &autocert.Manager{
-				Cache:      autocert.DirCache(filepath.Join(stateDir, "acme")),
-				Prompt:     autocert.AcceptTOS,
-				HostPolicy: autocert.HostWhitelist(domains...),
+			acmeDir := filepath.Join(stateDir, "acme")
+			var cachedCert atomic.Pointer[tls.Certificate]
+			var cachedAt atomic.Int64
+			loadCert := func() (*tls.Certificate, error) {
+				if c := cachedCert.Load(); c != nil && time.Since(time.Unix(cachedAt.Load(), 0)) < 6*time.Hour {
+					return c, nil
+				}
+				data, err := autocert.DirCache(acmeDir).Get(context.Background(), domains[0])
+				if err != nil {
+					if c := cachedCert.Load(); c != nil {
+						return c, nil // stale beats nothing on the emergency listener
+					}
+					return nil, err
+				}
+				cert, err := tls.X509KeyPair(data, data)
+				if err != nil {
+					return nil, err
+				}
+				cachedCert.Store(&cert)
+				cachedAt.Store(time.Now().Unix())
+				return &cert, nil
 			}
-			tlsCfg = mgr.TLSConfig()
-			tlsCfg.MinVersion = tls.VersionTLS12
-			transport.RealisticTLS(tlsCfg)
+			tlsCfg = transport.RealisticTLS(&tls.Config{
+				MinVersion: tls.VersionTLS12,
+				GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+					return loadCert()
+				},
+			})
 		} else {
 			cert, _, cerr := transport.LoadOrCreateCert(cfg.CertFile, cfg.KeyFile, cfg.Host)
 			if cerr != nil {

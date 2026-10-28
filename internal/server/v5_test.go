@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ type v5Stub struct {
 	token   string
 	pubkey  string
 	alerts  *[]string
+	v5      *atomic.Bool // set when MarkV5 fires (sticky latch state)
 	onAllow func()
 }
 
@@ -52,6 +54,14 @@ func (v v5Stub) RecordAlert(sev, kind, msg string) {
 	if v.alerts != nil {
 		*v.alerts = append(*v.alerts, sev+"|"+kind+"|"+msg)
 	}
+}
+func (v v5Stub) MarkV5(tok string) {
+	if v.v5 != nil && tok == v.token {
+		v.v5.Store(true)
+	}
+}
+func (v v5Stub) V5Seen(tok string) bool {
+	return v.v5 != nil && tok == v.token && v.v5.Load()
 }
 
 // TestV5HandshakeSignatureEnforcement: with a registered key on file, the
@@ -125,6 +135,94 @@ func TestV5HandshakeSignatureEnforcement(t *testing.T) {
 	ver, st, err := protocol.ReadHandshakeStatus(c1)
 	if err != nil || st != protocol.StatusOK || ver != protocol.ProtoVersionLegacy {
 		t.Fatalf("legacy handshake: ver=%d status=%d err=%v", ver, st, err)
+	}
+}
+
+// TestV4DowngradeGate pins the audit round four fix: once a peer has
+// authenticated with a signature-verified v5 session, v4 handshakes for
+// its token are refused (a harvested token must not survive by
+// downgrading). Never-upgraded peers stay admitted until the optional
+// enforcement date passes.
+func TestV4DowngradeGate(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshPub, _ := ssh.NewPublicKey(pub)
+	authKey := string(ssh.MarshalAuthorizedKey(sshPub))
+
+	const tok = "gate-token-1234567890abcdef"
+	var v5State atomic.Bool
+	var alerts []string
+
+	dialV4 := func(opt Options) byte {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		go handleSession(c2, opt, "203.0.113.9")
+		if err := protocol.WriteHandshake(c1, tok); err != nil {
+			t.Fatalf("write v4: %v", err)
+		}
+		_ = c1.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, st, rerr := protocol.ReadHandshakeStatus(c1)
+		if rerr != nil {
+			t.Fatalf("read status: %v", rerr)
+		}
+		return st
+	}
+	dialV5 := func(opt Options) byte {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		go handleSession(c2, opt, "203.0.113.9")
+		salt := protocol.RandomSalt()
+		sig := ed25519.Sign(priv, protocol.HandshakeMsg(tok, salt))
+		if err := protocol.WriteHandshakeV5(c1, tok, salt, sig); err != nil {
+			t.Fatalf("write v5: %v", err)
+		}
+		_ = c1.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, st, rerr := protocol.ReadHandshakeStatus(c1)
+		if rerr != nil {
+			t.Fatalf("read status: %v", rerr)
+		}
+		return st
+	}
+
+	opt := Options{Token: "master", PanelDB: v5Stub{token: tok, pubkey: authKey, alerts: &alerts, v5: &v5State}}
+
+	// 1. Never-upgraded peer: v4 admitted (migration window).
+	if st := dialV4(opt); st != protocol.StatusOK {
+		t.Fatalf("fresh peer v4: status=%d, want OK", st)
+	}
+
+	// 2. One v5 session latches the peer.
+	if st := dialV5(opt); st != protocol.StatusOK {
+		t.Fatalf("v5: status=%d, want OK", st)
+	}
+	if !v5State.Load() {
+		t.Fatal("MarkV5 must latch after a verified v5 session")
+	}
+
+	// 3. The downgrade attempt: v4 for the latched peer is refused.
+	before := len(alerts)
+	if st := dialV4(opt); st != protocol.StatusBadToken {
+		t.Fatalf("downgrade v4: status=%d, want BadToken", st)
+	}
+	if len(alerts) == before {
+		t.Fatal("downgrade attempt must raise a security alert")
+	}
+
+	// 4. Enforcement date in the future: unlatched peer still admitted.
+	futureOpt := opt
+	futureOpt.PanelDB = v5Stub{token: tok, pubkey: authKey, alerts: &alerts, v5: &atomic.Bool{}}
+	futureOpt.RequireV5After = time.Now().Add(24 * time.Hour)
+	if st := dialV4(futureOpt); st != protocol.StatusOK {
+		t.Fatalf("pre-date v4: status=%d, want OK", st)
+	}
+
+	// 5. Enforcement date passed: v4 refused even without v5_seen.
+	pastOpt := futureOpt
+	pastOpt.RequireV5After = time.Now().Add(-time.Hour)
+	if st := dialV4(pastOpt); st != protocol.StatusBadToken {
+		t.Fatalf("post-date v4: status=%d, want BadToken", st)
 	}
 }
 

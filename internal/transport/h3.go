@@ -43,6 +43,26 @@ type H3Options struct {
 
 type h3Transport struct {
 	opt H3Options
+
+	// One shared http3.Transport per tier (audit rounds three/four): every
+	// Dial used to mint a fresh QUIC connection and a fresh handshake per
+	// mux rotation — slower and a "browser reconnecting on a metronome"
+	// flow-shape tell. The transport pools the QUIC connection across
+	// sessions; streams still close independently.
+	trOnce sync.Once
+	tr     *http3.Transport
+	trErr  error
+}
+
+// sharedTransport lazily builds (once) the pooled HTTP/3 transport.
+func (t *h3Transport) sharedTransport(tlsCfg *tls.Config) (*http3.Transport, error) {
+	t.trOnce.Do(func() {
+		t.tr = &http3.Transport{
+			TLSClientConfig: tlsCfg,
+			QUICConfig:      quicDialConfig(),
+		}
+	})
+	return t.tr, t.trErr
 }
 
 // NewH3 builds the HTTP/3 transport tier.
@@ -117,9 +137,10 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 		}
 	}()
 
-	tr := &http3.Transport{
-		TLSClientConfig: tlsCfg,
-		QUICConfig:      quicDialConfig(),
+	tr, terr := t.sharedTransport(tlsCfg)
+	if terr != nil {
+		rcancel()
+		return nil, fmt.Errorf("transport: h3 transport: %w", terr)
 	}
 
 	pr, pw := io.Pipe()
@@ -156,17 +177,14 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 		resp, err = r.resp, r.err
 	case <-time.After(timeout):
 		rcancel()
-		_ = tr.Close()
 		return nil, fmt.Errorf("transport: h3 dial %s: timeout", hostPort)
 	}
 	if err != nil {
-		_ = tr.Close()
 		_ = pw.CloseWithError(err)
 		return nil, fmt.Errorf("transport: h3 dial %s: %w", hostPort, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		_ = tr.Close()
 		_ = pw.CloseWithError(errors.New("transport: h3 status " + resp.Status))
 		return nil, fmt.Errorf("transport: h3 dial %s: status %s", hostPort, resp.Status)
 	}
@@ -174,17 +192,17 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 	return &h3ClientConn{
 		pw:     pw,
 		body:   resp.Body,
-		tr:     tr,
 		cancel: rcancel,
 	}, nil
 }
 
 // h3ClientConn adapts the request/response body pair into a net.Conn for
-// the protocol layers above.
+// the protocol layers above. The shared http3.Transport outlives it: Close
+// ends this session's stream only, leaving the pooled QUIC connection for
+// the next dial.
 type h3ClientConn struct {
 	pw     *io.PipeWriter
 	body   io.ReadCloser
-	tr     *http3.Transport
 	cancel context.CancelFunc
 
 	dlMu    sync.Mutex
@@ -208,10 +226,9 @@ func (c *h3ClientConn) Close() error {
 	c.dlMu.Unlock()
 	_ = c.pw.CloseWithError(errors.New("transport: closed"))
 	_ = c.body.Close()
-	// The transport owns the pooled QUIC connection; closing it tears
-	// down the conn this stream rides. Sessions close the conn when
-	// they rotate, so the lifecycle travels with the tunnel session.
-	_ = c.tr.Close()
+	// Only this stream dies: the shared transport keeps the pooled QUIC
+	// connection for the next mux session (connection reuse is both
+	// faster and a more browser-like flow shape).
 	c.cancel()
 	return nil
 }

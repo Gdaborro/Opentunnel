@@ -36,6 +36,27 @@ func (db *DB) SSHPubKey(token string) string {
 	return pub
 }
 
+// MarkV5 records the first signature-verified v5 session for a token.
+// Sticky: it is the per-peer upgrade latch the downgrade gate keys on.
+// The WHERE clause keeps it a one-time write per peer (no hot-path cost).
+func (db *DB) MarkV5(token string) {
+	if db == nil || token == "" {
+		return
+	}
+	db.Exec(`UPDATE peers SET v5_seen=datetime('now') WHERE token=? AND v5_seen IS NULL`, token)
+}
+
+// V5Seen reports whether the peer has ever authenticated with a v5
+// proof-of-possession handshake.
+func (db *DB) V5Seen(token string) bool {
+	if db == nil || token == "" {
+		return false
+	}
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM peers WHERE token=? AND v5_seen IS NOT NULL`, token).Scan(&n)
+	return n > 0
+}
+
 // KnownPeer reports whether the panel has a row for the token. The
 // in-band control channel mirrors the HTTPS 404 contract with it: unknown
 // tokens must read as "" so purged devices re-register on every network.

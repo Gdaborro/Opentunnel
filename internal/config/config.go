@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -45,6 +46,26 @@ type Server struct {
 	// real client behind the CDN. Spoofed headers from non-CF peers are
 	// ignored.
 	TrustCloudflareIPs bool `toml:"trust_cf_ips"`
+	// RequireV5After auto-sunsets the v4 handshake migration window for
+	// key-registered peers: RFC3339 or YYYY-MM-DD, e.g. "2026-12-01".
+	// Empty (default) keeps per-peer enforcement only (v5_seen sticky
+	// gate). Malformed values fail open — the per-peer gate still
+	// protects every device that has updated.
+	RequireV5After string `toml:"require_v5_after"`
+}
+
+// RequireV5Time parses require_v5_after; zero when unset or malformed.
+func (s *Server) RequireV5Time() time.Time {
+	v := strings.TrimSpace(s.RequireV5After)
+	if v == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 type ClientConf struct {
@@ -264,6 +285,10 @@ key_file  = ""
 	purge_after_days = 14
 	# Offline MaxMind country mmdb for the panel map (empty = disabled).
 	geoip_db = ""
+	# Auto-sunset for the v4 handshake migration window (key-registered
+	# peers only): "2026-12-01" or RFC3339. Empty = per-peer sticky gate
+	# only (every device that has updated once can never be downgraded).
+	require_v5_after = ""
 	`
 	return writeFile(path, t)
 }

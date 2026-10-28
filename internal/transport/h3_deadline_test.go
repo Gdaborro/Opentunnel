@@ -5,8 +5,6 @@ import (
 	"io"
 	"testing"
 	"time"
-
-	"github.com/quic-go/quic-go/http3"
 )
 
 // blockingReader never returns: it models a peer that accepted the stream
@@ -32,7 +30,6 @@ func TestH3ClientDeadlineForceCloses(t *testing.T) {
 	c := &h3ClientConn{
 		pw:     pw,
 		body:   br,
-		tr:     &http3.Transport{}, // Close on a never-used transport is a no-op
 		cancel: cancel,
 	}
 	if err := c.SetDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
@@ -56,7 +53,7 @@ func TestH3ClientClearedDeadlineDoesNotClose(t *testing.T) {
 	pr, pw := io.Pipe()
 	_ = pr
 
-	c := &h3ClientConn{pw: pw, body: br, tr: &http3.Transport{}, cancel: func() {}}
+	c := &h3ClientConn{pw: pw, body: br, cancel: func() {}}
 	_ = c.SetDeadline(time.Now().Add(100 * time.Millisecond))
 	_ = c.SetDeadline(time.Time{}) // clear, as muxSessionFactory does
 	time.Sleep(300 * time.Millisecond)

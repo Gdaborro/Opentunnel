@@ -120,6 +120,10 @@ func migrate(db *sql.DB) error {
 		{"max_bps", "INTEGER DEFAULT 0"},
 		{"quota_bytes", "INTEGER DEFAULT 0"},
 		{"last_ip", "TEXT DEFAULT ''"},
+		// v5_seen: first signature-verified v5 session (audit round four:
+		// sticky upgrade — once a peer proved key possession, v4
+		// handshakes for its token are downgrade attempts).
+		{"v5_seen", "DATETIME"},
 	} {
 		var n int
 		db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name=?`, col.name).Scan(&n)

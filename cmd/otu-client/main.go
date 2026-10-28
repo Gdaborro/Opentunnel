@@ -43,6 +43,12 @@ func setupCrashLog() {
 	if err := os.MkdirAll(filepath.Dir(crashLogPath()), 0o700); err != nil {
 		return
 	}
+	// Rotate at 1 MiB so long-lived deployments never accumulate an
+	// unbounded file (previous runs are kept once as crash.log.old).
+	if fi, err := os.Stat(crashLogPath()); err == nil && fi.Size() > 1<<20 {
+		_ = os.Remove(crashLogPath() + ".old")
+		_ = os.Rename(crashLogPath(), crashLogPath()+".old")
+	}
 	f, err := os.OpenFile(crashLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return

@@ -73,6 +73,9 @@ type Options struct {
 		// (proof-of-possession check) and security alerting.
 		SSHPubKey(token string) string
 		RecordAlert(severity, kind, message string)
+		// Sticky per-peer v5 upgrade latch (downgrade gate).
+		MarkV5(token string)
+		V5Seen(token string) bool
 	}
 	// CurrentPin, when set, returns the relay's CURRENT leaf certificate
 	// fingerprint (hex). Every control response carries it so clients
@@ -83,6 +86,11 @@ type Options struct {
 	// when the TCP peer is a Cloudflare edge (CDN front). Guards, GeoIP
 	// and rate limits then see the client, not the CDN.
 	TrustCloudflareIPs bool
+	// RequireV5After, when non-zero, refuses v4 handshakes from every
+	// key-registered peer after that date — the auto-sunset for the
+	// migration window. The per-peer v5_seen gate is always active
+	// regardless.
+	RequireV5After time.Time
 }
 
 func (o *Options) guard() *Guard {
@@ -280,26 +288,47 @@ func handleSession(stream net.Conn, opt Options, peerIP string) {
 	status := opt.verifyHandshakeToken(hs.Token)
 	// v5 proof-of-possession (audit round three, N-1/N-2): a session
 	// presenting a valid token must also prove possession of the device
-	// key registered for it. A harvested bearer token alone used to
-	// authenticate; now it answers BadToken. Peers without a key on file
-	// (ancient registrations) pass with a log line — all panel-era
-	// registrations carry the key.
-	if status == protocol.StatusOK && hs.Version >= protocol.ProtoVersion {
-		pub := ""
-		if opt.PanelDB != nil {
-			pub = opt.PanelDB.SSHPubKey(hs.Token)
-		}
-		if pub == "" {
-			opt.logger().Printf("server: no registered key for %s — v5 signature not enforced this session", shortToken(hs.Token))
-		} else if !verifyHandshakeSig(pub, hs) {
-			opt.guard().Punish(peerIP)
-			if opt.PanelDB != nil {
+	// key registered for it. Peers without a key on file (ancient
+	// registrations) pass with a log line — all panel-era registrations
+	// carry the key.
+	if status == protocol.StatusOK && opt.PanelDB != nil {
+		pub := opt.PanelDB.SSHPubKey(hs.Token)
+		switch {
+		case hs.Version >= protocol.ProtoVersion:
+			if pub == "" {
+				opt.logger().Printf("server: no registered key for %s — v5 signature not enforced this session", shortToken(hs.Token))
+			} else if !verifyHandshakeSig(pub, hs) {
+				opt.guard().Punish(peerIP)
 				opt.PanelDB.RecordAlert("critical", "security",
 					"handshake signature mismatch for device "+shortToken(hs.Token)+" — possible stolen token")
+				opt.logger().Printf("server: v5 signature mismatch for %s", shortToken(hs.Token))
+				_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
+				return
+			} else {
+				// Sticky per-peer upgrade latch: from this moment a v4
+				// hello for this token is a downgrade attempt.
+				opt.PanelDB.MarkV5(hs.Token)
 			}
-			opt.logger().Printf("server: v5 signature mismatch for %s", shortToken(hs.Token))
-			_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
-			return
+		default: // v4 hello
+			// Downgrade gate (audit round four): a token that has ever
+			// authenticated with v5 must present v5 — v4 skips the
+			// proof-of-possession check, so a harvested token alone used
+			// to survive by downgrading. Keyless and never-v5 peers stay
+			// admitted (migration window, auto-closing per identity).
+			enforce := pub != ""
+			if enforce && !opt.PanelDB.V5Seen(hs.Token) {
+				// Not yet upgraded: only a passed enforcement date can
+				// demand v5 now.
+				enforce = !opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After)
+			}
+			if enforce {
+				opt.guard().Punish(peerIP)
+				opt.PanelDB.RecordAlert("critical", "security",
+					"v4 downgrade attempt for device "+shortToken(hs.Token)+" — possible stolen token (send v5)")
+				opt.logger().Printf("server: v4 downgrade attempt for %s (v5 required)", shortToken(hs.Token))
+				_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
+				return
+			}
 		}
 	}
 	if err := protocol.WriteHandshakeStatus(stream, hs.Version, status); err != nil {
@@ -489,12 +518,16 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 			return
 		}
 	}
-	// Record aggregated visited site (privacy: domain only, no URL, count per peer).
+	// Record aggregated visited site (privacy: domain only, no URL, count
+	// per peer). Off the hot path: a synchronous SQLite write per proxied
+	// connection added latency to every page load; the bounded queue
+	// drops under flood (monitoring data, not billing). Logs are sampled
+	// so a busy relay does not fill journald.
 	if opt.PanelDB != nil && token != "" && target.Domain != "" {
-		opt.PanelDB.RecordVisit(token, target.Domain)
-		// Abuse protection: per-peer rate limit - if same peer hits >100 domains in 10s, temp kick
-		// (handled via Guard, but we also log)
-		opt.logger().Printf("visit %s -> %s", shortToken(token), target.Domain)
+		recordVisitAsync(opt.PanelDB, token, target.Domain)
+		if visitLogN.Add(1)%8 == 1 {
+			opt.logger().Printf("visit %s -> %s", shortToken(token), target.Domain)
+		}
 	}
 
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -627,6 +660,41 @@ var (
 	replayOnce    sync.Once
 	defaultReplay *protocol.ReplayCache
 )
+
+// visitLogN samples the per-connection visit log line (1-in-8).
+var visitLogN atomic.Uint64
+
+type visitRecorder interface {
+	RecordVisit(token, domain string)
+}
+
+var (
+	visitOnce sync.Once
+	visitCh   chan visitEntry
+)
+
+type visitEntry struct {
+	db            visitRecorder
+	token, domain string
+}
+
+// recordVisitAsync queues a visit record onto a bounded worker (started
+// on first use). Dropped under flood by design; at most one write in
+// flight, so SQLite contention stays bounded.
+func recordVisitAsync(db visitRecorder, token, domain string) {
+	visitOnce.Do(func() {
+		visitCh = make(chan visitEntry, 1024)
+		go func() {
+			for e := range visitCh {
+				e.db.RecordVisit(e.token, e.domain)
+			}
+		}()
+	})
+	select {
+	case visitCh <- visitEntry{db, token, domain}:
+	default:
+	}
+}
 
 // serveCtrlStream answers one in-band control request (status poll or
 // health telemetry) on a mux stream. It exists because TLS-intercepting

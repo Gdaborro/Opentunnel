@@ -23,8 +23,9 @@ type Handler struct {
 	autoApprove bool
 	geo         *GeoIP // optional; nil = no country resolution
 
-	rlMu  sync.Mutex
-	rlMap map[string]*regLimit // per-IP registration rate limit
+	rlMu    sync.Mutex
+	rlMap   map[string]*regLimit // per-IP rate-limit buckets (bucket|ip)
+	rlSwept time.Time            // last opportunistic expiry sweep
 
 	// OnApprove installs a device's SSH public key into the ssh tier's
 	// authorized_keys when an admin approves it (nil = not configured).
@@ -64,6 +65,18 @@ func (h *Handler) rateAllowed(ip string, max int, window time.Duration, bucket s
 	h.rlMu.Lock()
 	defer h.rlMu.Unlock()
 	now := time.Now()
+	// Opportunistic sweep: without it, every IP that ever touched a
+	// public endpoint stays in the map forever (a source-rotating
+	// attacker grows panel memory unboundedly). Cheap because it runs at
+	// most once per window.
+	if now.Sub(h.rlSwept) > window {
+		for k, v := range h.rlMap {
+			if now.Sub(v.windowStart) > 10*window {
+				delete(h.rlMap, k)
+			}
+		}
+		h.rlSwept = now
+	}
 	r := h.rlMap[key]
 	if r == nil || now.Sub(r.windowStart) > window {
 		r = &regLimit{windowStart: now}
@@ -127,7 +140,45 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 func (h *Handler) Handler() http.Handler {
 	mux := http.NewServeMux()
 	h.Mount(mux)
-	return mux
+	return securityHeaders(csrfOriginCheck(mux))
+}
+
+// securityHeaders applies the control-plane baseline (audit round three,
+// O-1): no framing, no MIME sniffing, no referrer leakage, and a CSP that
+// allows only same-origin scripts/styles (the SPA is fully embedded).
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
+				"img-src 'self' data:; font-src 'self'; connect-src 'self'; "+
+				"frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// csrfOriginCheck rejects cross-origin state-changing requests. The admin
+// session cookie is SameSite=Strict already; this is the second lock: a
+// non-GET request whose Origin names a different site is refused before
+// any handler runs. Requests without an Origin (curl, the relay's own
+// proxy carries none for server-side calls) pass — they cannot be CSRF.
+func csrfOriginCheck(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				want := "http://" + r.Host
+				wantTLS := "https://" + r.Host
+				if origin != want && origin != wantTLS {
+					http.Error(w, "cross-origin request refused", http.StatusForbidden)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) apiSetup(w http.ResponseWriter, r *http.Request) {
