@@ -163,15 +163,30 @@ func securityHeaders(next http.Handler) http.Handler {
 // csrfOriginCheck rejects cross-origin state-changing requests. The admin
 // session cookie is SameSite=Strict already; this is the second lock: a
 // non-GET request whose Origin names a different site is refused before
-// any handler runs. Requests without an Origin (curl, the relay's own
-// proxy carries none for server-side calls) pass — they cannot be CSRF.
+// any handler runs. Requests without an Origin (curl, server-side calls)
+// pass — they cannot be CSRF.
+//
+// Host comparison must survive the relay's reverse proxy, which rewrites
+// r.Host to the loopback upstream (production incident 2026-10-28: the
+// original comparison 403'd every browser login). The relay stamps the
+// original, browser-facing host in X-Otu-Original-Host before rewriting —
+// overwritten relay-side so the value is unspoofable from outside.
 func csrfOriginCheck(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if origin := r.Header.Get("Origin"); origin != "" {
-				want := "http://" + r.Host
-				wantTLS := "https://" + r.Host
-				if origin != want && origin != wantTLS {
+				hosts := []string{r.Host}
+				if fh := r.Header.Get("X-Otu-Original-Host"); fh != "" {
+					hosts = append(hosts, fh)
+				}
+				ok := false
+				for _, h := range hosts {
+					if origin == "http://"+h || origin == "https://"+h {
+						ok = true
+						break
+					}
+				}
+				if !ok {
 					http.Error(w, "cross-origin request refused", http.StatusForbidden)
 					return
 				}

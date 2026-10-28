@@ -76,9 +76,13 @@ func main() {
 	ph := panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo)
 
 	// permitopen pins device-key forwarding to the relay's internal ws
-	// listener (the ssh tier's direct-tcpip target); permitlisten="" denies
-	// remote forwards entirely (the client never uses -R). Defaults match
-	// the relay's listen_internal; custom deployments stay consistent.
+	// listener (the ssh tier's direct-tcpip target). Defaults match the
+	// relay's listen_internal; custom deployments stay consistent.
+	// NOTE: permitlisten="" was tried for the remote-forward direction and
+	// REVERTED — sshd's option parser rejects the empty-string form, skips
+	// the whole key line and denies the device (production incident
+	// 2026-10-28: every school device lost the ssh tier). Remote forwards
+	// bind to loopback by default (no GatewayPorts), which is acceptable.
 	permitTarget := "127.0.0.1:8081"
 	if cfg.ListenInternal != "" {
 		permitTarget = cfg.ListenInternal
@@ -102,7 +106,7 @@ func main() {
 		if _, err := os.Stat(akPath); err != nil {
 			return
 		}
-		canonical := `restrict,port-forwarding,permitopen="` + permitTarget + `",permitlisten="" ` + pub
+		canonical := `restrict,port-forwarding,permitopen="` + permitTarget + `" ` + pub
 		content := readFileString(akPath)
 		if strings.Contains(content, canonical) {
 			return // already current

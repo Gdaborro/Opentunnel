@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: vet
+        run: go vet ./...
+      - name: gofmt check
+        run: |
+          OUT=$(gofmt -l .)
+          if [ -n "$OUT" ]; then echo "unformatted: $OUT"; exit 1; fi
+        if: runner.os == 'Linux'
+      - name: tests (race, includes test/security regression suite)
+        run: go test -race -timeout 300s ./...
+      - name: govulncheck
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        if: runner.os == 'Linux'
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: repro metadata
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: cross-compile release binaries
+        run: |
+          LDFLAGS="-s -w"
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-client-windows-amd64.exe ./cmd/otu-client
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-server-linux-amd64 ./cmd/otu-server
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-server-linux-arm64 ./cmd/otu-server
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-panel-linux-amd64 ./cmd/otu-panel
+      - name: SBOM (module inventory)
+        run: |
+          go version -m dist/otu-client-windows-amd64.exe | sed 's/\t/ /g' > dist/SBOM-otu-client.txt
+          go version -m dist/otu-server-linux-amd64 | sed 's/\t/ /g' > dist/SBOM-otu-server.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opentunnel-binaries
+          path: dist/

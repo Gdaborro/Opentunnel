@@ -239,8 +239,13 @@ func main() {
 		// the CDN front) before proxying: the panel's per-IP rate limits
 		// and login lockout key on it, and the header overwrites anything
 		// the outside sent — unspoofable from beyond the relay.
+		// The original browser-facing Host is preserved the same way: the
+		// Director below rewrites r.Host to the loopback upstream, and the
+		// panel's CSRF origin check needs the host the browser actually
+		// used (production incident 2026-10-28).
 		stampIP := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			r.Header.Set("X-Otu-Client-IP", server.ResolveClientIP(r, cfg.TrustCloudflareIPs))
+			r.Header.Set("X-Otu-Original-Host", r.Host)
 			proxy.ServeHTTP(w, r)
 		})
 		mux := http.NewServeMux()

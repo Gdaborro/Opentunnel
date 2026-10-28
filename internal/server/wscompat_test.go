@@ -64,10 +64,10 @@ func (k killSwitchStub) BanReason(string) string            { return "" }
 func (k killSwitchStub) TouchPeer(string)                   {}
 func (k killSwitchStub) KnownPeer(string) bool              { return true }
 func (k killSwitchStub) RecordVisit(string, string)         {}
-func (k killSwitchStub) SSHPubKey(string) string   { return "" }
+func (k killSwitchStub) SSHPubKey(string) string            { return "" }
 func (k killSwitchStub) RecordAlert(string, string, string) {}
-func (k killSwitchStub) MarkV5(string)             {}
-func (k killSwitchStub) V5Seen(string) bool        { return false }
+func (k killSwitchStub) MarkV5(string)                      {}
+func (k killSwitchStub) V5Seen(string) bool                 { return false }
 
 // TestTunnelPathServesDecoyWithoutUpgrade: a plain GET on the tunnel path
 // must answer with the site's own 404 page — the Go-native "404 page not
