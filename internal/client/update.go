@@ -211,13 +211,13 @@ func socksDialContext(ctx context.Context, socksAddr, network, addr string) (net
 // sha256 line all ride channels a middlebox can rewrite, but a forged
 // binary cannot produce a valid signature for the offline private key.
 func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
-	assetName := updateAssetWin
-	if runtime.GOOS != "windows" {
-		return errors.New("auto-update: unsupported platform " + runtime.GOOS)
-	}
+	// Metadata validation first (platform-independent): the version floor
+	// and the signature requirement must hold anywhere this code runs —
+	// and must be exercisable by tests on every OS.
 	if belowMinTag(rel.TagName) {
 		return fmt.Errorf("auto-update: release %s is below the minimum supported version %s — refusing", rel.TagName, MinUpdateTag)
 	}
+	assetName := updateAssetWin
 	var url, sigURL string
 	for _, a := range rel.Assets {
 		switch a.Name {
@@ -237,6 +237,10 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 		// forged tag over a real old binary fails verification too
 		// (audit round three, N-3).
 		return fmt.Errorf("auto-update: release %s has no manifest signature — refusing install", rel.TagName)
+	}
+	// The swap/re-exec machinery is Windows-only.
+	if runtime.GOOS != "windows" {
+		return errors.New("auto-update: unsupported platform " + runtime.GOOS)
 	}
 
 	exe, err := os.Executable()
