@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react"
 import { api, type ServerHealth } from "@/lib/api"
+import { Button } from "@/components/ui/button"
 import {
   Card,
   CardContent,
@@ -13,26 +14,65 @@ import { Badge } from "@/components/ui/badge"
 import { PowerIcon, ShieldAlertIcon, InfoIcon } from "lucide-react"
 import { formatDuration } from "@/lib/format"
 
+type KillDetail = {
+  kill_switch_reason?: string
+  kill_switch_allow?: string[]
+}
+
 export function SystemPage() {
   const [kill, setKill] = useState(false)
   const [health, setHealth] = useState<ServerHealth | null>(null)
   const [loaded, setLoaded] = useState(false)
+  const [reason, setReason] = useState("")
+  const [allow, setAllow] = useState("")
+  const [devices, setDevices] = useState<{ token: string; device_name?: string }[]>([])
+  const [saved, setSaved] = useState("")
 
   const load = useCallback(() => {
     api
       .settings()
       .then((s) => {
         setKill(s.kill_switch)
+        const d = s as KillDetail
+        setReason(d.kill_switch_reason ?? "")
+        setAllow((d.kill_switch_allow ?? []).join("\n"))
         setLoaded(true)
       })
       .catch(() => {})
     api.serverHealth().then(setHealth).catch(() => {})
+    fetch("/admin/api/devices")
+      .then((r) => r.json())
+      .then((list) => setDevices(list || []))
+      .catch(() => {})
   }, [])
   useEffect(load, [load])
 
   const toggleKill = (on: boolean) => {
     setKill(on)
     api.setKillSwitch(on).catch(() => setKill(!on))
+  }
+
+  const saveKillDetail = () => {
+    fetch("/admin/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kill_switch: kill,
+        kill_switch_reason: reason,
+        kill_switch_allow: allow.split("\n").map((t) => t.trim()).filter(Boolean),
+      }),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        setSaved("saved")
+        setTimeout(() => setSaved(""), 3000)
+      })
+      .catch((e) => setSaved(`save failed: ${e.message}`))
+  }
+
+  const addAllowed = (token: string) => {
+    const cur = allow.split("\n").map((t) => t.trim()).filter(Boolean)
+    if (!cur.includes(token)) setAllow([...cur, token].join("\n"))
   }
 
   return (
@@ -59,6 +99,44 @@ export function SystemPage() {
             </p>
           </div>
           {loaded && <Switch checked={kill} onCheckedChange={toggleKill} />}
+        </CardContent>
+        <CardContent className="flex flex-col gap-3 border-t border-border/50 pt-4 text-sm">
+          <div className="flex flex-col gap-1.5">
+            <span className="font-medium">Reason shown to every client while down</span>
+            <textarea
+              className="min-h-14 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              placeholder="Shut down till further notice"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <span className="font-medium">Allowed devices keep browsing (one token per line)</span>
+            <textarea
+              className="min-h-11 w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
+              value={allow}
+              onChange={(e) => setAllow(e.target.value)}
+            />
+          </div>
+          {devices.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {devices.slice(0, 12).map((d) => (
+                <Button
+                  key={d.token}
+                  variant="outline"
+                  size="sm"
+                  onClick={() => addAllowed(d.token)}
+                  title={d.token}
+                >
+                  {d.device_name || d.token.slice(0, 8)} +
+                </Button>
+              ))}
+            </div>
+          )}
+          <div className="flex items-center gap-3">
+            <Button onClick={saveKillDetail}>Save reason + allowlist</Button>
+            <span className="text-xs text-muted-foreground">{saved}</span>
+          </div>
         </CardContent>
       </Card>
 
