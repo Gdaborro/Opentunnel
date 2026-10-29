@@ -79,8 +79,9 @@ func serveUDPStream(rw io.ReadWriteCloser, opt Options, token, peerStatus string
 		if err != nil {
 			return
 		}
-		// Kill switch drops datagrams while suspended.
-		if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
+		// Kill switch drops datagrams while suspended — the operator's
+		// allowlisted devices keep their UDP relay.
+		if opt.PanelDB != nil && opt.PanelDB.KillSwitch() && !opt.PanelDB.KillSwitchAllow(token) {
 			continue
 		}
 		// Blocklist applies to domains and IP literals alike.

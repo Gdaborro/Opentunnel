@@ -253,6 +253,56 @@ func (db *DB) SetKillSwitch(on bool) {
 	killMu.Unlock()
 }
 
+// kill-detail cache: the admin's reason string and the token allowlist
+// that keeps the operator's own devices connected while the switch is
+// engaged. Same 1s cache shape as the switch itself.
+var (
+	killReasonCache  string
+	killAllowCache   map[string]bool
+	killDetailLoaded time.Time
+)
+
+func (db *DB) killDetail() (string, map[string]bool) {
+	if db == nil {
+		return "", nil
+	}
+	killMu.Lock()
+	defer killMu.Unlock()
+	if time.Since(killDetailLoaded) < time.Second && killAllowCache != nil {
+		return killReasonCache, killAllowCache
+	}
+	reason := db.Setting("kill_switch_reason")
+	allow := map[string]bool{}
+	for _, t := range strings.Split(db.Setting("kill_switch_allow"), ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			allow[t] = true
+		}
+	}
+	killReasonCache, killAllowCache, killDetailLoaded = reason, allow, time.Now()
+	return reason, allow
+}
+
+// KillSwitchReason returns the admin's reason shown on the client's
+// traffic-down page ("" when unset).
+func (db *DB) KillSwitchReason() string { r, _ := db.killDetail(); return r }
+
+// KillSwitchAllow reports whether a token keeps tunneling while the kill
+// switch is engaged (the operator's own devices).
+func (db *DB) KillSwitchAllow(token string) bool {
+	_, allow := db.killDetail()
+	return allow[token]
+}
+
+// KillSwitchAllowList returns the allowlist for the admin API/UI.
+func (db *DB) KillSwitchAllowList() []string {
+	_, allow := db.killDetail()
+	out := make([]string, 0, len(allow))
+	for t := range allow {
+		out = append(out, t)
+	}
+	return out
+}
+
 // AutoAcceptUntil returns the current auto-accept deadline (zero when off).
 func (db *DB) AutoAcceptUntil() time.Time {
 	raw := db.Setting("auto_accept_until")

@@ -115,6 +115,9 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	}))
 	mux.Handle("/admin/api/login", http.HandlerFunc(h.apiLogin))
 	mux.Handle("/admin/logout", http.HandlerFunc(h.logout))
+	// Standalone kill-switch console (plain HTML; the SPA bundle predates
+	// the reason/allowlist fields and there is no rebuild toolchain).
+	mux.Handle("/admin/killswitch", h.auth.RequireAuth(http.HandlerFunc(h.killswitchPage)))
 	mux.Handle("/admin/api/peers", h.auth.RequireAuth(http.HandlerFunc(h.apiPeers)))
 	mux.Handle("/admin/api/peers/", h.auth.RequireAuth(http.HandlerFunc(h.apiPeerAction)))
 	mux.Handle("/admin/api/blocklist", h.auth.RequireAuth(http.HandlerFunc(h.apiBlocklist)))
@@ -337,6 +340,18 @@ func (h *Handler) apiPeers(w http.ResponseWriter, r *http.Request) {
 		peers = append(peers, p)
 	}
 	json.NewEncoder(w).Encode(peers)
+}
+
+// shortTokens abbreviates a token list for event log text.
+func shortTokens(toks []string) []string {
+	out := make([]string, 0, len(toks))
+	for _, t := range toks {
+		if len(t) > 8 {
+			t = t[:8]
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // validTokenCharset reports whether a token is safe to use in URL paths
@@ -584,7 +599,9 @@ func (h *Handler) apiEvents(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		resp := map[string]any{
-			"kill_switch": h.db.KillSwitch(),
+			"kill_switch":        h.db.KillSwitch(),
+			"kill_switch_reason": h.db.KillSwitchReason(),
+			"kill_switch_allow":  h.db.KillSwitchAllowList(),
 		}
 		if until := h.db.AutoAcceptUntil(); !until.IsZero() {
 			resp["auto_accept_until"] = until.Format(time.RFC3339)
@@ -596,12 +613,42 @@ func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		KillSwitch    *bool `json:"kill_switch"`
-		AutoAcceptMin *int  `json:"auto_accept_minutes"` // >0 open for N minutes; 0 close now
+		KillSwitch    *bool     `json:"kill_switch"`
+		KillReason    *string   `json:"kill_switch_reason"`
+		KillAllow     *[]string `json:"kill_switch_allow"`
+		AutoAcceptMin *int      `json:"auto_accept_minutes"` // >0 open for N minutes; 0 close now
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || (req.KillSwitch == nil && req.AutoAcceptMin == nil) {
-		http.Error(w, "kill_switch or auto_accept_minutes required", 400)
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil ||
+		(req.KillSwitch == nil && req.AutoAcceptMin == nil && req.KillReason == nil && req.KillAllow == nil) {
+		http.Error(w, "kill_switch, kill_switch_reason, kill_switch_allow or auto_accept_minutes required", 400)
 		return
+	}
+	if req.KillReason != nil {
+		reason := strings.TrimSpace(*req.KillReason)
+		if len(reason) > 500 {
+			http.Error(w, "reason too long (max 500)", 400)
+			return
+		}
+		h.db.SetSetting("kill_switch_reason", reason)
+	}
+	if req.KillAllow != nil {
+		if len(*req.KillAllow) > 64 {
+			http.Error(w, "allowlist too large (max 64)", 400)
+			return
+		}
+		clean := make([]string, 0, len(*req.KillAllow))
+		for _, t := range *req.KillAllow {
+			if t = strings.TrimSpace(t); t == "" {
+				continue
+			}
+			if !validTokenCharset(t) {
+				http.Error(w, "invalid token in allowlist", 400)
+				return
+			}
+			clean = append(clean, t)
+		}
+		h.db.SetSetting("kill_switch_allow", strings.Join(clean, ","))
+		h.db.RecordEvent("kill-switch", "allowlist updated ("+strings.Join(shortTokens(clean), ", ")+")")
 	}
 	if req.AutoAcceptMin != nil {
 		until := h.db.SetAutoAccept(*req.AutoAcceptMin)

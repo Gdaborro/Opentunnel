@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,7 +48,11 @@ func TestWSPathsAcceptSubprotocollessDials(t *testing.T) {
 }
 
 // killSwitchStub implements server.Options.PanelDB for handler-level tests.
-type killSwitchStub struct{ on bool }
+type killSwitchStub struct {
+	on     bool
+	reason string
+	allow  map[string]bool
+}
 
 func (k killSwitchStub) CheckToken(string) (string, string, string, error) {
 	return "approved", "", "", nil
@@ -56,6 +61,8 @@ func (k killSwitchStub) RecordTraffic(string, int64, int64) {}
 func (k killSwitchStub) IsBlocked(string) bool              { return false }
 func (k killSwitchStub) BlockWhy(string) string             { return "" }
 func (k killSwitchStub) KillSwitch() bool                   { return k.on }
+func (k killSwitchStub) KillSwitchReason() string           { return k.reason }
+func (k killSwitchStub) KillSwitchAllow(tok string) bool    { return k.allow[tok] }
 func (k killSwitchStub) PeerLimits(string) (int64, int64)   { return 0, 0 }
 func (k killSwitchStub) SetPeerIP(string, string)           {}
 func (k killSwitchStub) RecordHealth(string, string, string, string, float64, float64, float64, int64, float64, float64, float64) {
@@ -97,29 +104,50 @@ func TestTunnelPathServesDecoyWithoutUpgrade(t *testing.T) {
 	}
 }
 
-// TestKillSwitchServesDecoy: while suspended the endpoint answers with the
-// site's own page and a 503 status — never a framework text blob.
-func TestKillSwitchServesDecoy(t *testing.T) {
-	h := Handler(Options{Token: "test-token-1234567890abcdef", PanelDB: killSwitchStub{on: true}})
-	srv := httptest.NewServer(h)
-	defer srv.Close()
+// TestKillSwitchBlocksStreamsWithReason: the kill switch is enforced
+// per-stream now (upgrades are NOT refused — sessions must establish so
+// clients can render the down page, and the allowlisted operator device
+// must be able to connect). Non-allowlisted streams answer StatusBlocked
+// with the "down:<admin reason>" payload; allowlisted tokens bypass it.
+func TestKillSwitchBlocksStreamsWithReason(t *testing.T) {
+	const tok = "blocked-device-token-123456"
+	stub := killSwitchStub{on: true, reason: "shut down till further notice"}
 
-	req, _ := http.NewRequest("GET", srv.URL+protocol.DefaultWSPath, nil)
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("get: %v", err)
+	run := func(st killSwitchStub, token string) (byte, string) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		go relayTarget(protocol.ATypIPv4, c2, Options{Token: "master", PanelDB: st}, token, "approved", "", protocol.ProtoVersionLegacy)
+		// Target address bytes in a goroutine: net.Pipe is unbuffered and
+		// the kill-switch path answers without reading the address, so a
+		// synchronous write here deadlocks both ends.
+		go func() { _, _ = c1.Write([]byte{127, 0, 0, 1, 0, 1}) }()
+		_ = c1.SetReadDeadline(time.Now().Add(3 * time.Second))
+		resp := make([]byte, 2)
+		if _, err := io.ReadFull(c1, resp); err != nil {
+			t.Fatalf("status read: %v", err)
+		}
+		reason := ""
+		if resp[1] == protocol.StatusBlocked {
+			if tokStr, err := protocol.ReadToken(c1); err == nil {
+				reason = tokStr
+			}
+		}
+		return resp[1], reason
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
+
+	st, reason := run(stub, tok)
+	if st != protocol.StatusBlocked {
+		t.Fatalf("blocked device: status=%d, want StatusBlocked", st)
 	}
-	if !strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
-		t.Fatalf("content-type = %q, want the decoy page (text/html)", resp.Header.Get("Content-Type"))
+	if reason != "blocked:down:shut down till further notice" {
+		t.Fatalf("reason payload = %q", reason)
 	}
-	if len(body) == 0 {
-		t.Fatal("empty body: the kill switch must serve the decoy page")
+
+	// Allowlisted token bypasses the switch (dial to the unreachable test
+	// target fails, which proves relayTarget proceeded past the gate).
+	allowed := stub
+	allowed.allow = map[string]bool{tok: true}
+	if st, _ := run(allowed, tok); st == protocol.StatusBlocked {
+		t.Fatal("allowlisted device must not be blocked by the kill switch")
 	}
 }

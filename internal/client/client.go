@@ -423,6 +423,13 @@ func (c *Client) DialTunnel(ctx context.Context, target *protocol.Address) (net.
 				} else if len(reason) >= 8 && reason[:8] == "blocked:" {
 					kind = "blocked"
 					reason = reason[8:]
+					// Kill-switch down page: "down:<admin reason>" renders a
+					// distinct "traffic temporarily down" notice, not a
+					// domain block notice.
+					if len(reason) >= 5 && reason[:5] == "down:" {
+						kind = "down"
+						reason = reason[5:]
+					}
 				}
 				return nil, &BlockedError{Kind: kind, Reason: reason}
 			}

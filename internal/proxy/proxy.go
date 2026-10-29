@@ -147,7 +147,7 @@ func isBlockedErr(err error) bool {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "banned:") || strings.Contains(s, "kicked:") || strings.Contains(s, "blocked:") || strings.Contains(s, "StatusBlocked") || strings.Contains(s, "blocked")
+	return strings.Contains(s, "banned:") || strings.Contains(s, "kicked:") || strings.Contains(s, "down:") || strings.Contains(s, "blocked:") || strings.Contains(s, "StatusBlocked") || strings.Contains(s, "blocked")
 }
 
 func blockReason(err error) string {
@@ -155,7 +155,7 @@ func blockReason(err error) string {
 		return "blocked by policy"
 	}
 	s := err.Error()
-	for _, p := range []string{"banned:", "kicked:", "blocked:", "kicked-silent:"} {
+	for _, p := range []string{"banned:", "kicked:", "down:", "blocked:", "kicked-silent:"} {
 		if idx := strings.Index(s, p); idx != -1 {
 			reason := s[idx+len(p):]
 			if i := strings.Index(reason, ":"); i != -1 && p == "kicked:" {
@@ -191,7 +191,16 @@ func serveBlockPageHTML(addr *protocol.Address, err error) string {
 	badgeLabel := "Blocked"
 	title := "Access blocked"
 	desc := ""
-	if err != nil && strings.Contains(err.Error(), "banned:") {
+	if err != nil && strings.Contains(err.Error(), "down:") {
+		// Kill switch: the network is intentionally down; show the
+		// administrator's reason on every site. The device stays
+		// connected and registered — nothing to do but wait.
+		kind = "down"
+		badgeClass = "badge-destructive"
+		badgeLabel = "Down"
+		title = "Traffic temporarily down"
+		desc = fmt.Sprintf("<strong>%s</strong><br>Access resumes automatically when the administrator brings the tunnel back up. This device stays registered — nothing to do on your end.", escHTML(reason))
+	} else if err != nil && strings.Contains(err.Error(), "banned:") {
 		kind = "banned"
 		badgeClass = "badge-destructive"
 		badgeLabel = "Banned"

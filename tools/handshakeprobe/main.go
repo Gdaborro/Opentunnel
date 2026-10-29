@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -119,8 +120,62 @@ func main() {
 		fmt.Println("v4 read:", err)
 		os.Exit(1)
 	}
-	conn.Close()
 	fmt.Printf("v4 (no signature): ver=%d status=%d (%s)\n", ver, st, statuses[st])
+	if st != protocol.StatusOK {
+		conn.Close()
+		return
+	}
+	// Complete the session the way a legacy client does (salt, AEAD
+	// stream, client token) and request a target — this exposes
+	// kill-switch/down states and dial verdicts without a full client.
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	tsalt := protocol.RandomSalt()
+	if werr := protocol.WriteSalt(conn, tsalt); werr != nil {
+		fmt.Println("salt write:", werr)
+		os.Exit(1)
+	}
+	sec, serr := protocol.ClientSideSecureStream(conn, tok, tsalt, protocol.ProfileFor("fast"))
+	if serr != nil {
+		fmt.Println("secure stream:", serr)
+		os.Exit(1)
+	}
+	if werr := protocol.WriteToken(sec, tok); werr != nil {
+		fmt.Println("token write:", werr)
+		os.Exit(1)
+	}
+	if tresp, terr := protocol.ReadToken(sec); terr != nil {
+		fmt.Println("token response:", terr)
+		os.Exit(1)
+	} else if tresp != "ok" {
+		fmt.Printf("token response: %q\n", tresp)
+		conn.Close()
+		return
+	}
+	taddr, _ := protocol.ParseAddress("example.com", 80)
+	if werr := taddr.Encode(sec); werr != nil {
+		fmt.Println("target write:", werr)
+		os.Exit(1)
+	}
+	hdr := make([]byte, 2)
+	if _, rerr := io.ReadFull(sec, hdr); rerr != nil {
+		fmt.Println("target response:", rerr)
+		os.Exit(1)
+	}
+	switch hdr[1] {
+	case protocol.StatusOK:
+		fmt.Println("target request: OK (relay dialed the target)")
+	case protocol.StatusBlocked:
+		reason := ""
+		if tokStr, rerr := protocol.ReadToken(sec); rerr == nil {
+			reason = tokStr
+		}
+		fmt.Printf("target request: BLOCKED — %s\n", reason)
+	case protocol.StatusDialFailed:
+		fmt.Println("target request: dial failed (relay reachable, target unreachable)")
+	default:
+		fmt.Printf("target request: status=%d\n", hdr[1])
+	}
+	conn.Close()
 }
 
 // clientSign loads the device key and signs HandshakeMsg(token, salt),

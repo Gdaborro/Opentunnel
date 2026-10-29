@@ -60,6 +60,11 @@ type Options struct {
 		IsBlocked(domain string) bool
 		BlockWhy(domain string) string
 		KillSwitch() bool
+		// Kill-switch detail: the admin's reason (shown on the client's
+		// traffic-down page) and the token allowlist that keeps the
+		// operator's own devices tunneling while the switch is engaged.
+		KillSwitchReason() string
+		KillSwitchAllow(token string) bool
 		PeerLimits(token string) (maxBps, quotaBytes int64)
 		SetPeerIP(token, ip string)
 		// Control channel (v0.9.23): in-band status/health mirroring the
@@ -142,12 +147,10 @@ func Handler(opt Options) http.Handler {
 				return
 			}
 			defer release()
-			if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = w.Write(decoy.IndexPage())
-				return
-			}
+			// NO upgrade-level kill-switch block: sessions must establish
+			// so clients can render the traffic-down page, and the
+			// allowlisted operator device must be able to connect.
+			// Enforcement is per-stream in relayTarget/serveUDPStream.
 			flusher, _ := w.(http.Flusher)
 			w.Header().Set("Content-Type", "application/octet-stream")
 			// Respond immediately: the client's dial cannot complete
@@ -176,15 +179,8 @@ func Handler(opt Options) http.Handler {
 			decoyHandler.ServeHTTP(w, r)
 			return
 		}
-		// Global kill switch: refuse new tunnels outright. Same front page as
-		// the rest of the site, 503 status only — no framework tell, no text
-		// naming what stopped.
-		if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write(decoy.IndexPage())
-			return
-		}
+		// NO upgrade-level kill-switch block (see the h3 branch above):
+		// per-stream enforcement delivers the reason to clients.
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			// NO subprotocol negotiation: echoing a purpose-built
 			// subprotocol back answers "is this opentunnel?" in a single
@@ -469,10 +465,17 @@ func handleSession(stream net.Conn, opt Options, peerIP string) {
 // sessions and by every multiplexed stream. Traffic is recorded per-token.
 func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string, ver byte) {
 	defer rw.Close()
-	// Global kill switch: block every new stream while suspended.
-	if opt.PanelDB != nil && opt.PanelDB.KillSwitch() {
+	// Global kill switch: block every new stream while suspended — except
+	// the operator's allowlisted devices. The wire reason carries the
+	// "down:" prefix and the admin's text, so the client renders the
+	// traffic-down page with that exact message on every site.
+	if opt.PanelDB != nil && opt.PanelDB.KillSwitch() && !opt.PanelDB.KillSwitchAllow(token) {
 		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
-		_ = protocol.WriteToken(rw, "blocked:service suspended (kill switch)")
+		reason := strings.TrimSpace(opt.PanelDB.KillSwitchReason())
+		if reason == "" {
+			reason = "shut down till further notice"
+		}
+		_ = protocol.WriteToken(rw, "blocked:down:"+reason)
 		return
 	}
 	// ISP-level ban/kick handling

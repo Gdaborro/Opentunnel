@@ -36,6 +36,8 @@ func (v v5Stub) RecordTraffic(string, int64, int64) {}
 func (v v5Stub) IsBlocked(string) bool              { return false }
 func (v v5Stub) BlockWhy(string) string             { return "" }
 func (v v5Stub) KillSwitch() bool                   { return false }
+func (v v5Stub) KillSwitchReason() string           { return "" }
+func (v v5Stub) KillSwitchAllow(string) bool        { return false }
 func (v v5Stub) PeerLimits(string) (int64, int64)   { return 0, 0 }
 func (v v5Stub) SetPeerIP(string, string)           {}
 func (v v5Stub) RecordHealth(string, string, string, string, float64, float64, float64, int64, float64, float64, float64) {
