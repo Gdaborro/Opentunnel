@@ -21,8 +21,9 @@ import (
 // Destinations pass the same SSRF filter and blocklist as TCP targets.
 // Identity rules apply identically to the TCP relay (pentest 2026-10-25):
 // banned/kicked devices get nothing, bytes are accounted per device, and
-// per-device bandwidth caps pace datagram writes.
-func serveUDPStream(rw io.ReadWriteCloser, opt Options, token, peerStatus string) {
+// per-device bandwidth caps pace datagram writes. ssh ingress adds the
+// ssh-tier containment policy (sshtier.go): cap + daily budget.
+func serveUDPStream(rw io.ReadWriteCloser, opt Options, token, peerStatus, ingress string) {
 	defer rw.Close()
 
 	switch peerStatus {
@@ -32,19 +33,22 @@ func serveUDPStream(rw io.ReadWriteCloser, opt Options, token, peerStatus string
 		return
 	}
 
-	// Per-device cap: datagrams used to leave unmeasured; the same token
-	// bucket that paces TCP streams now paces datagram writes.
+	// Per-device cap + ssh-tier containment: datagrams used to leave
+	// unmeasured; the same policy that paces TCP streams now paces
+	// datagram writes and counts against the device's ssh daily budget.
+	pol := resolveStreamPolicy(opt, token, ingress)
 	var lim *rate.Limiter
-	if opt.PanelDB != nil && token != "" {
-		if maxBps, _ := opt.PanelDB.PeerLimits(token); maxBps > 0 {
-			lim = rate.NewLimiter(rate.Limit(maxBps), int(maxBps))
-		}
+	if pol.limitBps > 0 {
+		lim = rate.NewLimiter(rate.Limit(pol.limitBps), int(pol.limitBps))
 	}
 
 	var up, down atomic.Int64
 	if opt.PanelDB != nil && token != "" {
 		defer func() {
 			opt.PanelDB.RecordTraffic(token, up.Load(), down.Load())
+			if pol.budgetBytes > 0 {
+				sshBudgetAdd(token, up.Load()+down.Load())
+			}
 		}()
 	}
 

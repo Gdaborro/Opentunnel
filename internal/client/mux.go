@@ -255,12 +255,12 @@ func (p *MuxPool) sweep() {
 	}()
 }
 
-// muxConfig clones the shared smux parameters with a jittered keepalive:
-// an exact 20 s heartbeat from every session is a correlatable beacon.
+// muxConfig returns the shared smux parameters. Keepalive jitter now
+// lives in protocol.MuxConfig() so BOTH ends of a tunnel (client and
+// relay) jitter per session — an exact heartbeat from every session is a
+// correlatable beacon, and a fixed server-side cadence was the last one.
 func muxConfig() *smux.Config {
-	cfg := protocol.MuxConfig()
-	cfg.KeepAliveInterval += time.Duration(rand.Int63n(int64(10 * time.Second)))
-	return cfg
+	return protocol.MuxConfig()
 }
 
 // overCap reports whether a session already carries enough streams that

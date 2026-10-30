@@ -91,7 +91,13 @@ var siteEpoch = time.Date(2026, 8, 27, 2, 5, 0, 0, time.UTC)
 func serveAsset(w http.ResponseWriter, name, ctype, cache string) {
 	data, err := siteFS.ReadFile(name)
 	if err != nil {
-		http.NotFound(w, nil)
+		// Same catch-all page as every other unknown path: Go's native
+		// "404 page not found" text is exactly the fingerprint the decoy
+		// exists to avoid.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		nf, _ := siteFS.ReadFile("site/404.html")
+		_, _ = w.Write(nf)
 		return
 	}
 	sum := sha256.Sum256(data)

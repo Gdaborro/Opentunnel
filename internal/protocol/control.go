@@ -51,6 +51,13 @@ type CtrlResponse struct {
 	BanReason   string `json:"ban_reason"`
 	KickExpires string `json:"kick_expires"`
 	Pin         string `json:"pin"`
+	// SSHHost, when set, is the relay's public ssh-tier dial target — a
+	// plain A record a CDN front does not proxy (port 22). Clients learn
+	// and persist it in-band so the ssh last-resort tier keeps a dialable
+	// target after the tunnel domain moves behind a CDN, without any
+	// per-device config update. Injection is impossible from outside: the
+	// control channel lives inside the authenticated, AEAD-sealed session.
+	SSHHost string `json:"ssh_host,omitempty"`
 }
 
 // WriteCtrlMessage frames v as [u16 length][JSON].

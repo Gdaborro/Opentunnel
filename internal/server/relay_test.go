@@ -83,7 +83,7 @@ func TestRelaySurvivesSlowTransfer(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		relayTarget(protocol.ATypIPv4, rw.(deadlineRW), opt, "", "approved", "", protocol.ProtoVersionLegacy)
+		relayTarget(protocol.ATypIPv4, rw.(deadlineRW), opt, "", "approved", "", protocol.ProtoVersionLegacy, "")
 	}()
 
 	_ = clientEnd.SetDeadline(time.Now().Add(60 * time.Second))

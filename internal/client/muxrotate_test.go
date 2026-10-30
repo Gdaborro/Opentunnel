@@ -103,8 +103,8 @@ func TestRotationRetiresOldSession(t *testing.T) {
 func TestKeepaliveJittered(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		got := muxConfig().KeepAliveInterval
-		if got < 20*time.Second || got > 30*time.Second {
-			t.Fatalf("keepalive out of [20s, 30s]: %v", got)
+		if got < 20*time.Second || got >= 35*time.Second {
+			t.Fatalf("keepalive out of [20s, 35s): %v", got)
 		}
 	}
 }

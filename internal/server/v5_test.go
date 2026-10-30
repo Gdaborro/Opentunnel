@@ -32,14 +32,15 @@ func (v v5Stub) CheckToken(tok string) (string, string, string, error) {
 	}
 	return "pending", "", "", nil
 }
-func (v v5Stub) RecordTraffic(string, int64, int64) {}
-func (v v5Stub) IsBlocked(string) bool              { return false }
-func (v v5Stub) BlockWhy(string) string             { return "" }
-func (v v5Stub) KillSwitch() bool                   { return false }
-func (v v5Stub) KillSwitchReason() string           { return "" }
-func (v v5Stub) KillSwitchAllow(string) bool        { return false }
-func (v v5Stub) PeerLimits(string) (int64, int64)   { return 0, 0 }
-func (v v5Stub) SetPeerIP(string, string)           {}
+func (v v5Stub) RecordTraffic(string, int64, int64)   {}
+func (v v5Stub) IsBlocked(string) bool                { return false }
+func (v v5Stub) BlockWhy(string) string               { return "" }
+func (v v5Stub) KillSwitch() bool                     { return false }
+func (v v5Stub) KillSwitchReason() string             { return "" }
+func (v v5Stub) KillSwitchAllow(string) bool          { return false }
+func (v v5Stub) PeerLimits(string) (int64, int64)     { return 0, 0 }
+func (v v5Stub) SSHTierLimits() (int64, int64, int64) { return 0, 0, 0 }
+func (v v5Stub) SetPeerIP(string, string)             {}
 func (v v5Stub) RecordHealth(string, string, string, string, float64, float64, float64, int64, float64, float64, float64) {
 }
 func (v v5Stub) BanReason(string) string    { return "" }
@@ -88,7 +89,7 @@ func TestV5HandshakeSignatureEnforcement(t *testing.T) {
 	run := func(sig []byte) (byte, error) {
 		c1, c2 := net.Pipe()
 		defer c1.Close()
-		go handleSession(c2, opt, "203.0.113.9")
+		go handleSession(c2, opt, "203.0.113.9", "")
 		salt := protocol.RandomSalt()
 		if sig == nil {
 			sig = ed25519.Sign(priv, protocol.HandshakeMsg(tok, salt))
@@ -129,7 +130,7 @@ func TestV5HandshakeSignatureEnforcement(t *testing.T) {
 	// Legacy v4 handshake still accepted during the migration window.
 	c1, c2 := net.Pipe()
 	defer c1.Close()
-	go handleSession(c2, opt, "203.0.113.9")
+	go handleSession(c2, opt, "203.0.113.9", "")
 	if err := protocol.WriteHandshake(c1, tok); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +161,7 @@ func TestV4DowngradeGate(t *testing.T) {
 	dialV4 := func(opt Options) byte {
 		c1, c2 := net.Pipe()
 		defer c1.Close()
-		go handleSession(c2, opt, "203.0.113.9")
+		go handleSession(c2, opt, "203.0.113.9", "")
 		if err := protocol.WriteHandshake(c1, tok); err != nil {
 			t.Fatalf("write v4: %v", err)
 		}
@@ -174,7 +175,7 @@ func TestV4DowngradeGate(t *testing.T) {
 	dialV5 := func(opt Options) byte {
 		c1, c2 := net.Pipe()
 		defer c1.Close()
-		go handleSession(c2, opt, "203.0.113.9")
+		go handleSession(c2, opt, "203.0.113.9", "")
 		salt := protocol.RandomSalt()
 		sig := ed25519.Sign(priv, protocol.HandshakeMsg(tok, salt))
 		if err := protocol.WriteHandshakeV5(c1, tok, salt, sig); err != nil {

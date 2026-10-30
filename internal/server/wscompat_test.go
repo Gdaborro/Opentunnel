@@ -52,6 +52,10 @@ type killSwitchStub struct {
 	on     bool
 	reason string
 	allow  map[string]bool
+
+	// ssh-tier containment knobs (sshtier_test.go scenarios).
+	peerMax                      int64
+	sshMax, sshDaily, sshTrickle int64
 }
 
 func (k killSwitchStub) CheckToken(string) (string, string, string, error) {
@@ -63,8 +67,11 @@ func (k killSwitchStub) BlockWhy(string) string             { return "" }
 func (k killSwitchStub) KillSwitch() bool                   { return k.on }
 func (k killSwitchStub) KillSwitchReason() string           { return k.reason }
 func (k killSwitchStub) KillSwitchAllow(tok string) bool    { return k.allow[tok] }
-func (k killSwitchStub) PeerLimits(string) (int64, int64)   { return 0, 0 }
-func (k killSwitchStub) SetPeerIP(string, string)           {}
+func (k killSwitchStub) PeerLimits(string) (int64, int64)   { return k.peerMax, 0 }
+func (k killSwitchStub) SSHTierLimits() (int64, int64, int64) {
+	return k.sshMax, k.sshDaily, k.sshTrickle
+}
+func (k killSwitchStub) SetPeerIP(string, string) {}
 func (k killSwitchStub) RecordHealth(string, string, string, string, float64, float64, float64, int64, float64, float64, float64) {
 }
 func (k killSwitchStub) BanReason(string) string            { return "" }
@@ -116,7 +123,7 @@ func TestKillSwitchBlocksStreamsWithReason(t *testing.T) {
 	run := func(st killSwitchStub, token string) (byte, string) {
 		c1, c2 := net.Pipe()
 		defer c1.Close()
-		go relayTarget(protocol.ATypIPv4, c2, Options{Token: "master", PanelDB: st}, token, "approved", "", protocol.ProtoVersionLegacy)
+		go relayTarget(protocol.ATypIPv4, c2, Options{Token: "master", PanelDB: st}, token, "approved", "", protocol.ProtoVersionLegacy, "")
 		// Target address bytes in a goroutine: net.Pipe is unbuffered and
 		// the kill-switch path answers without reading the address, so a
 		// synchronous write here deadlocks both ends.

@@ -198,6 +198,12 @@ func NewAdaptive(token string, base transport.WSTLSOptions, profile string, dial
 	return a
 }
 
+// h3MuxByteCap keeps one h3 session under Cloudflare's 100 MB proxied
+// request-body limit: the h3 tier tunnels as one streamed request, so a
+// session crossing the edge's cap would be cut mid-transfer with a bare
+// reset. 64 MiB + the pool's usual ±25% jitter stays clear with margin.
+const h3MuxByteCap = 64 << 20
+
 func defaultFactory(a *Adaptive, idx int) *Client {
 	name := a.tierName(idx)
 	var tr transport.Transport
@@ -219,13 +225,17 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		opt.ChromeHello = true
 		tr = transport.NewWSTLS(opt)
 	}
-	return NewWithOptions(tr, Options{
+	opts := Options{
 		Token:          a.token,
 		DialTimeout:    a.dialTimeout,
 		Profile:        "balanced", // under h3/ssh, mild padding; harmless elsewhere
 		Mux:            a.mux,
 		OnAuthRejected: a.OnAuthRejected,
-	})
+	}
+	if name == H3TierName {
+		opts.MuxByteCap = h3MuxByteCap
+	}
+	return NewWithOptions(tr, opts)
 }
 
 func (a *Adaptive) build(idx int) *Client {

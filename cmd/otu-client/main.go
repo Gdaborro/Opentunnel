@@ -403,6 +403,23 @@ func run() {
 			Fingerprints: fpSet,
 			Insecure:     cfg.Insecure,
 		}
+		// ECH (transport/ech.go): once the entry host publishes an
+		// ECHConfigList (HTTPS DNS record — Cloudflare publishes it for
+		// eligible zones), every Chrome-hello dial rides it: the outer
+		// hello shows only the cover name while the real SNI travels
+		// encrypted. Fail-open; IP-literal entries have no DNS record and
+		// simply skip ECH. The provider is also installed process-wide so
+		// control-plane polls tell the same SNI story as the tunnel.
+		if cfg.ECHEnabled() {
+			if echHost := cfg.SNIHost(); net.ParseIP(echHost) == nil {
+				provider := transport.NewECHProvider(echHost,
+					filepath.Join(tokenStore.Dir, "ech.json"), cfg.ECHDoHURLs(), log.Printf)
+				provider.Start(ctx)
+				baseOpts.ECHList = provider.ConfigFor
+				baseOpts.ECHRejected = provider.RejectedFor
+				transport.SetDefaultECH(provider.ConfigFor, provider.RejectedFor)
+			}
+		}
 		dialer = client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
 		dialer.AllowHostileSSH = cfg.AllowHostileSSH()
 		// Rotatable entries: primary plus fallbacks (same cert assumed).
@@ -444,6 +461,11 @@ func run() {
 			resp, err := dialer.CtrlExchange(ctx, req)
 			if err == nil && resp != nil {
 				learnPin(resp.Pin)
+				// In-band ssh-tier dial-host learning: persists so the
+				// ssh tier survives CDN fronting on hostile networks.
+				if resp.SSHHost != "" {
+					client.LearnSSHHost(resp.SSHHost)
+				}
 			}
 			return resp, err
 		})
@@ -465,10 +487,9 @@ func run() {
 			if key == "" {
 				log.Fatal("transport=ssh requires ssh_key in config")
 			}
-			sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
 			dialer.UseTransportBuilder(func(profile string) transport.Transport {
 				return transport.NewSSH(transport.SSHOptions{
-					Host:             sshAddr,
+					Host:             net.JoinHostPort(sshDialHost(cfg), cfg.SSHPortOrDefault()),
 					User:             user,
 					KeyFile:          key,
 					InternalWS:       internal,
@@ -499,7 +520,6 @@ func run() {
 					if user == "" {
 						user = "ubuntu"
 					}
-					sshAddr := net.JoinHostPort(cfg.SSHDialHost(), cfg.SSHPortOrDefault())
 					pins := cfg.SSHHostKeyPins()
 					if len(pins) == 0 && !cfg.Insecure {
 						// Fail-closed tier would only produce dial errors;
@@ -509,7 +529,7 @@ func run() {
 					} else {
 						dialer.EnableSSHFallback(func() transport.Transport {
 							return transport.NewSSH(transport.SSHOptions{
-								Host:             sshAddr,
+								Host:             net.JoinHostPort(sshDialHost(cfg), cfg.SSHPortOrDefault()),
 								User:             user,
 								KeyFile:          cfg.SSHKey,
 								InternalWS:       internal,
@@ -695,6 +715,22 @@ func checkBanAtStartup(cfg *config.ClientConf, token string, ts *client.TokenSto
 	}
 	ts.ClearBan()
 	return "", false
+}
+
+// sshDialHost resolves the ssh tier's dial target: explicit config
+// override > host learned in-band from the relay (persisted across
+// restarts) > sinkhole-proof IP literal > server_addr host. The in-band
+// value is what keeps the ssh tier dialable once the tunnel domain is
+// CDN-fronted (port 22 is not proxied). Resolved per transport build, so
+// a host learned mid-session applies to the next ssh-tier build.
+func sshDialHost(cfg *config.ClientConf) string {
+	if h := strings.TrimSpace(cfg.SSHDialHostOverride); h != "" {
+		return h
+	}
+	if h := client.LearnedSSHHost(); h != "" {
+		return h
+	}
+	return cfg.SSHDialHost()
 }
 
 func firstNonEmpty(a, b string) string {

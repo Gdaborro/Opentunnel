@@ -11,12 +11,18 @@ import {
 import { Switch } from "@/components/ui/switch"
 import { Separator } from "@/components/ui/separator"
 import { Badge } from "@/components/ui/badge"
-import { PowerIcon, ShieldAlertIcon, InfoIcon } from "lucide-react"
+import { PowerIcon, ShieldAlertIcon, InfoIcon, GaugeIcon } from "lucide-react"
 import { formatDuration } from "@/lib/format"
 
 type KillDetail = {
   kill_switch_reason?: string
   kill_switch_allow?: string[]
+}
+
+type SshTierDetail = {
+  ssh_tier_max_bps?: number
+  ssh_tier_daily_mb?: number
+  ssh_tier_trickle_kbps?: number
 }
 
 export function SystemPage() {
@@ -27,6 +33,11 @@ export function SystemPage() {
   const [allow, setAllow] = useState("")
   const [devices, setDevices] = useState<{ token: string; device_name?: string }[]>([])
   const [saved, setSaved] = useState("")
+  // ssh-tier containment controls (bytes/sec cap stored, Mbps shown).
+  const [sshMaxMbps, setSshMaxMbps] = useState("0")
+  const [sshDailyMB, setSshDailyMB] = useState("0")
+  const [sshTrickleKbps, setSshTrickleKbps] = useState("0")
+  const [sshSaved, setSshSaved] = useState("")
 
   const load = useCallback(() => {
     api
@@ -36,6 +47,11 @@ export function SystemPage() {
         const d = s as KillDetail
         setReason(d.kill_switch_reason ?? "")
         setAllow((d.kill_switch_allow ?? []).join("\n"))
+        const t = s as SshTierDetail
+        const mbps = ((t.ssh_tier_max_bps ?? 0) * 8) / 1e6
+        setSshMaxMbps(mbps ? String(+mbps.toFixed(3)) : "0")
+        setSshDailyMB(String(t.ssh_tier_daily_mb ?? 0))
+        setSshTrickleKbps(String(t.ssh_tier_trickle_kbps ?? 0))
         setLoaded(true)
       })
       .catch(() => {})
@@ -73,6 +89,24 @@ export function SystemPage() {
   const addAllowed = (token: string) => {
     const cur = allow.split("\n").map((t) => t.trim()).filter(Boolean)
     if (!cur.includes(token)) setAllow([...cur, token].join("\n"))
+  }
+
+  const saveSshTier = () => {
+    fetch("/admin/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ssh_tier_max_bps: Math.max(0, Math.round((parseFloat(sshMaxMbps) || 0) * 1e6 / 8)),
+        ssh_tier_daily_mb: Math.max(0, Math.round(parseFloat(sshDailyMB) || 0)),
+        ssh_tier_trickle_kbps: Math.max(0, Math.round(parseFloat(sshTrickleKbps) || 0)),
+      }),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        setSshSaved("saved")
+        setTimeout(() => setSshSaved(""), 3000)
+      })
+      .catch((e) => setSshSaved(`save failed: ${e.message}`))
   }
 
   return (
@@ -136,6 +170,69 @@ export function SystemPage() {
           <div className="flex items-center gap-3">
             <Button onClick={saveKillDetail}>Save reason + allowlist</Button>
             <span className="text-xs text-muted-foreground">{saved}</span>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <GaugeIcon className="size-4 text-primary" />
+            SSH-tier containment
+          </CardTitle>
+          <CardDescription>
+            Keeps the ssh transport — the only tier that survives TLS
+            interception with blocked UDP — from reading as a media relay:
+            cap each device's sustained rate and give it a daily byte budget.
+            After the budget is spent, new streams degrade to the post-budget
+            rate (pages keep loading, video cannot).
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3 text-sm">
+          <div className="grid gap-3 sm:grid-cols-3">
+            <label className="flex flex-col gap-1.5">
+              <span className="font-medium">Sustained cap (Mbps, 0 = off)</span>
+              <input
+                type="number"
+                min={0}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                value={sshMaxMbps}
+                onChange={(e) => setSshMaxMbps(e.target.value)}
+              />
+              <span className="text-xs text-muted-foreground">
+                Per device, ssh ingress only
+              </span>
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className="font-medium">Daily budget (MB, 0 = off)</span>
+              <input
+                type="number"
+                min={0}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                value={sshDailyMB}
+                onChange={(e) => setSshDailyMB(e.target.value)}
+              />
+              <span className="text-xs text-muted-foreground">
+                Per device; resets at UTC midnight
+              </span>
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className="font-medium">Post-budget rate (kbps, 0 = 200)</span>
+              <input
+                type="number"
+                min={0}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                value={sshTrickleKbps}
+                onChange={(e) => setSshTrickleKbps(e.target.value)}
+              />
+              <span className="text-xs text-muted-foreground">
+                Once the daily budget is spent
+              </span>
+            </label>
+          </div>
+          <div className="flex items-center gap-3">
+            <Button onClick={saveSshTier}>Save containment policy</Button>
+            <span className="text-xs text-muted-foreground">{sshSaved}</span>
           </div>
         </CardContent>
       </Card>

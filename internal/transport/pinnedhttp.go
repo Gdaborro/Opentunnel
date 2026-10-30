@@ -25,6 +25,11 @@ type PinnedHTTPOptions struct {
 	Insecure     bool // dev only: skip pin verification entirely
 	Timeout      time.Duration
 	ChromeHello  bool // mimic Chrome's ClientHello (uTLS)
+	// ECH hooks (see ech.go). nil = process-wide defaults (SetDefaultECH),
+	// which is what control-plane clients normally use: polls must tell
+	// the same SNI story as the tunnel.
+	ECHList     func(serverName string) []byte
+	ECHRejected func(serverName string)
 }
 
 // NewPinnedHTTPClient builds an http.Client that always dials DialAddr —
@@ -64,21 +69,16 @@ func NewPinnedHTTPClient(opt PinnedHTTPOptions) (*http.Client, error) {
 			return VerifyPinSet(pins, rawCerts)
 		}
 	}
+	echList, echRejected := opt.ECHList, opt.ECHRejected
+	if echList == nil && echRejected == nil {
+		echList, echRejected = defaultECHHooks()
+	}
 	d := &net.Dialer{Timeout: timeout}
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
 			DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				raw, err := d.DialContext(ctx, "tcp", hostPort)
-				if err != nil {
-					return nil, err
-				}
-				conn, err := tlsHandshake(ctx, raw, cfg, opt.ChromeHello)
-				if err != nil {
-					_ = raw.Close()
-					return nil, err
-				}
-				return conn, nil
+				return dialTLSWithECH(ctx, d, "tcp", hostPort, cfg, opt.ChromeHello, echList, echRejected)
 			},
 			ForceAttemptHTTP2: false,
 		},

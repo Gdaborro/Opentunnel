@@ -45,6 +45,7 @@ func startPanelServer(t *testing.T) (addr, fp string, db *panel.DB) {
 			PanelDB:                db,
 			AllowRestrictedTargets: true, // tests dial loopback targets
 			CurrentPin:             func() string { return certFP },
+			SSHPublicHost:          "git.aborro.dev",
 		}),
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{*cert}},
 	}

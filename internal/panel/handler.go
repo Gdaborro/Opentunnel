@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -598,10 +599,15 @@ func (h *Handler) apiEvents(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
+		sshMax, sshDaily, sshTrickle := h.db.SSHTierLimits()
 		resp := map[string]any{
 			"kill_switch":        h.db.KillSwitch(),
 			"kill_switch_reason": h.db.KillSwitchReason(),
 			"kill_switch_allow":  h.db.KillSwitchAllowList(),
+			// ssh-tier containment (sshtier.go): effective values, 0 = off.
+			"ssh_tier_max_bps":      sshMax,
+			"ssh_tier_daily_mb":     sshDaily >> 20,
+			"ssh_tier_trickle_kbps": sshTrickle * 8 / 1000,
 		}
 		if until := h.db.AutoAcceptUntil(); !until.IsZero() {
 			resp["auto_accept_until"] = until.Format(time.RFC3339)
@@ -613,14 +619,18 @@ func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		KillSwitch    *bool     `json:"kill_switch"`
-		KillReason    *string   `json:"kill_switch_reason"`
-		KillAllow     *[]string `json:"kill_switch_allow"`
-		AutoAcceptMin *int      `json:"auto_accept_minutes"` // >0 open for N minutes; 0 close now
+		KillSwitch     *bool     `json:"kill_switch"`
+		KillReason     *string   `json:"kill_switch_reason"`
+		KillAllow      *[]string `json:"kill_switch_allow"`
+		AutoAcceptMin  *int      `json:"auto_accept_minutes"`   // >0 open for N minutes; 0 close now
+		SSHMaxBps      *int64    `json:"ssh_tier_max_bps"`      // sustained ssh-ingress cap, bytes/sec
+		SSHDailyMB     *int64    `json:"ssh_tier_daily_mb"`     // per-device daily ssh budget, MB
+		SSHTrickleKbps *int64    `json:"ssh_tier_trickle_kbps"` // post-budget rate, kbps
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil ||
-		(req.KillSwitch == nil && req.AutoAcceptMin == nil && req.KillReason == nil && req.KillAllow == nil) {
-		http.Error(w, "kill_switch, kill_switch_reason, kill_switch_allow or auto_accept_minutes required", 400)
+		(req.KillSwitch == nil && req.AutoAcceptMin == nil && req.KillReason == nil && req.KillAllow == nil &&
+			req.SSHMaxBps == nil && req.SSHDailyMB == nil && req.SSHTrickleKbps == nil) {
+		http.Error(w, "kill_switch, kill_switch_reason, kill_switch_allow, auto_accept_minutes or ssh_tier_* required", 400)
 		return
 	}
 	if req.KillReason != nil {
@@ -649,6 +659,33 @@ func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		h.db.SetSetting("kill_switch_allow", strings.Join(clean, ","))
 		h.db.RecordEvent("kill-switch", "allowlist updated ("+strings.Join(shortTokens(clean), ", ")+")")
+	}
+	if req.SSHMaxBps != nil || req.SSHDailyMB != nil || req.SSHTrickleKbps != nil {
+		if req.SSHMaxBps != nil {
+			v := *req.SSHMaxBps
+			if v < 0 || v > 1_000_000_000 { // ≤ 1 GB/s
+				http.Error(w, "ssh_tier_max_bps out of range (0..1e9)", 400)
+				return
+			}
+			h.db.SetSetting("ssh_tier_max_bps", strconv.FormatInt(v, 10))
+		}
+		if req.SSHDailyMB != nil {
+			v := *req.SSHDailyMB
+			if v < 0 || v > 1_000_000 { // ≤ 1 TB/day per device
+				http.Error(w, "ssh_tier_daily_mb out of range (0..1e6)", 400)
+				return
+			}
+			h.db.SetSetting("ssh_tier_daily_mb", strconv.FormatInt(v, 10))
+		}
+		if req.SSHTrickleKbps != nil {
+			v := *req.SSHTrickleKbps
+			if v < 0 || v > 1_000_000 {
+				http.Error(w, "ssh_tier_trickle_kbps out of range (0..1e6)", 400)
+				return
+			}
+			h.db.SetSetting("ssh_tier_trickle_kbps", strconv.FormatInt(v, 10))
+		}
+		h.db.RecordEvent("ssh-tier", "containment policy updated")
 	}
 	if req.AutoAcceptMin != nil {
 		until := h.db.SetAutoAccept(*req.AutoAcceptMin)

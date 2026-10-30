@@ -41,6 +41,12 @@ func TestControlChannelStatusAndHealth(t *testing.T) {
 	if resp.Pin != fp {
 		t.Fatalf("pin announcement = %q, want the relay's current leaf pin %q", resp.Pin, fp)
 	}
+	// In-band ssh-tier dial-host learning: every control response carries
+	// the relay's announced ssh target so the tier survives CDN fronting
+	// without per-device config updates.
+	if resp.SSHHost != "git.aborro.dev" {
+		t.Fatalf("ssh host announcement = %q, want git.aborro.dev", resp.SSHHost)
+	}
 
 	resp, err = cl.CtrlExchange(context.Background(), protocol.CtrlRequest{
 		Op: "health", Token: device.Token, Version: "v0.9.23-test", OS: "windows", Arch: "amd64",

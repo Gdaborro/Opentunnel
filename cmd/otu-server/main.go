@@ -198,6 +198,7 @@ func main() {
 		TrustCloudflareIPs:     cfg.TrustCloudflareIPs,
 		RequireV5After:         cfg.RequireV5Time(),
 		CurrentPin:             func() string { v, _ := leafFP.Load().(string); return v },
+		SSHPublicHost:          cfg.SSHPublicHost,
 	}
 	if panelDB != nil {
 		baseOpts.PanelDB = panelDB
@@ -263,14 +264,6 @@ func main() {
 		TLSConfig:         tlsCfg,
 	}
 
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
-		fmt.Println("\nshutting down…")
-		_ = srv.Close()
-	}()
-
 	// Optional second listener sharing the same handler and certificate —
 	// useful when censors intercept standard web ports but leave other
 	// ports untouched.
@@ -290,19 +283,38 @@ func main() {
 	// Optional PLAIN (no-TLS) WebSocket listener bound to loopback only:
 	// the entry point for the ssh transport, where SSH itself provides the
 	// outer encryption and opentunnel's AEAD layer provides end-to-end
-	// confidentiality.
+	// confidentiality. It gets its own http.Server so its requests can be
+	// marked as ssh ingress (server.WithIngress): the relay's containment
+	// policy (sustained cap + daily budget, sshtier.go) keys on that
+	// marker to keep fanned-in ssh traffic from reading as a media relay.
+	var intSrv *http.Server
 	if cfg.ListenInternal != "" {
 		intLn, ierr := net.Listen("tcp", cfg.ListenInternal)
 		if ierr != nil {
 			log.Fatalf("internal listen: %v", ierr)
 		}
+		intSrv = &http.Server{
+			Handler:           server.WithIngress(handler, server.IngressSSH),
+			ReadHeaderTimeout: 15 * time.Second,
+		}
 		go func() {
-			if ierr := srv.Serve(intLn); ierr != nil && ierr != http.ErrServerClosed {
+			if ierr := intSrv.Serve(intLn); ierr != nil && ierr != http.ErrServerClosed {
 				log.Printf("internal listener: %v", ierr)
 			}
 		}()
 		log.Printf("internal (plain) listener on %s", cfg.ListenInternal)
 	}
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		fmt.Println("\nshutting down…")
+		_ = srv.Close()
+		if intSrv != nil {
+			_ = intSrv.Close()
+		}
+	}()
 
 	// HTTP/3 listener (v0.9.26): same handler mux over QUIC on the UDP
 	// side of the port — the transport that survives TLS interception.

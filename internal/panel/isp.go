@@ -213,9 +213,14 @@ func (db *DB) Setting(key string) string {
 	return v
 }
 
-// SetSetting writes a settings key.
+// SetSetting writes a settings key. ssh-tier policy keys bypass their
+// read cache immediately so operator changes take effect on the next
+// stream instead of up to a second later.
 func (db *DB) SetSetting(key, value string) {
 	db.Exec(`INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	if strings.HasPrefix(key, "ssh_tier_") {
+		invalidateSSHTierCache()
+	}
 }
 
 // killCache caches the kill switch (checked per connection and per stream).
@@ -301,6 +306,66 @@ func (db *DB) KillSwitchAllowList() []string {
 		out = append(out, t)
 	}
 	return out
+}
+
+// ssh-tier containment policy (relay side: internal/server/sshtier.go): a
+// sustained bytes/sec cap and a per-device daily byte budget for ssh
+// ingress, plus the post-budget trickle rate. Same 1s cache shape as the
+// kill switch — the relay reads it per stream start.
+var (
+	sshPolMu      sync.Mutex
+	sshPolMaxBps  int64
+	sshPolDaily   int64
+	sshPolTrickle int64
+	sshPolLoaded  time.Time
+)
+
+// defaultSSHTrickleBps ≈ 200 kbps: once the daily ssh budget is spent,
+// pages keep loading and video cannot hold a buffer.
+const defaultSSHTrickleBps = 25_000
+
+// SSHTierLimits returns the ssh-tier containment policy (0 = unset):
+// maxBps caps sustained ssh-ingress bandwidth per device, dailyBytes is
+// the per-device daily budget on that ingress, and trickleBps is the
+// rate new streams degrade to once the budget is spent (defaults to
+// ~200 kbps whenever a budget is configured).
+func (db *DB) SSHTierLimits() (maxBps, dailyBytes, trickleBps int64) {
+	if db == nil {
+		return 0, 0, 0
+	}
+	sshPolMu.Lock()
+	defer sshPolMu.Unlock()
+	if time.Since(sshPolLoaded) < time.Second {
+		return sshPolMaxBps, sshPolDaily, sshPolTrickle
+	}
+	maxBps = positiveSetting(db.Setting("ssh_tier_max_bps"))
+	mb := positiveSetting(db.Setting("ssh_tier_daily_mb"))
+	if mb > 1_000_000 { // cap at 1 TB/day so the shift stays sane
+		mb = 1_000_000
+	}
+	dailyBytes = mb << 20
+	trickleBps = positiveSetting(db.Setting("ssh_tier_trickle_kbps")) * 1000 / 8
+	if dailyBytes > 0 && trickleBps <= 0 {
+		trickleBps = defaultSSHTrickleBps
+	}
+	sshPolMaxBps, sshPolDaily, sshPolTrickle, sshPolLoaded = maxBps, dailyBytes, trickleBps, time.Now()
+	return maxBps, dailyBytes, trickleBps
+}
+
+// invalidateSSHTierCache forces the next SSHTierLimits call to reload.
+func invalidateSSHTierCache() {
+	sshPolMu.Lock()
+	sshPolLoaded = time.Time{}
+	sshPolMu.Unlock()
+}
+
+// positiveSetting parses a non-negative integer setting ("" or invalid → 0).
+func positiveSetting(v string) int64 {
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // AutoAcceptUntil returns the current auto-accept deadline (zero when off).

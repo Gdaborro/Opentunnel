@@ -3,7 +3,7 @@
 package version
 
 // Version defaults to the next planned release; release builds stamp the tag.
-var Version = "0.9.30"
+var Version = "1.0.0"
 
 // ProductName, ProcessID and StopHelper name the install surface: the
 // %LOCALAPPDATA% data dir, the process image (no .exe), and the generated

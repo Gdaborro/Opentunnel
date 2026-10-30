@@ -25,6 +25,10 @@ type Options struct {
 	DialTimeout time.Duration // per-connection budget for handshake+target
 	Profile     string        // fast | balanced | stealth (shaping on our writes)
 	Mux         bool          // multiplex targets over pooled sessions
+	// MuxByteCap overrides the per-session rotation byte cap (0 = default
+	// 160 MiB). The h3 tier sets this below Cloudflare's 100 MB proxied
+	// request-body limit so sessions rotate before the edge cuts them.
+	MuxByteCap int64
 	// OnAuthRejected is invoked when the server rejects the device token
 	// (unknown/purged/expired) so the caller can re-register with the panel.
 	OnAuthRejected func()
@@ -337,6 +341,9 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 func (c *Client) getPool() *MuxPool {
 	c.poolOnce.Do(func() {
 		c.pool = newMuxPool(c.muxSessionFactory, 8, c.opts.DialTimeout)
+		if c.opts.MuxByteCap > 0 {
+			c.pool.maxBytes = c.opts.MuxByteCap
+		}
 	})
 	return c.pool
 }

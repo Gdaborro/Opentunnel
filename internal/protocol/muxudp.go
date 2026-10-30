@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -14,10 +15,17 @@ import (
 // buffer sizes and keepalives always match. Windows are sized for high-BDP
 // paths: throughput <= buffer / RTT, so 8 MB stream buffers sustain
 // hundreds of Mbps even at ~150 ms RTT.
+//
+// Keepalives are deliberately jittered per session (per call): a fixed
+// 20 s NOP on every idle session is a fleet-wide correlation signature at
+// the flow level — many devices beating in lockstep. A randomized idle
+// cadence (20–35 s) with a receive-silence timeout comfortably above the
+// PEER's widest cadence reads as ordinary application heartbeat traffic.
 func MuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
-	cfg.KeepAliveInterval = 20 * time.Second
-	cfg.KeepAliveTimeout = 40 * time.Second
+	interval := 20*time.Second + time.Duration(rand.Int63n(int64(15*time.Second)))
+	cfg.KeepAliveInterval = interval
+	cfg.KeepAliveTimeout = interval + 30*time.Second + time.Duration(rand.Int63n(int64(15*time.Second)))
 	cfg.MaxFrameSize = 32768
 	cfg.MaxReceiveBuffer = 16 * 1024 * 1024
 	cfg.MaxStreamBuffer = 8 * 1024 * 1024

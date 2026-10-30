@@ -78,7 +78,7 @@ func TestServeUDPStreamIdentityGate(t *testing.T) {
 		defer rw2.Close()
 		done := make(chan struct{})
 		go func() {
-			serveUDPStream(rw1, Options{}, "tok", st)
+			serveUDPStream(rw1, Options{}, "tok", st, "")
 			close(done)
 		}()
 		select {

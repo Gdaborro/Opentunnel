@@ -50,6 +50,14 @@ type WSTLSOptions struct {
 	Insecure     bool          // dev only: skip pin verification
 	DialTimeout  time.Duration // per-transport dial budget
 	ChromeHello  bool          // mimic Chrome's TLS ClientHello (uTLS)
+	// ECHList returns the current ECHConfigList for the dial's SNI host
+	// (draft-ietf-tls-esni; see ech.go), or nil to dial without ECH.
+	// nil hook = process-wide defaults (SetDefaultECH).
+	ECHList func(serverName string) []byte
+	// ECHRejected is called (with the SNI host) after a dial fell back
+	// because the server rejected ECH or the outer certificate failed the
+	// pins, so the provider can back off and refetch.
+	ECHRejected func(serverName string)
 }
 
 type wsTLSTransport struct{ opt WSTLSOptions }
@@ -167,7 +175,11 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	httpClient := newPinnedHTTPClient(tlsCfg, timeout, t.opt.ChromeHello)
+	echList, echRejected := t.opt.ECHList, t.opt.ECHRejected
+	if echList == nil && echRejected == nil {
+		echList, echRejected = defaultECHHooks()
+	}
+	httpClient := newPinnedHTTPClient(tlsCfg, timeout, t.opt.ChromeHello, echList, echRejected)
 
 	// No subprotocol and a browser-plausible User-Agent: under interception
 	// this reads as an ordinary app's realtime channel, not a custom
@@ -241,27 +253,78 @@ func (c *wsConn) Close() error {
 
 // newPinnedHTTPClient returns an http.Client whose TLS dial uses cfg,
 // bypassing system roots so fingerprint pinning governs trust. When chrome is
-// true the ClientHello mimics Chrome via uTLS (balanced/stealth profiles).
-func newPinnedHTTPClient(cfg *tls.Config, timeout time.Duration, chrome bool) *http.Client {
+// true the ClientHello mimics Chrome via uTLS (balanced/stealth profiles) and
+// an available ECH config (ech.go) rides the handshake.
+func newPinnedHTTPClient(cfg *tls.Config, timeout time.Duration, chrome bool, echList func(string) []byte, echRejected func(string)) *http.Client {
 	d := &net.Dialer{Timeout: timeout}
 	return &http.Client{
 		Transport: &http.Transport{
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				raw, err := d.DialContext(ctx, network, addr)
-				if err != nil {
-					return nil, err
-				}
-				conn, err := tlsHandshake(ctx, raw, cfg, chrome)
-				if err != nil {
-					_ = raw.Close()
-					return nil, err
-				}
-				return conn, nil
+				return dialTLSWithECH(ctx, d, network, addr, cfg, chrome, echList, echRejected)
 			},
 			ForceAttemptHTTP2: false,
 		},
 		Timeout: timeout,
 	}
+}
+
+// errECHOuterPin reports that ECH was rejected and the outer hello's
+// certificate failed pin verification — the plain-SNI retry trigger (see
+// dialTLSWithECH) and a hard verdict at once: the candidate connection is
+// never adopted.
+var errECHOuterPin = errors.New("transport: ech rejected — outer certificate failed pin verification")
+
+// dialTLSWithECH dials addr and completes the pinned handshake. When an
+// ECH config is available for the SNI host, the first attempt rides ECH;
+// an ECH-shaped failure (server rejection, or the outer hello failing the
+// pins) closes the socket, reports the rejection, and retries once over a
+// fresh socket WITHOUT ECH — fail-open, the pin still governs trust.
+func dialTLSWithECH(ctx context.Context, d *net.Dialer, network, addr string, cfg *tls.Config, chrome bool, echList func(string) []byte, echRejected func(string)) (net.Conn, error) {
+	if chrome && echList != nil {
+		if list := echList(cfg.ServerName); len(list) > 0 {
+			conn, err := dialTLSOnce(ctx, d, network, addr, cfg, true, list)
+			if err == nil {
+				return conn, nil
+			}
+			if !isECHFallback(err) {
+				return nil, err
+			}
+			if echRejected != nil {
+				echRejected(cfg.ServerName)
+			}
+			// Fresh socket: the failed attempt consumed this one.
+			return dialTLSOnce(ctx, d, network, addr, cfg, true, nil)
+		}
+	}
+	return dialTLSOnce(ctx, d, network, addr, cfg, chrome, nil)
+}
+
+func dialTLSOnce(ctx context.Context, d *net.Dialer, network, addr string, cfg *tls.Config, chrome bool, echList []byte) (net.Conn, error) {
+	raw, err := d.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := tlsHandshake(ctx, raw, cfg, chrome, echList)
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// isECHFallback classifies a failed ECH attempt: uTLS's ECHRejectionError
+// (the server refused ECH and may have sent retry configs), or our
+// rejection-callback error (the outer hello's certificate failed the pins
+// — the candidate connection must not proceed, but a plain-SNI retry may).
+func isECHFallback(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rej *utls.ECHRejectionError
+	if errors.As(err, &rej) {
+		return true
+	}
+	return errors.Is(err, errECHOuterPin)
 }
 
 // tlsHandshake upgrades raw with the pinned settings; chrome selects the uTLS
@@ -270,7 +333,15 @@ func newPinnedHTTPClient(cfg *tls.Config, timeout time.Duration, chrome bool) *h
 // different story than the headers that follow — so the spec's ALPN is pinned
 // to http/1.1. (Networks that classify hellos are defeated by the ssh
 // fallback tier, not by hello tricks.)
-func tlsHandshake(ctx context.Context, raw net.Conn, cfg *tls.Config, chrome bool) (net.Conn, error) {
+//
+// echList, when non-empty, carries the host's ECHConfigList (ech.go): the
+// inner ClientHello (real SNI) is HPKE-encrypted behind the config's cover
+// name. uTLS requires TLS 1.3 minimum once ECH is configured, and the
+// rejection callback pin-checks the OUTER hello's certificate — without
+// that, a cover-name connection completed by an interceptor could be
+// adopted. Rejections surface as ECHRejectionError/errECHOuterPin and are
+// handled by dialTLSWithECH (plain-SNI retry on a fresh socket).
+func tlsHandshake(ctx context.Context, raw net.Conn, cfg *tls.Config, chrome bool, echList []byte) (net.Conn, error) {
 	if !chrome {
 		tconn := tls.Client(raw, cfg)
 		if err := tconn.HandshakeContext(ctx); err != nil {
@@ -302,6 +373,23 @@ func tlsHandshake(ctx context.Context, raw net.Conn, cfg *tls.Config, chrome boo
 		// wiring PSK into the parrot spec is future work (see
 		// u_pre_shared_key.go Initializable).
 		PreferSkipResumptionOnNilExtension: true,
+	}
+	if len(echList) > 0 {
+		ucfg.EncryptedClientHelloConfigList = echList
+		ucfg.MinVersion = tls.VersionTLS13 // required by uTLS when ECH is set
+		ucfg.EncryptedClientHelloRejectionVerify = func(cs utls.ConnectionState) error {
+			if cfg.VerifyPeerCertificate == nil { // dev-insecure
+				return nil
+			}
+			rawCerts := make([][]byte, 0, len(cs.PeerCertificates))
+			for _, c := range cs.PeerCertificates {
+				rawCerts = append(rawCerts, c.Raw)
+			}
+			if err := cfg.VerifyPeerCertificate(rawCerts, nil); err != nil {
+				return errECHOuterPin
+			}
+			return nil
+		}
 	}
 	uconn := utls.UClient(raw, ucfg, utls.HelloCustom)
 	if err := uconn.ApplyPreset(&spec); err != nil {

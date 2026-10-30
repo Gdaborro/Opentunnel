@@ -52,6 +52,11 @@ type Server struct {
 	// gate). Malformed values fail open — the per-peer gate still
 	// protects every device that has updated.
 	RequireV5After string `toml:"require_v5_after"`
+	// SSHPublicHost, when set (e.g. "git.aborro.dev"), is announced in
+	// every control response so clients learn the ssh tier's dial target
+	// in-band — required once the tunnel domain is CDN-fronted, because
+	// CDNs do not proxy port 22.
+	SSHPublicHost string `toml:"ssh_public_host"`
 }
 
 // RequireV5Time parses require_v5_after; zero when unset or malformed.
@@ -105,7 +110,17 @@ type ClientConf struct {
 	// true): QUIC to :443 cannot be transparently intercepted, so pinned
 	// handshakes reach the relay on MITM networks and bulk traffic moves
 	// off SSH there. UDP-blocked networks fail through to ssh in ~8s.
-	H3Tier     *bool    `toml:"h3_tier"`
+	H3Tier *bool `toml:"h3_tier"`
+	// ECH enables Encrypted Client Hello on ws-tls dials once the entry
+	// hostname publishes an ECHConfigList (HTTPS DNS record — Cloudflare
+	// publishes it automatically for eligible zones): the real SNI rides
+	// encrypted behind a cover name, so SNI-based classification sees only
+	// the cover. Fail-open: a rejected attempt retries without ECH over a
+	// fresh socket. Default true.
+	ECH *bool `toml:"ech"`
+	// ECHDoH overrides the DoH resolvers (comma-separated URLs) used to
+	// fetch the ECHConfigList. Empty = built-in defaults.
+	ECHDoh     string   `toml:"ech_doh"`
 	SOCKSAddr  string   `toml:"socks_addr"`  // default 127.0.0.1:1080
 	HTTPAddr   string   `toml:"http_addr"`   // default 127.0.0.1:8118
 	BypassList []string `toml:"bypass_list"` // extra ProxyOverride entries
@@ -172,6 +187,20 @@ func (c *ClientConf) MuxEnabled() bool { return c.Mux == nil || *c.Mux }
 // H3TierEnabled reports whether the HTTP/3 tier rides the ladder
 // (default true: it only engages after every ws-tls profile has failed).
 func (c *ClientConf) H3TierEnabled() bool { return c.H3Tier == nil || *c.H3Tier }
+
+// ECHEnabled reports the effective ECH setting (default true).
+func (c *ClientConf) ECHEnabled() bool { return c.ECH == nil || *c.ECH }
+
+// ECHDoHURLs splits ech_doh into resolver URLs (nil = built-in defaults).
+func (c *ClientConf) ECHDoHURLs() []string {
+	var out []string
+	for _, u := range strings.Split(c.ECHDoh, ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			out = append(out, u)
+		}
+	}
+	return out
+}
 
 // UDPEnabled reports the effective UDP relay setting (default true).
 func (c *ClientConf) UDPEnabled() bool { return c.UDP == nil || *c.UDP }
@@ -289,6 +318,10 @@ key_file  = ""
 	# peers only): "2026-12-01" or RFC3339. Empty = per-peer sticky gate
 	# only (every device that has updated once can never be downgraded).
 	require_v5_after = ""
+	# Public ssh-tier dial target announced to clients in-band (control
+	# channel): a plain A record the CDN does not front (CDNs do not
+	# proxy port 22). Set this once the tunnel domain is CDN-fronted.
+	# ssh_public_host = "git.aborro.dev"
 	`
 	return writeFile(path, t)
 }
@@ -319,6 +352,11 @@ udp = true
 # engages after every ws-tls profile has failed; UDP-blocked networks
 # fall through to ssh in seconds.
 h3_tier = true
+# ECH (Encrypted Client Hello, default on): once the server host
+# publishes an ECHConfigList (HTTPS DNS record — Cloudflare publishes it
+# automatically), the real SNI rides encrypted behind a cover name.
+# Fail-open: a rejected attempt retries without ECH.
+ech = true
 # Last-resort tier for networks that intercept TLS: tunnel inside real SSH.
 # Drop tun.key next to this config to enable it (skipped when missing).
 fallback_ssh = true
@@ -376,6 +414,11 @@ ssh_internal = "127.0.0.1:8081"
 # SSH banner announced by the ssh tier (default = whitelisted OpenSSH family;
 # "-" reverts to Go's stock banner).
 # ssh_client_version = "SSH-2.0-OpenSSH_9.6p1"
+# ECH (Encrypted Client Hello): hides the real server name behind the
+# ECHConfig's cover name once the host publishes one (HTTPS DNS record —
+# Cloudflare publishes it automatically). Fail-open. Default: on.
+ech = true
+# ech_doh = "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query"
 socks_addr = "127.0.0.1:1080"
 http_addr = "127.0.0.1:8118"
 bypass_list = ["*.internal.example.com"]

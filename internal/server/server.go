@@ -66,6 +66,10 @@ type Options struct {
 		KillSwitchReason() string
 		KillSwitchAllow(token string) bool
 		PeerLimits(token string) (maxBps, quotaBytes int64)
+		// SSH-tier containment (sshtier.go): sustained cap and daily byte
+		// budget for the ssh transport's ingress, plus the post-budget
+		// trickle rate. All 0 = disabled.
+		SSHTierLimits() (maxBps, dailyBytes, trickleBps int64)
 		SetPeerIP(token, ip string)
 		// Control channel (v0.9.23): in-band status/health mirroring the
 		// panel's public token API for devices on TLS-intercepting networks.
@@ -87,6 +91,11 @@ type Options struct {
 	// survive certificate rotation (LE renews ~every 60-90 days; a stale
 	// pin would otherwise brick every client at renewal).
 	CurrentPin func() string
+	// SSHPublicHost, when set, is announced in every control response
+	// (CtrlResponse.SSHHost): the plain A record clients should dial for
+	// the ssh last-resort tier once the tunnel domain is CDN-fronted
+	// (CDNs do not proxy port 22). Clients learn and persist it in-band.
+	SSHPublicHost string
 	// TrustCloudflareIPs resolves real client IPs from CF-Connecting-IP
 	// when the TCP peer is a Cloudflare edge (CDN front). Guards, GeoIP
 	// and rate limits then see the client, not the CDN.
@@ -137,6 +146,9 @@ func Handler(opt Options) http.Handler {
 	mux.Handle("/", decoyHandler)
 	wsHandler := func(w http.ResponseWriter, r *http.Request) {
 		peerIP := ResolveClientIP(r, opt.TrustCloudflareIPs)
+		// Ingress marker (sshtier.go): set by WithIngress on the loopback
+		// listener the ssh transport forwards into; public arrivals are "".
+		ingress := ingressFrom(r)
 		// HTTP/3 arrivals (ProtoMajor 3): the h3 transport tier tunnels
 		// the protocol over a streaming request — no WebSocket upgrade
 		// exists on that path. Same guard, same session machinery.
@@ -161,7 +173,7 @@ func Handler(opt Options) http.Handler {
 			if flusher != nil {
 				flusher.Flush()
 			}
-			handleSession(&h3ServerConn{Reader: r.Body, Writer: w, Flusher: flusher}, opt, peerIP)
+			handleSession(&h3ServerConn{Reader: r.Body, Writer: w, Flusher: flusher}, opt, peerIP, ingress)
 			return
 		}
 		release := opt.guard().Acquire(peerIP)
@@ -197,7 +209,7 @@ func Handler(opt Options) http.Handler {
 		}
 		defer conn.Close(websocket.StatusInternalError, "")
 		stream := websocket.NetConn(r.Context(), conn, websocket.MessageBinary)
-		handleSession(stream, opt, peerIP)
+		handleSession(stream, opt, peerIP, ingress)
 	}
 	mux.HandleFunc(path, wsHandler)
 	if path != protocol.LegacyWSPath {
@@ -261,8 +273,9 @@ func verifyHandshakeSig(pubkeyAuthorized string, hs *protocol.Handshake) bool {
 
 // handleSession authenticates one tunnel stream. peerIP is the resolved
 // client address (behind a CDN front the TCP peer is the edge, not the
-// client) and drives guard bans and the panel's device-IP view.
-func handleSession(stream net.Conn, opt Options, peerIP string) {
+// client) and drives guard bans and the panel's device-IP view. ingress
+// is the WithIngress marker ("" = public; IngressSSH = ssh transport).
+func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 	defer stream.Close()
 	metrics.SessionStarted()
 	defer metrics.SessionEnded()
@@ -452,18 +465,20 @@ func handleSession(stream net.Conn, opt Options, peerIP string) {
 	}
 	switch mode[0] {
 	case protocol.MuxMarker:
-		opt.serveMuxSession(sec, clientToken, peerStatus, peerReason, hs.Version)
+		opt.serveMuxSession(sec, clientToken, peerStatus, peerReason, hs.Version, ingress)
 	case protocol.UdpMarker:
-		serveUDPStream(sec, opt, clientToken, peerStatus)
+		serveUDPStream(sec, opt, clientToken, peerStatus, ingress)
 	default:
-		relayTarget(mode[0], sec, opt, clientToken, peerStatus, peerReason, hs.Version)
+		relayTarget(mode[0], sec, opt, clientToken, peerStatus, peerReason, hs.Version, ingress)
 	}
 }
 
 // relayTarget performs the classic single-target exchange on rw and pipes it
 // to the dialed upstream until both directions finish. Used by legacy
-// sessions and by every multiplexed stream. Traffic is recorded per-token.
-func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string, ver byte) {
+// sessions and by every multiplexed stream. Traffic is recorded per-token;
+// on ssh ingress the ssh-tier containment policy (sshtier.go) may cap the
+// stream and its bytes count against the device's daily ssh budget.
+func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string, ver byte, ingress string) {
 	defer rw.Close()
 	// Global kill switch: block every new stream while suspended — except
 	// the operator's allowlisted devices. The wire reason carries the
@@ -558,18 +573,28 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	buf1 := make([]byte, 256*1024)
 	buf2 := make([]byte, 256*1024)
 
-	// Per-device bandwidth cap (QoS): one shared token bucket paces both
-	// directions of this stream. 0 = unlimited.
+	// Per-device bandwidth cap (QoS) + ssh-tier containment: one shared
+	// token bucket paces both directions of this stream. 0 = unlimited.
+	// On ssh ingress the policy adds the sustained ceiling and, once the
+	// device's daily ssh budget is spent, the post-budget trickle rate —
+	// bulk stops reading as a media feed without bricking browsing.
+	pol := resolveStreamPolicy(opt, token, ingress)
 	var dst1, dst2 io.Writer = upstream, rw
-	if opt.PanelDB != nil && token != "" {
-		if maxBps, _ := opt.PanelDB.PeerLimits(token); maxBps > 0 {
-			burst := int(maxBps)
-			if burst < len(buf1) {
-				burst = len(buf1)
-			}
-			lim := rate.NewLimiter(rate.Limit(maxBps), burst)
-			dst1 = &limitedWriter{w: upstream, lim: lim}
-			dst2 = &limitedWriter{w: rw, lim: lim}
+	if pol.limitBps > 0 {
+		burst := int(pol.limitBps)
+		if burst < len(buf1) {
+			burst = len(buf1)
+		}
+		lim := rate.NewLimiter(rate.Limit(pol.limitBps), burst)
+		dst1 = &limitedWriter{w: upstream, lim: lim}
+		dst2 = &limitedWriter{w: rw, lim: lim}
+		if ingress == IngressSSH {
+			// Shape mimicry (segment.go): bulk on the ssh tier drains in
+			// segment-sized bursts with jittered gaps — a streaming
+			// player's fetch cadence, not a flat line-rate feed.
+			sp := defaultSegmentParams()
+			dst1 = newSegmentShaper(dst1, pol.limitBps, sp)
+			dst2 = newSegmentShaper(dst2, pol.limitBps, sp)
 		}
 	}
 
@@ -587,6 +612,9 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	<-done
 	if opt.PanelDB != nil && token != "" {
 		opt.PanelDB.RecordTraffic(token, n1, n2)
+	}
+	if pol.budgetBytes > 0 {
+		sshBudgetAdd(token, n1+n2)
 	}
 }
 
@@ -617,8 +645,10 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 }
 
 // serveMuxSession upgrades an authenticated secure stream into a smux
-// session; every stream inside carries one relayTarget exchange.
-func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peerReason string, ver byte) {
+// session; every stream inside carries one relayTarget exchange. ingress
+// travels with each stream so the ssh-tier containment policy applies to
+// the whole session's data (see sshtier.go).
+func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peerReason string, ver byte, ingress string) {
 	sess, err := smux.Server(sec, protocol.MuxConfig())
 	if err != nil {
 		o.logger().Printf("server: mux setup failed: %v", err)
@@ -647,14 +677,14 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 				return
 			}
 			if atyp[0] == protocol.UdpMarker {
-				serveUDPStream(s, o, token, peerStatus)
+				serveUDPStream(s, o, token, peerStatus, ingress)
 				return
 			}
 			if atyp[0] == protocol.CtrlMarker {
 				serveCtrlStream(s, o)
 				return
 			}
-			relayTarget(atyp[0], s, o, token, peerStatus, peerReason, ver)
+			relayTarget(atyp[0], s, o, token, peerStatus, peerReason, ver, ingress)
 		}(stream)
 	}
 }
@@ -714,6 +744,9 @@ func serveCtrlStream(rw deadlineRW, opt Options) {
 	if opt.CurrentPin != nil {
 		resp.Pin = opt.CurrentPin()
 	}
+	// Announced on every control response (status and health): the ssh
+	// tier's dial target survives CDN fronting without config updates.
+	resp.SSHHost = opt.SSHPublicHost
 	defer func() { _ = protocol.WriteCtrlMessage(rw, resp) }()
 	if opt.PanelDB == nil || req.Token == "" {
 		return
