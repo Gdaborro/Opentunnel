@@ -814,6 +814,12 @@ func serveCtrlStream(rw deadlineRW, opt Options, authTok string) {
 		opt.PanelDB.RecordHealth(authTok, req.Version, req.OS, req.Arch,
 			req.CPUPct, req.MemPct, req.TempC, req.UptimeS,
 			req.LatencyMs, req.JitterMs, req.ProbeLossPct)
+		if req.HostileNet {
+			// The device's own adaptive stealth latched hostile mode:
+			// a censor/middlebox is intercepting its TLS. Operator intel
+			// (v1.1.x), throttled per device by the sentinel.
+			opt.sentinel().HostileNet(authTok)
+		}
 		opt.PanelDB.TouchPeer(authTok)
 		resp.OK = true
 	}

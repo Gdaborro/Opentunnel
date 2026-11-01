@@ -209,6 +209,23 @@ func TestSentinelRollingWindow(t *testing.T) {
 	}
 }
 
+// TestSentinelHostileNet: device-reported TLS interception alerts once per
+// device per six hours, never per health report.
+func TestSentinelHostileNet(t *testing.T) {
+	st := newSentinelStub()
+	s := NewSentinel(st, nil)
+
+	s.HostileNet("hostile-device-token")
+	s.HostileNet("hostile-device-token")
+	s.HostileNet("hostile-device-token")
+	if n := strings.Count(st.alertText(), "TLS interception"); n != 1 {
+		t.Fatalf("want 1 throttled hostile alert, got %d", n)
+	}
+	if !strings.Contains(st.alertText(), "hostile-device-token"[:8]) {
+		t.Fatalf("alert must name the device prefix: %q", st.alertText())
+	}
+}
+
 // TestEnsureSentinelMemoizesAndWires: EnsureSentinel returns one shared
 // instance per Options and binds the panel DB as reporter (Handler() and
 // main.go's error-log writer rely on both properties).

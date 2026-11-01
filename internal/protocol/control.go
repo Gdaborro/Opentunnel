@@ -35,6 +35,10 @@ type CtrlRequest struct {
 	LatencyMs    float64 `json:"latency_ms,omitempty"`
 	JitterMs     float64 `json:"jitter_ms,omitempty"`
 	ProbeLossPct float64 `json:"probe_loss_pct,omitempty"`
+	// HostileNet reports that the client's own adaptive stealth latched
+	// hostile mode: this network intercepts TLS (censor / enterprise
+	// middlebox). Surfaced by the relay sentinel as operator intel.
+	HostileNet bool `json:"hostile_net,omitempty"`
 }
 
 // CtrlResponse answers a control request. Pin carries the relay's CURRENT

@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.1.1 — sentinel console + hostile-network intel
+
+### Added
+- **Standalone sentinel console** at `/admin/sentinel` (same pattern as
+  the kill-switch page — no SPA rebuild): switch the response mode
+  (`off` | `alert` | `respond`) and watch recent findings, auto-refreshing.
+- **Client-side hostile-network reporting**: the client's adaptive stealth
+  already latches when a network intercepts TLS; health reports now carry
+  that signal in-band, and the relay sentinel raises a throttled
+  per-device alert — the operator sees which networks are actively
+  MITM'ing devices.
+
+### Changed
+- Update floor raised to v1.1.1.
+
 ## v1.1.0 — proactive sentinel (detection + automated response)
 
 Every audit round so far was reactive: fix the hole after it is found.

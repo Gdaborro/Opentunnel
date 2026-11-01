@@ -1,8 +1,11 @@
 package panel
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -203,6 +206,50 @@ func TestSentinelTickOffIsSilent(t *testing.T) {
 	db.QueryRow(`SELECT COUNT(*) FROM alerts`).Scan(&alerts)
 	if alerts != 0 {
 		t.Fatalf("off mode must stay silent, got %d alerts", alerts)
+	}
+}
+
+// TestAPISentinel: GET defaults to respond + lists findings; POST validates
+// and persists the mode.
+func TestAPISentinel(t *testing.T) {
+	db := sentinelTestDB(t)
+	h := New(db, NewAuth(db), false)
+
+	rr := httptest.NewRecorder()
+	h.apiSentinel(rr, httptest.NewRequest("GET", "/admin/api/sentinel", nil))
+	if rr.Code != 200 {
+		t.Fatalf("GET code %d", rr.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["mode"] != "respond" {
+		t.Fatalf("default mode = %v, want respond", got["mode"])
+	}
+
+	rr = httptest.NewRecorder()
+	h.apiSentinel(rr, httptest.NewRequest("POST", "/admin/api/sentinel", strings.NewReader(`{"mode":"nuke"}`)))
+	if rr.Code != 400 {
+		t.Fatalf("invalid mode must 400, got %d", rr.Code)
+	}
+
+	rr = httptest.NewRecorder()
+	h.apiSentinel(rr, httptest.NewRequest("POST", "/admin/api/sentinel", strings.NewReader(`{"mode":"alert"}`)))
+	if rr.Code != 200 {
+		t.Fatalf("POST code %d", rr.Code)
+	}
+	if v := db.Setting("sentinel_mode"); v != "alert" {
+		t.Fatalf("persisted mode = %q, want alert", v)
+	}
+
+	// Findings surface in the GET payload.
+	db.RecordAlert("warning", "sentinel", "test finding")
+	rr = httptest.NewRecorder()
+	h.apiSentinel(rr, httptest.NewRequest("GET", "/admin/api/sentinel", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "test finding") || !strings.Contains(body, `"mode":"alert"`) {
+		t.Fatalf("GET payload missing finding/mode: %s", body)
 	}
 }
 

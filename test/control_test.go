@@ -130,3 +130,44 @@ func TestControlChannelIdentityBinding(t *testing.T) {
 		t.Fatalf("victim health rows = %d err=%v, want 0", n, err)
 	}
 }
+
+// TestControlHostileNetIntel (v1.1.x): a health report carrying the
+// client's hostile-network flag (its adaptive stealth saw TLS
+// interception) must raise a throttled sentinel alert — once, not once
+// per health report.
+func TestControlHostileNetIntel(t *testing.T) {
+	addr, fp, db := startPanelServer(t)
+	store, err := client.NewTokenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := store.LoadOrCreate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO peers(token,fingerprint,device_name,status,created_at,last_seen) VALUES(?,?,?,'approved',datetime('now'),datetime('now'))`,
+		device.Token, device.Fingerprint, "hostile-reporter"); err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+
+	cl := panelClient(addr, fp)
+	send := func() {
+		resp, err := cl.CtrlExchange(context.Background(), protocol.CtrlRequest{
+			Op: "health", Token: device.Token, Version: "v1.1.0", OS: "windows", Arch: "amd64",
+			HostileNet: true,
+		})
+		if err != nil || !resp.OK {
+			t.Fatalf("ctrl health: err=%v resp=%+v", err, resp)
+		}
+	}
+	send()
+	send()
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE kind='sentinel' AND message LIKE '%TLS interception%'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("hostile-net alert rows = %d, want exactly 1 (throttled)", n)
+	}
+}

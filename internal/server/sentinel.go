@@ -214,7 +214,12 @@ func (s *Sentinel) throttle(key string, d time.Duration) bool {
 // per-key so distinct subjects never mask each other, and stale keys
 // cannot re-alert more than once per window.
 func (s *Sentinel) alert(key, severity, kind, message string) {
-	if !s.throttle("alert|"+key, sentinelThrottle) {
+	s.alertD(key, severity, kind, message, sentinelThrottle)
+}
+
+// alertD is alert with an explicit throttle window.
+func (s *Sentinel) alertD(key, severity, kind, message string, d time.Duration) {
+	if !s.throttle("alert|"+key, d) {
 		return
 	}
 	if s.rep != nil {
@@ -313,6 +318,20 @@ func (s *Sentinel) GuardDenied(ip string) {
 	}
 	s.alert("denied|"+ip, "warning", "sentinel",
 		fmt.Sprintf("rate-limit pressure from %s: %d denied arrivals in %s (cap or ban active)", ip, n, sentinelGuardWindow))
+}
+
+// HostileNet: a device reports that its local network intercepts TLS (its
+// adaptive stealth latched hostile mode) — a censor or enterprise
+// middlebox is actively MITM'ing that device. Health reports arrive every
+// few minutes while the condition persists, so the alert is throttled to
+// one per device per six hours: visible, never a storm.
+func (s *Sentinel) HostileNet(token string) {
+	if token == "" || !s.active() {
+		return
+	}
+	s.hit("hostile", token, 24*time.Hour)
+	s.alertD("hostile|"+token, "warning", "sentinel",
+		"device "+shortToken(token)+" reports TLS interception on its current network (hostile middlebox)", 6*time.Hour)
 }
 
 // SessionStart: one authenticated session began. Watches per-device churn

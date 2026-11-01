@@ -189,6 +189,11 @@ func (h *HealthReporter) reportOnce() {
 			Version: s.version, OS: s.osName, Arch: s.arch,
 			CPUPct: s.cpuPct, MemPct: s.memPct, TempC: s.tempC, UptimeS: s.uptimeS,
 			LatencyMs: s.latencyMs, JitterMs: s.jitterMs, ProbeLossPct: s.lossPct,
+			// Hostile-network intel (v1.1.x): the adaptive dialer latches
+			// this when pinned TLS fails everywhere — exactly the network
+			// where the in-band channel is the only lifeline, so report it
+			// here. The panel raises a throttled sentinel alert.
+			HostileNet: HostileMode(),
 		})
 		cancel()
 		if err == nil && resp != nil && resp.OK {
