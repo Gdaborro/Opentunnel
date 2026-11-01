@@ -105,6 +105,11 @@ type Options struct {
 	// migration window. The per-peer v5_seen gate is always active
 	// regardless.
 	RequireV5After time.Time
+	// Sntl is the process-wide proactive detector (sentinel.go, v1.1.0):
+	// detection alerts plus the automated response ladder. main.go wires it
+	// with the panel reporter and the session guard; Handler() lazily
+	// creates one when unset (tests, direct construction).
+	Sntl *Sentinel
 }
 
 func (o *Options) guard() *Guard {
@@ -137,6 +142,10 @@ func (o *Options) logger() *log.Logger {
 // Handler returns an http.Handler that upgrades tunnel requests on wsPath and
 // serves the decoy page for everything else. Mount behind a TLS listener.
 func Handler(opt Options) http.Handler {
+	// One sentinel for the whole handler tree: every closure below shares
+	// this copy, and main.go pre-seeds opt.Sntl so the HTTP error log
+	// (tlserr.go) reports into the same instance.
+	opt.EnsureSentinel()
 	mux := http.NewServeMux()
 	path := opt.wsPath()
 	if path[0] != '/' {
@@ -155,6 +164,7 @@ func Handler(opt Options) http.Handler {
 		if r.ProtoMajor == 3 {
 			release := opt.guard().Acquire(peerIP)
 			if release == nil {
+				opt.sentinel().GuardDenied(peerIP)
 				decoyHandler.ServeHTTP(w, r)
 				return
 			}
@@ -179,6 +189,7 @@ func Handler(opt Options) http.Handler {
 		release := opt.guard().Acquire(peerIP)
 		if release == nil {
 			// Over limit or banned: indistinguishable from the normal site.
+			opt.sentinel().GuardDenied(peerIP)
 			decoyHandler.ServeHTTP(w, r)
 			return
 		}
@@ -188,6 +199,7 @@ func Handler(opt Options) http.Handler {
 			// Not a tunnel after all: serve exactly what every other path
 			// serves. A Go-native "404 page not found" here would both
 			// fingerprint the server and mark the endpoint for active probers.
+			opt.sentinel().Probe(peerIP, "plain")
 			decoyHandler.ServeHTTP(w, r)
 			return
 		}
@@ -288,6 +300,7 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 			st = protocol.StatusBadToken
 		}
 		opt.guard().Punish(peerIP)
+		opt.sentinel().AuthFail(peerIP)
 		opt.logger().Printf("server: handshake rejected: %v", err)
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			_ = protocol.WriteHandshakeStatus(stream, protocol.ProtoVersion, st)
@@ -308,8 +321,7 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 				opt.logger().Printf("server: no registered key for %s — v5 signature not enforced this session", shortToken(hs.Token))
 			} else if !verifyHandshakeSig(pub, hs) {
 				opt.guard().Punish(peerIP)
-				opt.PanelDB.RecordAlert("critical", "security",
-					"handshake signature mismatch for device "+shortToken(hs.Token)+" — possible stolen token")
+				opt.sentinel().StolenToken(hs.Token, peerIP, "handshake signature mismatch")
 				opt.logger().Printf("server: v5 signature mismatch for %s", shortToken(hs.Token))
 				_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
 				return
@@ -332,8 +344,7 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 			}
 			if enforce {
 				opt.guard().Punish(peerIP)
-				opt.PanelDB.RecordAlert("critical", "security",
-					"v4 downgrade attempt for device "+shortToken(hs.Token)+" — possible stolen token (send v5)")
+				opt.sentinel().StolenToken(hs.Token, peerIP, "v4 downgrade attempt")
 				opt.logger().Printf("server: v4 downgrade attempt for %s (v5 required)", shortToken(hs.Token))
 				_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
 				return
@@ -348,6 +359,7 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 		// retry as part of normal flow and must not trip IP bans.
 		if status == protocol.StatusBadToken {
 			opt.guard().Punish(peerIP)
+			opt.sentinel().AuthFail(peerIP)
 		}
 		return
 	}
@@ -414,6 +426,7 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 	if opt.PanelDB != nil {
 		go opt.PanelDB.SetPeerIP(clientToken, peerIP)
 	}
+	opt.sentinel().SessionStart(clientToken, peerIP)
 	var peerStatus = "approved"
 	var peerReason string
 	if opt.PanelDB != nil {

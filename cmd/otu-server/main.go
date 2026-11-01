@@ -205,6 +205,10 @@ func main() {
 	} // else: leave the interface nil (a typed-nil *DB would defeat the
 	// nil checks and crash the relay on first use — legacy static-token
 	// mode when the panel is disabled).
+	// Sentinel (v1.1.0): one instance shared by the relay handlers and the
+	// HTTP error log (scanner intel); pre-seeding here makes Handler() use
+	// this one instead of lazily creating its own.
+	sntl := baseOpts.EnsureSentinel()
 	baseHandler := server.Handler(baseOpts)
 	var handler http.Handler = baseHandler
 	if panelDB != nil {
@@ -273,6 +277,9 @@ func main() {
 		// applies, so tunnel sessions are unaffected.
 		ReadTimeout: 60 * time.Second,
 		TLSConfig:   tlsCfg,
+		// v1.1.0: TLS handshake errors double as scanner intel — forward
+		// them to the sentinel (tlserr.go) while keeping journal parity.
+		ErrorLog: log.New(server.SentinelLogWriter(sntl, os.Stderr), "", 0),
 	}
 
 	// Optional second listener sharing the same handler and certificate —

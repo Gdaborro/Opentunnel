@@ -413,12 +413,23 @@ func (db *DB) SetPeerLimits(token, schedule string, maxBps, quotaBytes int64) {
 	db.Exec(`UPDATE peers SET schedule=?, max_bps=?, quota_bytes=? WHERE token=?`, schedule, maxBps, quotaBytes, token)
 }
 
-// SetPeerIP records the last seen source IP for a device (GeoIP in panel).
+// SetPeerIP records the last seen source IP for a device (GeoIP in panel)
+// and appends a history row for the sentinel's travel analysis (v1.1.0):
+// one row per IP change, capped at 200 rows per device and pruned to seven
+// days by the reaper.
 func (db *DB) SetPeerIP(token, ip string) {
-	if db == nil {
+	if db == nil || token == "" || ip == "" {
 		return
 	}
 	db.Exec(`UPDATE peers SET last_ip=? WHERE token=?`, ip, token)
+	var last string
+	db.QueryRow(`SELECT COALESCE(ip,'') FROM peer_ips WHERE token=? ORDER BY rowid DESC LIMIT 1`, token).Scan(&last)
+	if last == ip {
+		return
+	}
+	db.Exec(`INSERT INTO peer_ips(token, ip) VALUES(?,?)`, token, ip)
+	db.Exec(`DELETE FROM peer_ips WHERE token=? AND rowid NOT IN
+		(SELECT rowid FROM peer_ips WHERE token=? ORDER BY rowid DESC LIMIT 200)`, token, token)
 }
 
 // scheduleWindow is one allowed daily interval (minutes since midnight).

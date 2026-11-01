@@ -1,5 +1,46 @@
 # Changelog
 
+## v1.1.0 — proactive sentinel (detection + automated response)
+
+Every audit round so far was reactive: fix the hole after it is found.
+This release flips the direction — the relay and panel now watch their
+own traffic for attack patterns and, when configured to, respond
+automatically. No wire-protocol changes; the 1.0.1 client is unaffected
+(the update floor moves to v1.1.0).
+
+### Added
+- **Relay-side sentinel** (`internal/server/sentinel.go`): rolling-window
+  detection for auth-failure floods, active probing (non-upgrade requests
+  on the tunnel path, junk TLS handshakes), rate-limit pressure,
+  per-device session churn and per-IP session bursts. Findings land in
+  the panel alert feed (kind `sentinel`), throttled per subject — no
+  alert storms, ever.
+- **Response ladder** — `sentinel_mode` is `off` | `alert` | `respond`
+  (default `respond`; GET/POST `/admin/api/sentinel`):
+  - auth-failure flood from one IP → 30-minute guard ban (the peer keeps
+    receiving the decoy page; the ban stays invisible);
+  - stolen-token evidence (v5 signature mismatch, or a v4 downgrade from
+    a peer that has proven v5 key possession) → 60-minute automated
+    device kick + critical alert;
+  - impossible travel (same device from two countries within 30 minutes)
+    → 30-minute automated kick + critical alert.
+  Every action self-expires; allowlisted operator devices are never
+  auto-kicked.
+- **Panel-side detectors** (`internal/panel/sentinel.go`, one-minute
+  tick): impossible travel (new `peer_ips` connection history, GeoIP),
+  source-IP spread per device (shared or leaked token), and registration
+  bursts per /24. Throttles persist in the DB — restarts never re-fire.
+- **TLS-layer scanner intel**: handshake errors are classified (obsolete
+  TLS, plain HTTP sent to the TLS port, junk bytes, cipher mismatch) per
+  source and fed to the sentinel as probe events.
+- Registration now records the registrant's source IP (`last_ip`) so the
+  burst detector works before the first tunnel session.
+
+### Changed
+- Stolen-token and downgrade alerts flow through the sentinel: throttled,
+  and able to drive the automated response in `respond` mode.
+- Update floor raised to v1.1.0 (build-stamped as of 1.0.1).
+
 ## v1.0.1 — security hardening (audit round four)
 
 Ten hardening items across the relay, panel, client and update chain. No

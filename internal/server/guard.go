@@ -146,6 +146,20 @@ func (g *Guard) releaseSlot(ip string) {
 	g.mu.Unlock()
 }
 
+// BanIP applies an explicit temporary ban (sentinel L2 response). Banned
+// peers see the decoy page like everyone else — the ban stays invisible.
+func (g *Guard) BanIP(ip string, d time.Duration) {
+	if ip == "" || isLoopbackIP(ip) {
+		return
+	}
+	g.mu.Lock()
+	until := time.Now().Add(d)
+	if cur, ok := g.bans[ip]; !ok || cur.Before(until) {
+		g.bans[ip] = until
+	}
+	g.mu.Unlock()
+}
+
 // Punish records a failed handshake and escalates the peer's ban.
 func (g *Guard) Punish(ip string) {
 	if isLoopbackIP(ip) {

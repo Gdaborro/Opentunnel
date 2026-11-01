@@ -110,6 +110,13 @@ func migrate(db *sql.DB) error {
 		acked INTEGER DEFAULT 0,
 		at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
+	CREATE TABLE IF NOT EXISTS peer_ips (
+		token TEXT NOT NULL,
+		ip TEXT NOT NULL,
+		at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_peer_ips_token ON peer_ips(token);
+	CREATE INDEX IF NOT EXISTS idx_peer_ips_at ON peer_ips(at);
 	`)
 	if err != nil {
 		return err
@@ -154,6 +161,8 @@ func reaper(db *DB, purgeAfterDays int) {
 		db.Exec(`DELETE FROM visits WHERE token NOT IN (SELECT token FROM peers)`)
 		db.Exec(`DELETE FROM daily_usage WHERE token NOT IN (SELECT token FROM peers)`)
 		db.Exec(`DELETE FROM device_health WHERE token NOT IN (SELECT token FROM peers)`)
+		db.Exec(`DELETE FROM peer_ips WHERE token NOT IN (SELECT token FROM peers)`)
+		db.Exec(`DELETE FROM peer_ips WHERE at < datetime('now','-7 days')`)
 		db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE status='kicked' AND kick_expires IS NOT NULL AND kick_expires < datetime('now')`)
 		db.Exec(`DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 500)`)
 		db.offlineSweep()

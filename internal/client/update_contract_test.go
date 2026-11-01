@@ -9,9 +9,10 @@ import (
 )
 
 // TestBelowMinTagFloor: the floor refuses signed-but-old releases (audit
-// round three N-3 / round four downgrade class). As of 1.0.1 the floor is
-// a build-stamped variable raised to each release's own tag — update the
-// three "current era" expectations whenever the release stamp moves.
+// round three N-3 / round four downgrade class). The floor is a
+// build-stamped variable raised to each release's own tag — update the
+// "current era" expectations whenever the in-tree default moves (v1.1.0
+// as of the sentinel release).
 func TestBelowMinTagFloor(t *testing.T) {
 	cases := []struct {
 		tag  string
@@ -20,11 +21,13 @@ func TestBelowMinTagFloor(t *testing.T) {
 		{"v0.9.26", true},
 		{"0.9.26", true},
 		{"v0.0.1", true},
-		{"v0.9.27", true}, // below the v1.0.1 floor (was the old static floor)
+		{"v0.9.27", true}, // below the v1.1.0 floor (was an old static floor)
 		{"v0.9.28", true},
 		{"v1.0.0", true},
-		{"v1.0.1", false}, // the floor itself is installable
-		{"v1.0.2", false},
+		{"v1.0.1", true},
+		{"v1.0.2", true},  // still below the v1.1.0 floor
+		{"v1.1.0", false}, // the floor itself is installable
+		{"v1.1.1", false},
 		{"v2.0.0", false},
 		{"garbage", true}, // unparseable → refuse
 		{"", true},

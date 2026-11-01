@@ -139,6 +139,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.Handle("/admin/api/events", h.auth.RequireAuth(http.HandlerFunc(h.apiEvents)))
 	mux.Handle("/admin/api/settings", h.auth.RequireAuth(http.HandlerFunc(h.apiSettings)))
 	mux.Handle("/admin/api/alerts", h.auth.RequireAuth(http.HandlerFunc(h.apiAlerts)))
+	mux.Handle("/admin/api/sentinel", h.auth.RequireAuth(http.HandlerFunc(h.apiSentinel)))
 	mux.Handle("/admin/api/devices", h.auth.RequireAuth(http.HandlerFunc(h.apiDevices)))
 	mux.Handle("/admin/api/server-health", h.auth.RequireAuth(http.HandlerFunc(h.apiServerHealth)))
 	mux.Handle("/admin/", h.auth.RequireAuth(http.HandlerFunc(h.dashboard)))
@@ -626,6 +627,55 @@ func (h *Handler) apiEvents(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(h.db.RecentEvents(50))
 }
 
+// apiSentinel (v1.1.0): visibility and control for the proactive
+// detectors. GET returns the response mode and recent findings; POST sets
+// the mode (off | alert | respond). The relay-side detectors pick the new
+// mode up within ~15s (their settings cache).
+func (h *Handler) apiSentinel(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		mode := strings.TrimSpace(h.db.Setting("sentinel_mode"))
+		if mode == "" {
+			mode = "respond"
+		}
+		var c24 int
+		h.db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE kind IN ('sentinel','security') AND at > datetime('now','-1 day')`).Scan(&c24)
+		type finding struct {
+			Severity string `json:"severity"`
+			Message  string `json:"message"`
+			At       string `json:"at"`
+		}
+		recent := []finding{}
+		if rows, err := h.db.Query(`SELECT severity, COALESCE(message,''), at FROM alerts WHERE kind='sentinel' ORDER BY id DESC LIMIT 20`); err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var f finding
+				if rows.Scan(&f.Severity, &f.Message, &f.At) == nil {
+					recent = append(recent, f)
+				}
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"mode": mode, "alerts_24h": c24, "recent": recent})
+		return
+	}
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		http.Error(w, "mode required", 400)
+		return
+	}
+	mode := strings.TrimSpace(req.Mode)
+	switch mode {
+	case "off", "alert", "respond":
+	default:
+		http.Error(w, "mode must be off | alert | respond", 400)
+		return
+	}
+	h.db.SetSetting("sentinel_mode", mode)
+	h.db.RecordEvent("sentinel", "response mode set to "+mode)
+	json.NewEncoder(w).Encode(map[string]string{"mode": mode})
+}
+
 func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		sshMax, sshDaily, sshTrickle := h.db.SSHTierLimits()
@@ -827,6 +877,9 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	// Only set status on first insert; existing peers keep their current status
 	res, _ := h.db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen) VALUES(?,?,?, ?, ?, datetime('now'), datetime('now'))`,
 		req.Token, req.Fingerprint, req.DeviceName, req.SSHPubKey, status)
+	// Record the registrant's source IP (v1.1.0): feeds the registration-
+	// burst detector and the travel history until the first tunnel connects.
+	h.db.SetPeerIP(req.Token, clientIP(r))
 	if n, _ := res.RowsAffected(); n == 0 {
 		h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=COALESCE(NULLIF(ssh_pubkey,''),?) WHERE token=?`, req.SSHPubKey, req.Token)
 		var existingStatus string

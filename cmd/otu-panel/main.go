@@ -208,6 +208,18 @@ func main() {
 		}()
 	}
 
+	// Proactive detectors (v1.1.0): travel / IP-spread / registration-burst
+	// once a minute. Findings and actions are throttled per subject
+	// (persistently — restarts never re-fire), and the tick is a no-op
+	// while the response mode is "off" (/admin/api/sentinel).
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			panelDB.SentinelTick(geo.CountryName)
+		}
+	}()
+
 	log.Printf("otu-panel %s listening on %s", version.Version, *listen)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
