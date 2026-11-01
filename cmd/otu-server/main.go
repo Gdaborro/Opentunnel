@@ -245,6 +245,13 @@ func main() {
 		// panel's CSRF origin check needs the host the browser actually
 		// used (production incident 2026-10-28).
 		stampIP := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 1.0.1: strip client-named hop-by-hop headers FIRST. The
+			// stdlib reverse proxy removes headers the client listed in
+			// `Connection:` when it forwards, so a request carrying
+			// `Connection: X-Otu-Client-IP` used to delete our trusted
+			// stamps AFTER they were set — collapsing the panel's per-IP
+			// rate limits and login lockout into one shared bucket.
+			server.SanitizeConnectionHeaders(r.Header)
 			r.Header.Set("X-Otu-Client-IP", server.ResolveClientIP(r, cfg.TrustCloudflareIPs))
 			r.Header.Set("X-Otu-Original-Host", r.Host)
 			proxy.ServeHTTP(w, r)
@@ -261,7 +268,11 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 15 * time.Second,
-		TLSConfig:         tlsCfg,
+		// 1.0.1: bound slow request bodies too (slowloris on the proxied
+		// admin/token trees). WebSocket upgrades hijack before this
+		// applies, so tunnel sessions are unaffected.
+		ReadTimeout: 60 * time.Second,
+		TLSConfig:   tlsCfg,
 	}
 
 	// Optional second listener sharing the same handler and certificate —
@@ -296,6 +307,7 @@ func main() {
 		intSrv = &http.Server{
 			Handler:           server.WithIngress(handler, server.IngressSSH),
 			ReadHeaderTimeout: 15 * time.Second,
+			ReadTimeout:       60 * time.Second,
 		}
 		go func() {
 			if ierr := intSrv.Serve(intLn); ierr != nil && ierr != http.ErrServerClosed {

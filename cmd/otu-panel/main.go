@@ -89,47 +89,39 @@ func main() {
 	}
 
 	// Approving a device installs/refreshes its SSH public key in the ssh
-	// tier's authorized_keys with least-privilege options: no
-	// shell/exec/pty/agent/X11, forwarding ONLY to the internal ws
-	// listener, no remote forwards. The rewrite is idempotent and heals
-	// legacy rows: a bare or stale-option line for the same key is
-	// replaced with the current canonical form (audit rounds two/three).
+	// tier's authorized_keys. The canonical line carries a forced command
+	// (1.0.1, N-11: `restrict` alone still permits non-PTY command
+	// execution and SFTP — proven empirically against OpenSSH 10.0) plus
+	// least-privilege options: forwarding ONLY to the internal ws
+	// listener. The rewrite is idempotent, drops malformed lines it finds,
+	// and refuses keys that fail validation outright. Ban and delete
+	// remove the key again — N-12: revocation is real.
+	akPath := os.Getenv("OTU_AUTHORIZED_KEYS")
+	if akPath == "" {
+		akPath = filepath.Join(stateDir, "authorized_keys")
+	}
 	ph.WithApproveHook(func(token string) {
-		pub := strings.TrimSpace(ph.SSHKeyPath(token))
-		if pub == "" {
+		pub, ok := panel.CanonicalSSHPubKey(ph.SSHKeyPath(token))
+		if !ok {
 			return
-		}
-		akPath := os.Getenv("OTU_AUTHORIZED_KEYS")
-		if akPath == "" {
-			akPath = filepath.Join(stateDir, "authorized_keys")
 		}
 		if _, err := os.Stat(akPath); err != nil {
 			return
 		}
-		canonical := `restrict,port-forwarding,permitopen="` + permitTarget + `" ` + pub
-		content := readFileString(akPath)
-		if strings.Contains(content, canonical) {
-			return // already current
+		if _, err := panel.UpsertAuthorizedKey(akPath, pub, permitTarget); err != nil {
+			log.Printf("panel: authorize ssh key for %s: %v", shortLogTok(token), err)
 		}
-		lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
-		if len(lines) == 1 && lines[0] == "" {
-			lines = nil
+	})
+	ph.WithRevokeHook(func(token string) {
+		pub, ok := panel.CanonicalSSHPubKey(ph.SSHKeyPath(token))
+		if !ok {
+			return
 		}
-		replaced := false
-		for i, l := range lines {
-			if strings.Contains(l, pub) {
-				lines[i] = canonical
-				replaced = true
-			}
+		if _, err := os.Stat(akPath); err != nil {
+			return
 		}
-		if !replaced {
-			lines = append(lines, canonical)
-		}
-		out := strings.Join(lines, "\n") + "\n"
-		tmp := akPath + ".tmp"
-		if err := os.WriteFile(tmp, []byte(out), 0o600); err != nil || os.Rename(tmp, akPath) != nil {
-			_ = os.Remove(tmp)
-			log.Printf("panel: authorize ssh key for %s: write failed", token[:8])
+		if _, err := panel.RemoveAuthorizedKey(akPath, pub); err != nil {
+			log.Printf("panel: revoke ssh key for %s: %v", shortLogTok(token), err)
 		}
 	})
 
@@ -137,6 +129,10 @@ func main() {
 		Addr:              *listen,
 		Handler:           ph.Handler(),
 		ReadHeaderTimeout: 15 * time.Second,
+		// 1.0.1: bound reads and writes (slowloris; the login endpoint was
+		// unbounded before the body cap landed on it).
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
 	}
 
 	go func() {
@@ -218,7 +214,10 @@ func main() {
 	}
 }
 
-func readFileString(path string) string {
-	data, _ := os.ReadFile(path)
-	return string(data)
+// shortLogTok is an 8-char log prefix (device tokens are >=16 chars).
+func shortLogTok(t string) string {
+	if len(t) > 8 {
+		return t[:8]
+	}
+	return t
 }

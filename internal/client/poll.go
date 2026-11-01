@@ -138,7 +138,8 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 // fallback here: at startup the device may be approved, and a live token
 // must never cross an intercepting middlebox.
 func TokenStatus(cfg *config.ClientConf, token string) (status, kickReason, banReason, kickExpires string, err error) {
-	return checkTokenStatus(cfg, token, false)
+	status, kickReason, banReason, kickExpires, _, err = checkTokenStatus(cfg, token, false)
+	return
 }
 
 // PollTokenStatus watches the panel for admission changes (approval, kick,
@@ -177,7 +178,7 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 		everApproved = ts.EverApproved(device.Fingerprint)
 	}
 	bootstrap := !everApproved && (*last == "" || *last == "pending" || *last == "expired")
-	status, kickReason, banReason, kickExpires, err := checkTokenStatus(cfg, device.Token, bootstrap)
+	status, kickReason, banReason, kickExpires, trusted, err := checkTokenStatus(cfg, device.Token, bootstrap)
 	if err != nil {
 		return // transient network error — keep the last known state
 	}
@@ -189,7 +190,13 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 		// Durable approval marker (fingerprint-keyed): from now on this
 		// device's token never crosses a system-trusted channel again,
 		// across restarts and re-registrations.
-		if status == "approved" {
+		//
+		// 1.0.1 (N-2): only a TRUSTED channel may write durable state. A
+		// plain (system-roots) response is display-only — a MITM
+		// answering "approved" must not flip the ever-approved marker
+		// and strand onboarding, and a forged "banned" must not persist
+		// a hard ban across restarts.
+		if status == "approved" && trusted {
 			ts.MarkApproved(device.Fingerprint)
 		}
 	}
@@ -197,9 +204,13 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 	case "approved":
 		fmt.Println("[+] Access granted — this device is online.")
 		// An unban that landed while we carry stale local markers (or a
-		// pending grace shutdown) takes effect immediately.
-		if ts, terr := NewTokenStore(); terr == nil {
-			ts.ClearBan()
+		// pending grace shutdown) takes effect immediately. Cleared only
+		// on a trusted verdict (1.0.1, N-2): an intercepting middlebox
+		// must not be able to lift a real ban's local marker.
+		if trusted {
+			if ts, terr := NewTokenStore(); terr == nil {
+				ts.ClearBan()
+			}
 		}
 		if onApproved != nil {
 			onApproved()
@@ -214,8 +225,15 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 			fmt.Printf("[!] Access paused: %s\n", kickReason)
 		}
 	case "banned":
-		ts, _ := NewTokenStore()
-		ts.WriteHardBan(banReason, "permanent")
+		// The session-level notice applies either way (a real ban must be
+		// visible immediately), but the DURABLE marker waits for a
+		// trusted verdict (1.0.1, N-2): a forged plain-channel "banned"
+		// used to brick the next start with os.Exit(1).
+		if trusted {
+			if ts, terr := NewTokenStore(); terr == nil {
+				ts.WriteHardBan(banReason, "permanent")
+			}
+		}
 		if onBan != nil {
 			onBan(banReason)
 		} else {
@@ -232,7 +250,11 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 	}
 }
 
-func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback bool) (status, kickReason, banReason, kickExpires string, err error) {
+// checkTokenStatus resolves a token's state. The trusted return reports
+// whether the answer came from a cryptographically anchored channel
+// (in-band session or pinned HTTPS): only those may drive DURABLE local
+// state — plain bootstrap answers are display-only (1.0.1, N-2).
+func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback bool) (status, kickReason, banReason, kickExpires string, trusted bool, err error) {
 	// In-band first: on TLS-intercepting networks pinned HTTPS cannot
 	// connect by design, and the authenticated session is the covert
 	// path everywhere else too. Servers predating v0.9.23 close the
@@ -242,14 +264,14 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 		resp, cerr := fn(ctx, protocol.CtrlRequest{Op: "status", Token: token})
 		cancel()
 		if cerr == nil && resp != nil && resp.OK {
-			return resp.Status, resp.KickReason, resp.BanReason, resp.KickExpires, nil
+			return resp.Status, resp.KickReason, resp.BanReason, resp.KickExpires, true, nil
 		}
 	}
 	var pinnedErr error
 	if cl, base, perr := panelHTTP(cfg); perr == nil {
 		st, kr, br, ke, ferr := fetchStatus(cl, base, token, true)
 		if ferr == nil {
-			return st, kr, br, ke, nil
+			return st, kr, br, ke, true, nil
 		}
 		pinnedErr = ferr
 	} else {
@@ -261,9 +283,10 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 		// networks. The token is not yet a live credential here — and
 		// the legacy query-GET form is never used on this path (the
 		// token would ride the URL line straight into proxy logs).
-		return fetchStatus(plainHTTPClient(), "https://"+cfg.SNIHost(), token, false)
+		st, kr, br, ke, ferr := fetchStatus(plainHTTPClient(), "https://"+cfg.SNIHost(), token, false)
+		return st, kr, br, ke, false, ferr
 	}
-	return "", "", "", "", pinnedErr
+	return "", "", "", "", false, pinnedErr
 }
 
 // fetchStatus asks the panel for a token's admission state over the given

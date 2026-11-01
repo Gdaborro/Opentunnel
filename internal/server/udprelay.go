@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/time/rate"
 
@@ -32,6 +34,17 @@ func serveUDPStream(rw io.ReadWriteCloser, opt Options, token, peerStatus, ingre
 		// kept flowing for banned/kicked devices with zero accounting.
 		return
 	}
+	// Live verdict (1.0.1): a ban/kick that lands mid-session must stop
+	// datagram flow too, not just the next handshake.
+	if st, _, _, ok := opt.currentVerdict(token); ok && (st == "banned" || st == "kicked") {
+		return
+	}
+	// Setup deadline: without it a peer could open UDP streams and never
+	// send a frame, holding a stream slot and the session semaphore
+	// forever (1.0.1). Lifted on the first datagram.
+	if d, ok := rw.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = d.SetDeadline(time.Now().Add(15 * time.Second))
+	}
 
 	// Per-device cap + ssh-tier containment: datagrams used to leave
 	// unmeasured; the same policy that paces TCP streams now paces
@@ -52,35 +65,69 @@ func serveUDPStream(rw io.ReadWriteCloser, opt Options, token, peerStatus, ingre
 		}()
 	}
 
-	pc, err := net.ListenPacket("udp", "")
-	if err != nil {
-		opt.logger().Printf("server: udp relay listen: %v", err)
-		return
-	}
-	defer pc.Close()
-
-	// Socket → client.
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, from, err := pc.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			down.Add(int64(n))
-			src := udpAddrToAddress(from)
-			if src == nil {
-				continue
-			}
-			if err := protocol.WriteUDPFrame(rw, src, buf[:n]); err != nil {
-				return
-			}
+	// The outbound UDP socket is created lazily on the first datagram: a
+	// stream that never sends one costs nothing (1.0.1 — every mux stream
+	// used to mint a socket plus a 64 KiB read goroutine up front, so 512
+	// idle streams per session exhausted relay fds).
+	var pc net.PacketConn
+	var pcOnce sync.Once
+	var pcErr error
+	defer func() {
+		if pc != nil {
+			_ = pc.Close()
 		}
 	}()
+	ensurePC := func() error {
+		pcOnce.Do(func() {
+			pc, pcErr = net.ListenPacket("udp", "")
+			if pcErr != nil {
+				return
+			}
+			// Socket → client.
+			go func(conn net.PacketConn) {
+				buf := make([]byte, 65535)
+				for {
+					n, from, rerr := conn.ReadFrom(buf)
+					if rerr != nil {
+						return
+					}
+					down.Add(int64(n))
+					src := udpAddrToAddress(from)
+					if src == nil {
+						continue
+					}
+					if werr := protocol.WriteUDPFrame(rw, src, buf[:n]); werr != nil {
+						return
+					}
+				}
+			}(pc)
+		})
+		return pcErr
+	}
 
+	lastVerdict := time.Now()
+	firstFrame := true
 	for {
 		dst, payload, err := protocol.ReadUDPFrame(rw)
 		if err != nil {
+			return
+		}
+		if firstFrame {
+			firstFrame = false
+			if d, ok := rw.(interface{ SetDeadline(time.Time) error }); ok {
+				_ = d.SetDeadline(time.Time{})
+			}
+		}
+		// Periodic live-verdict re-check: a mid-session ban/kick stops
+		// datagrams within ~10s, independent of client cooperation.
+		if time.Since(lastVerdict) > 10*time.Second {
+			lastVerdict = time.Now()
+			if st, _, _, ok := opt.currentVerdict(token); ok && (st == "banned" || st == "kicked") {
+				return
+			}
+		}
+		if err := ensurePC(); err != nil {
+			opt.logger().Printf("server: udp relay listen: %v", err)
 			return
 		}
 		// Kill switch drops datagrams while suspended — the operator's

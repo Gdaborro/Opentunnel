@@ -24,12 +24,16 @@ func TestCheckTokenStatusInBandFirst(t *testing.T) {
 	t.Cleanup(func() { SetControlChannel(nil) })
 
 	cfg := &config.ClientConf{ServerAddr: "unreachable.test:443", Fingerprint: ""}
-	status, kickReason, banReason, kickExpires, err := checkTokenStatus(cfg, "dev-tok", false)
+	status, kickReason, banReason, kickExpires, trusted, err := checkTokenStatus(cfg, "dev-tok", false)
 	if err != nil {
 		t.Fatalf("checkTokenStatus: %v", err)
 	}
 	if status != "approved" || kickReason != "kr" || banReason != "br" || kickExpires != "ke" {
 		t.Fatalf("status = %q %q %q %q", status, kickReason, banReason, kickExpires)
+	}
+	// In-band is a trusted channel (1.0.1, N-2): durable state may follow.
+	if !trusted {
+		t.Fatal("in-band response must be marked trusted")
 	}
 }
 
@@ -39,7 +43,7 @@ func TestCheckTokenStatusInBandFirst(t *testing.T) {
 func TestCheckTokenStatusNoPlainForApproved(t *testing.T) {
 	SetControlChannel(nil)
 	cfg := &config.ClientConf{ServerAddr: "unreachable.test:443", Fingerprint: ""}
-	if _, _, _, _, err := checkTokenStatus(cfg, "live-token", false); err == nil {
+	if _, _, _, _, _, err := checkTokenStatus(cfg, "live-token", false); err == nil {
 		t.Fatal("approved-state poll must not fall back to plain HTTPS")
 	}
 }

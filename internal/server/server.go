@@ -480,6 +480,13 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 // stream and its bytes count against the device's daily ssh budget.
 func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string, ver byte, ingress string) {
 	defer rw.Close()
+	// Setup-phase deadline (1.0.1): target parsing + upstream dial must
+	// finish within 15s or the stream is abandoned — an authenticated peer
+	// could otherwise park streams forever holding mux stream slots and
+	// the per-session semaphore while sending nothing. Lifted once the
+	// relay is connected; no data-phase deadlines (long transfers must
+	// never be guillotined — TestRelaySurvivesSlowTransfer).
+	_ = rw.SetDeadline(time.Now().Add(15 * time.Second))
 	// Global kill switch: block every new stream while suspended — except
 	// the operator's allowlisted devices. The wire reason carries the
 	// "down:" prefix and the admin's text, so the client renders the
@@ -493,21 +500,28 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 		_ = protocol.WriteToken(rw, "blocked:down:"+reason)
 		return
 	}
-	// ISP-level ban/kick handling
-	if peerStatus == "banned" {
-		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
-		_ = protocol.WriteToken(rw, "banned:"+peerReason)
-		return
-	}
-	if peerStatus == "kicked" {
-		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
-		_ = protocol.WriteToken(rw, "kicked:"+peerReason)
-		return
-	}
-	if peerStatus == "kicked-silent" {
-		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
-		_ = protocol.WriteToken(rw, "kicked-silent")
-		return
+	// ISP-level ban/kick handling. With a panel, re-check the LIVE verdict
+	// (1s cache) instead of the session-start snapshot: a device banned or
+	// over quota mid-session used to keep opening streams indefinitely
+	// (1.0.1). Without a panel, the handshake verdict is all there is.
+	if status, reason, _, ok := opt.currentVerdict(token); ok {
+		if status == "banned" || status == "kicked" {
+			writeBlocked(rw, ver, status, reason)
+			return
+		}
+	} else {
+		switch peerStatus {
+		case "banned":
+			writeBlocked(rw, ver, "banned", peerReason)
+			return
+		case "kicked":
+			writeBlocked(rw, ver, "kicked", peerReason)
+			return
+		case "kicked-silent":
+			_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
+			_ = protocol.WriteToken(rw, "kicked-silent")
+			return
+		}
 	}
 
 	target, err := protocol.ReadAddressWithATYP(atyp, rw)
@@ -524,7 +538,7 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 			name = target.IP.String()
 		}
 		if name != "" && opt.PanelDB.IsBlocked(name) {
-			opt.logger().Printf("blocked %s for %s", name, shortToken(token))
+			opt.logger().Printf("blocked %q for %s", name, shortToken(token))
 			_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
 			// Send the rule (not just the domain): the client block page
 			// states the reason, e.g. "ads category".
@@ -544,7 +558,7 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	if opt.PanelDB != nil && token != "" && target.Domain != "" {
 		recordVisitAsync(opt.PanelDB, token, target.Domain)
 		if visitLogN.Add(1)%8 == 1 {
-			opt.logger().Printf("visit %s -> %s", shortToken(token), target.Domain)
+			opt.logger().Printf("visit %s -> %q", shortToken(token), target.Domain)
 		}
 	}
 
@@ -555,7 +569,7 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	upstream, err := dialer.Dial("tcp", target.HostPort())
 	if err != nil {
 		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusDialFailed)
-		opt.logger().Printf("server: dial %s failed: %v", target, err)
+		opt.logger().Printf("server: dial %q failed: %v", target.HostPort(), err)
 		return
 	}
 	defer upstream.Close()
@@ -563,9 +577,10 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	if err := protocol.WriteTargetResponse(rw, ver, protocol.StatusOK); err != nil {
 		return
 	}
-	// No data-phase deadlines: the upstream dial already has a 10 s timeout,
-	// and anything armed here would guillotine long transfers (large
-	// downloads died ~10 s in). See TestRelaySurvivesSlowTransfer.
+	// Relay connected: lift the setup deadline — no data-phase deadlines
+	// from here on (large downloads must never be guillotined; the
+	// upstream dial carries its own 10 s timeout).
+	_ = rw.SetDeadline(time.Time{})
 	_ = upstream.(*net.TCPConn).SetNoDelay(true)
 
 	// 256 KiB copy buffers keep syscalls (and per-frame overhead) low on
@@ -681,7 +696,7 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 				return
 			}
 			if atyp[0] == protocol.CtrlMarker {
-				serveCtrlStream(s, o)
+				serveCtrlStream(s, o, token)
 				return
 			}
 			relayTarget(atyp[0], s, o, token, peerStatus, peerReason, ver, ingress)
@@ -734,7 +749,13 @@ func recordVisitAsync(db visitRecorder, token, domain string) {
 // networks make the pinned HTTPS control plane unreachable BY DESIGN —
 // inside the session the same data flows end-to-end encrypted, and the
 // panel keeps hearing from those devices.
-func serveCtrlStream(rw deadlineRW, opt Options) {
+//
+// Identity binding (1.0.1): the verdict is looked up for the token that
+// AUTHENTICATED the session, never for the token field the client sends
+// on the wire. Before this fix any approved device could read another
+// peer's status/ban reason and write health rows under arbitrary token
+// strings.
+func serveCtrlStream(rw deadlineRW, opt Options, authTok string) {
 	_ = rw.SetDeadline(time.Now().Add(20 * time.Second))
 	var req protocol.CtrlRequest
 	if err := protocol.ReadCtrlMessage(rw, &req); err != nil {
@@ -748,12 +769,12 @@ func serveCtrlStream(rw deadlineRW, opt Options) {
 	// tier's dial target survives CDN fronting without config updates.
 	resp.SSHHost = opt.SSHPublicHost
 	defer func() { _ = protocol.WriteCtrlMessage(rw, resp) }()
-	if opt.PanelDB == nil || req.Token == "" {
+	if opt.PanelDB == nil || authTok == "" {
 		return
 	}
 	switch req.Op {
 	case "status":
-		if !opt.PanelDB.KnownPeer(req.Token) {
+		if !opt.PanelDB.KnownPeer(authTok) {
 			// Unknown/purged: the HTTPS contract answers 404, which the
 			// client decodes as "" and re-registers. Mirror that in-band
 			// so purged devices recover on every network.
@@ -761,7 +782,7 @@ func serveCtrlStream(rw deadlineRW, opt Options) {
 			resp.Status = ""
 			return
 		}
-		status, kickReason, kickExpires, err := opt.PanelDB.CheckToken(req.Token)
+		status, kickReason, kickExpires, err := opt.PanelDB.CheckToken(authTok)
 		if err != nil {
 			return
 		}
@@ -769,13 +790,18 @@ func serveCtrlStream(rw deadlineRW, opt Options) {
 		resp.Status = status
 		resp.KickReason = kickReason
 		resp.KickExpires = kickExpires
-		resp.BanReason = opt.PanelDB.BanReason(req.Token)
-		opt.PanelDB.TouchPeer(req.Token)
+		resp.BanReason = opt.PanelDB.BanReason(authTok)
+		opt.PanelDB.TouchPeer(authTok)
 	case "health":
-		opt.PanelDB.RecordHealth(req.Token, req.Version, req.OS, req.Arch,
+		// Only known peers may write telemetry (RecordHealth upserts, so
+		// arbitrary token strings used to mint unbounded rows).
+		if !opt.PanelDB.KnownPeer(authTok) {
+			return
+		}
+		opt.PanelDB.RecordHealth(authTok, req.Version, req.OS, req.Arch,
 			req.CPUPct, req.MemPct, req.TempC, req.UptimeS,
 			req.LatencyMs, req.JitterMs, req.ProbeLossPct)
-		opt.PanelDB.TouchPeer(req.Token)
+		opt.PanelDB.TouchPeer(authTok)
 		resp.OK = true
 	}
 }

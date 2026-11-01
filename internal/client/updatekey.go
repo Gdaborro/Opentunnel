@@ -15,11 +15,20 @@ const ReleasePubKey = "XqEAMqVF/y1ZGrA0gID/cg+PZevHwDjEuYoLXnhkQfI="
 // MinUpdateTag is the minimum release tag this client will install, even
 // if a valid signature covers it. It blocks tag-forgery downgrades: a
 // middleman serving a genuinely-signed OLD release under its real tag is
-// refused once the floor passes it. Raise this floor whenever a release
-// fixes a security defect the fleet must not be rolled back below
-// (audit round three, N-3; manifest verification itself landed in the
-// floor version).
-const MinUpdateTag = "v0.9.27"
+// refused once the floor passes it (audit round three, N-3; manifest
+// verification itself landed in the floor version).
+//
+// v1.0.1 hardening: the floor is now a variable stamped at build time —
+//
+//	-ldflags "-X opentunnel/internal/client.MinUpdateTag=vX.Y.Z"
+//
+// — so every release raises the floor to ITSELF: each updated device
+// refuses anything older than the release it is running. The static
+// v0.9.27 floor let an interceptor replay-freeze the fleet on any
+// genuinely-signed release above it (serve v0.9.30, block v1.x). Release
+// builds MUST pass the stamp; the default below keeps unstamped builds
+// safe at this release's floor.
+var MinUpdateTag = "v1.0.1"
 
 // ReleaseMsg builds the exact bytes a release manifest signature covers:
 // the tag and the asset hash are bound together, so a signature for one

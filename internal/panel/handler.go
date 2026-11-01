@@ -31,6 +31,11 @@ type Handler struct {
 	// OnApprove installs a device's SSH public key into the ssh tier's
 	// authorized_keys when an admin approves it (nil = not configured).
 	OnApprove func(token string)
+
+	// OnRevoke removes a device's SSH key from authorized_keys when the
+	// device is banned or deleted (1.0.1, N-12: revocation used to be a
+	// lie — a banned device kept its key forever).
+	OnRevoke func(token string)
 }
 
 type regLimit struct {
@@ -50,6 +55,10 @@ func (h *Handler) WithGeoIP(g *GeoIP) *Handler { h.geo = g; return h }
 
 // WithApproveHook registers a callback fired after a device is approved.
 func (h *Handler) WithApproveHook(fn func(token string)) *Handler { h.OnApprove = fn; return h }
+
+// WithRevokeHook installs the N-12 revocation handler (ban/delete remove
+// the device's key from authorized_keys).
+func (h *Handler) WithRevokeHook(fn func(token string)) *Handler { h.OnRevoke = fn; return h }
 
 // SSHKeyPath returns the stored SSH public key for a device token.
 func (h *Handler) SSHKeyPath(token string) string {
@@ -156,6 +165,11 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
+		// Admin API responses carry device tokens, allowlists and audit
+		// data: browsers and disk caches must never keep them (1.0.1).
+		if strings.HasPrefix(r.URL.Path, "/admin/api/") {
+			h.Set("Cache-Control", "no-store")
+		}
 		h.Set("Content-Security-Policy",
 			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
 				"img-src 'self' data:; font-src 'self'; connect-src 'self'; "+
@@ -256,6 +270,10 @@ func (h *Handler) apiLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many failed attempts — try again later", http.StatusTooManyRequests)
 		return
 	}
+	// 4 KB is generous for two strings; the relay proxies this endpoint
+	// publicly, and an unbounded body let an unauthenticated caller make
+	// the panel buffer attacker-sized payloads (1.0.1).
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 	var creds struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -422,6 +440,9 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&req)
 		h.db.Exec(`UPDATE peers SET status='banned', ban_reason=?, ban_duration=? WHERE token=?`, req.Reason, req.Duration, token)
 		h.db.BanIdentity(token, req.Reason)
+		if h.OnRevoke != nil {
+			h.OnRevoke(token) // N-12: remove the ssh-tier key while the row still exists
+		}
 		h.db.RecordEvent("ban", short+" banned: "+req.Reason)
 		h.db.RecordAlert("critical", "security", "device "+short+" BANNED (fingerprint + key): "+trimReason(req.Reason))
 	case "unban":
@@ -430,6 +451,9 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		h.db.RecordEvent("unban", short+" unbanned (needs re-approval)")
 		h.db.RecordAlert("info", "security", "device "+short+" unbanned — pending re-approval")
 	case "delete":
+		if h.OnRevoke != nil {
+			h.OnRevoke(token) // N-12: revoke before the row (and its pubkey) is gone
+		}
 		h.db.UnbanIdentity(token)
 		h.db.Exec(`DELETE FROM peers WHERE token=?`, token)
 		h.db.Exec(`DELETE FROM daily_usage WHERE token=?`, token)
@@ -581,15 +605,20 @@ func (h *Handler) apiVisits(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiAbuse(w http.ResponseWriter, r *http.Request) {
-	// Abuse protection stats: rate-limited IPs, banned fingerprints, recent blocks
-	var rateLimited, bannedFP int
-	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='banned'`).Scan(&bannedFP)
-	// Guard stats if available (approx)
-	rateLimited = 0
+	// Live counters only (1.0.1). The old hardcoded note advertised guard
+	// limits that were never wired here, and it disclosed operator
+	// tradecraft (decoy maintenance) in an API response — audit round
+	// four flagged it as four rounds overdue.
+	var banned, pending, kicked, alerts int
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='banned'`).Scan(&banned)
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='pending'`).Scan(&pending)
+	h.db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='kicked'`).Scan(&kicked)
+	h.db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE severity IN ('warning','critical')`).Scan(&alerts)
 	json.NewEncoder(w).Encode(map[string]any{
-		"banned":       bannedFP,
-		"rate_limited": rateLimited,
-		"note":         "Abuse protection: per-IP 10/min, per-peer 100 domains/10s -> temp kick, fingerprint+IP hard ban, easy unban via panel. Oracle decoy: normal apt cron + decoy site traffic.",
+		"banned":        banned,
+		"pending":       pending,
+		"kicked":        kicked,
+		"recent_alerts": alerts,
 	})
 }
 
@@ -768,6 +797,20 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	if len(req.DeviceName) > 64 || len(req.Fingerprint) > 128 || len(req.SSHPubKey) > 2048 {
 		http.Error(w, "field too long", 400)
 		return
+	}
+	// SSH key validation (1.0.1): the old length-only check let a
+	// registrant smuggle newlines — once approved, the verbatim append
+	// installed extra UNRESTRICTED keys into root-served authorized_keys
+	// (audit round four, N-11 chain). Store the canonical single-line
+	// ed25519 form or refuse.
+	req.SSHPubKey = strings.TrimSpace(req.SSHPubKey)
+	if req.SSHPubKey != "" {
+		canon, cok := CanonicalSSHPubKey(req.SSHPubKey)
+		if !cok {
+			http.Error(w, "ssh_pubkey must be a single ed25519 key line", 400)
+			return
+		}
+		req.SSHPubKey = canon
 	}
 	// Hard ban on fingerprint OR device public key: a banned device cannot
 	// shed the ban by minting a fresh token.

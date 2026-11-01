@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -341,12 +342,15 @@ func dohHTTPSECH(ctx context.Context, endpoint, host string) ([]byte, time.Durat
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("transport: doh %s: HTTP %d", endpoint, resp.StatusCode)
 	}
-	var buf [64 << 10]byte
-	n, err := resp.Body.Read(buf[:])
-	if err != nil && n == 0 {
+	// Read the WHOLE body: a single Read may return a partial DNS message
+	// on unusual TCP segmentation (round-four robustness nit — the old
+	// failure mode was a silent retry, never corruption). The limit keeps
+	// a hostile resolver bounded.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
 		return nil, 0, err
 	}
-	return parseDoHHTTPSResponse(buf[:n], id)
+	return parseDoHHTTPSResponse(raw, id)
 }
 
 // parseDoHHTTPSResponse unpacks one DoH reply and returns the ECH param

@@ -1,5 +1,52 @@
 # Changelog
 
+## v1.0.1 — security hardening (audit round four)
+
+Ten hardening items across the relay, panel, client and update chain. No
+wire-protocol changes; existing clients keep working, and every fix is
+covered by new regression tests.
+
+### Fixed
+- **SSH key injection (N-11 chain)**: `ssh_pubkey` is validated and
+  canonicalized (single-line ed25519 only) — newline-smuggled keys are
+  refused. The canonical `authorized_keys` line now carries a forced
+  command: `restrict` alone never prevented non-PTY command execution or
+  SFTP (proven empirically against OpenSSH 10.0), while forwarding — the
+  only channel the tunnel uses — is unaffected.
+- **Revocation is real (N-12)**: banning or deleting a device removes its
+  key from `authorized_keys` immediately.
+- **SSRF filter fails closed**: zone identifiers (`::1%lo`), NAT64
+  literals, reserved ranges and unparseable hosts are refused; previously
+  anything `net.ParseIP` could not parse walked straight through to the
+  loopback plane.
+- **Control channel identity binding**: verdicts and health records are
+  bound to the token that authenticated the session; the wire token field
+  can no longer read another device's state or write rows under arbitrary
+  token strings.
+- **Mid-session enforcement**: bans, kicks and quotas are re-checked per
+  stream (1s cache) instead of trusting the session-start snapshot; UDP
+  streams re-check periodically too.
+- **Trusted-channel gating for durable state (N-2)**: only the in-band or
+  pinned channels may set the ever-approved marker, clear bans, or persist
+  a hard ban; plain bootstrap responses are display-only.
+- **Relay header stamps are unpickable**: client-named `Connection`
+  headers are stripped before stamping, closing the rate-limit / login
+  lockout bucket collapse.
+- **Update floor is build-stamped**: each release raises `MinUpdateTag` to
+  its own tag, so a middleman can no longer replay-freeze the fleet on
+  older — but genuinely signed — releases.
+- **DoS bounds**: per-stream setup deadlines (TCP + UDP), lazy UDP
+  sockets, a 4 KB login body cap, server read/write timeouts, and
+  age-ordered replay-cache eviction.
+- **Panel hygiene**: `no-store` on admin APIs; malformed in-band pins are
+  rejected before persistence; `/admin/api/abuse` reports live counters
+  instead of a hardcoded note.
+
+### Changed
+- DoH ECH fetches read the full response body (robustness on segmented
+  TCP).
+- Log hygiene: quoted visited domains; safer token prefixes.
+
 ## v1.0.0 — the undetectability overhaul
 
 One big release: containment, ECH, and a traffic-shape pass across every

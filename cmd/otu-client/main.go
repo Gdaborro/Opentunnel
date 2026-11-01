@@ -446,7 +446,15 @@ func run() {
 			knownPins[strings.ToLower(fp)] = true
 		}
 		learnPin := func(fp string) {
-			if fp = strings.ToLower(strings.TrimSpace(fp)); fp == "" || knownPins[fp] {
+			fp = strings.ToLower(strings.TrimSpace(fp))
+			if fp == "" || knownPins[fp] {
+				return
+			}
+			if _, err := transport.ParseFingerprint(fp); err != nil {
+				// Never persist a malformed announcement (1.0.1): the pin
+				// set refuses to build if any entry is unparseable, so a
+				// single bad value would brick every dial until manually
+				// removed from pins.json.
 				return
 			}
 			knownPins[fp] = true

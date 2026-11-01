@@ -12,6 +12,7 @@ import (
 	"io"
 	mathrand "math/rand"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
@@ -291,14 +292,26 @@ func (rc *ReplayCache) CheckAndAdd(salt []byte) bool {
 			}
 		}
 		if len(rc.m) >= rc.cap {
-			// Still full: evict a random 10% (map order is randomized) so
-			// recent salts mostly survive instead of wiping the whole cache,
-			// which would open a replay window under a salt flood.
-			for k := range rc.m {
-				delete(rc.m, k)
-				if len(rc.m) <= rc.cap-rc.cap/10 {
-					break
-				}
+			// Still full: evict the OLDEST ~10% (1.0.1). Random map-order
+			// eviction let an authenticated peer flood fresh salts and
+			// statistically displace other peers' younger entries,
+			// reopening replay windows for captured handshakes; age-ordered
+			// eviction deterministically keeps the newest entries.
+			type kv struct {
+				k string
+				t time.Time
+			}
+			all := make([]kv, 0, len(rc.m))
+			for k, ts := range rc.m {
+				all = append(all, kv{k, ts})
+			}
+			sort.Slice(all, func(i, j int) bool { return all[i].t.Before(all[j].t) })
+			drop := rc.cap / 10
+			if drop < 1 {
+				drop = 1
+			}
+			for i := 0; i < drop && i < len(all); i++ {
+				delete(rc.m, all[i].k)
 			}
 		}
 	}
