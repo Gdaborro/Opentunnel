@@ -87,6 +87,10 @@ type ECHProvider struct {
 	backoff    time.Duration
 	rejections int
 	started    bool
+	// noECHLogged dedupes the "host publishes no ECH config" line: it is a
+	// steady state, not an event — logging it on every refresh is pure
+	// noise on the exact networks where ECH is not the bottleneck.
+	noECHLogged bool
 }
 
 // NewECHProvider builds a provider for host. cachePath may be empty
@@ -188,9 +192,13 @@ func (p *ECHProvider) fetchNow(ctx context.Context) {
 	defer p.mu.Unlock()
 	if err != nil {
 		if errors.Is(err, errNoECH) {
-			// Not ECH-enabled (yet): rare retries, no backoff noise.
-			p.nextTry = time.Now().Add(6*time.Hour + jitterDur(time.Hour))
-			p.logf("ech: %s publishes no ECH config (retrying in ~6h)", p.host)
+			// Not ECH-enabled (yet): a steady state retried daily, logged
+			// once per transition rather than every refresh.
+			p.nextTry = time.Now().Add(24*time.Hour + jitterDur(2*time.Hour))
+			if !p.noECHLogged {
+				p.noECHLogged = true
+				p.logf("ech: %s publishes no ECH config (will recheck daily)", p.host)
+			}
 			return
 		}
 		if p.backoff == 0 {
@@ -204,6 +212,7 @@ func (p *ECHProvider) fetchNow(ctx context.Context) {
 	}
 	p.backoff = 0
 	p.rejections = 0
+	p.noECHLogged = false // a config exists again: re-arm the notice
 	if ttl < time.Hour {
 		ttl = time.Hour
 	}

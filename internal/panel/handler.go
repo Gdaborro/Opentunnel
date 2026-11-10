@@ -884,10 +884,58 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	// burst detector and the travel history until the first tunnel connects.
 	h.db.SetPeerIP(req.Token, clientIP(r))
 	if n, _ := res.RowsAffected(); n == 0 {
-		h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=COALESCE(NULLIF(ssh_pubkey,''),?) WHERE token=?`, req.SSHPubKey, req.Token)
-		var existingStatus string
-		h.db.QueryRow(`SELECT status FROM peers WHERE token=?`, req.Token).Scan(&existingStatus)
+		var existingStatus, existingKey string
+		_ = h.db.QueryRow(`SELECT status, COALESCE(ssh_pubkey,'') FROM peers WHERE token=?`, req.Token).
+			Scan(&existingStatus, &existingKey)
 		status = existingStatus
+		switch {
+		case req.SSHPubKey == "":
+			// No key announced (early boot before the identity files are
+			// written): update liveness only — an empty string is not a
+			// key rotation.
+			h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
+		case existingKey == "":
+			// Backfill: the row predates key storage (or the device's key
+			// was never recorded). For an approved device this is a repair,
+			// not a rotation — store the key and install its line now.
+			h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=? WHERE token=?`, req.SSHPubKey, req.Token)
+			if existingStatus == "approved" && h.OnApprove != nil {
+				h.OnApprove(req.Token)
+			}
+		case !sameSSHKey(existingKey, req.SSHPubKey):
+			// Key rotation. The old COALESCE-only update silently kept the
+			// stored key forever, so a reinstalled device presented a key
+			// the panel had never installed and the ssh tier failed on
+			// every attempt (2026-11-05 incident). Never silently keep a
+			// key the device no longer has:
+			//   - approved device: revoke the old line, store the new key
+			//     and send the device back through approval (a stolen
+			//     token can force a re-approval this way, but cannot gain
+			//     access — the key only becomes usable after an admin
+			//     approves the rotation);
+			//   - not-yet-approved device: just update the pending row.
+			if existingStatus != "approved" {
+				h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=? WHERE token=?`, req.SSHPubKey, req.Token)
+				break
+			}
+			if h.OnRevoke != nil {
+				h.OnRevoke(req.Token) // removes the OLD stored key
+			}
+			newStatus := "pending"
+			if h.autoApprove || h.db.AutoAcceptActive() {
+				newStatus = "approved"
+			}
+			h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=?, status=? WHERE token=?`,
+				req.SSHPubKey, newStatus, req.Token)
+			status = newStatus
+			h.db.RecordEvent("ssh-key", req.DeviceName+" presented a new ssh key — "+newStatus)
+			h.db.RecordAlert("warning", "nac", "device "+req.DeviceName+" presented a new SSH key — re-approval required")
+			if newStatus == "approved" && h.OnApprove != nil {
+				h.OnApprove(req.Token)
+			}
+		default:
+			h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
+		}
 		// A device that registered before an auto-accept window opened must
 		// not stay stuck pending forever: while the window is open, upgrade
 		// it and install its SSH key so early launchers connect too.

@@ -34,6 +34,13 @@ var profileOrder = []string{ProfileFast, ProfileBalanced, ProfileStealth}
 // SshTierName is the virtual last-resort tier riding inside real SSH.
 const SshTierName = "ssh"
 
+// sshRejectCooldown is how long the ssh tier pauses after sshd refuses
+// the device's key twice in a row. A dead key is a configuration state:
+// re-presenting it per request neither heals it nor looks like ordinary
+// admin SSH — it looks like a credential-stuffing loop. Reset() (fired
+// on panel approval) clears the cooldown immediately.
+const sshRejectCooldown = 15 * time.Minute
+
 // H3TierName is the HTTP/3 tier: QUIC to :443 survives TLS interception
 // (middleboxes cannot re-sign what they cannot terminate), sits between
 // the ws-tls profiles and the ssh last resort, and carries bulk traffic
@@ -64,6 +71,19 @@ func (a *Adaptive) tierName(idx int) string {
 		return H3TierName
 	}
 	return SshTierName
+}
+
+// sshTierIndex returns the ladder index of the ssh fallback tier, or -1
+// when it is absent or hidden (hostile network without AllowHostileSSH).
+// Must match tierCount's own gating exactly.
+func (a *Adaptive) sshTierIndex() int {
+	if a.sshFallback == nil || (a.hostile && !a.AllowHostileSSH) {
+		return -1
+	}
+	if a.h3Fallback != nil {
+		return len(profileOrder) + 1
+	}
+	return len(profileOrder)
 }
 
 // ParseProfile validates a configured profile name ("auto" handled by NewAdaptive).
@@ -115,6 +135,11 @@ type Adaptive struct {
 	// (TLS-intercepting network). Default true preserves connectivity;
 	// set false to forbid the conspicuous SSH fallback on hostile nets.
 	AllowHostileSSH bool
+
+	// sshCooldown/sshRejects implement the ssh-tier backoff after sshd
+	// refuses the device key (see noteSSHReject).
+	sshCooldown time.Time
+	sshRejects  int
 
 	// hostile latches when every ws tier fails certificate pinning (TLS
 	// interception): stealth shaping is locked on and beacons stretch.
@@ -276,6 +301,7 @@ func fatalUpstream(err error) bool {
 
 // DialTunnel implements proxy.Dialer with adaptive tier selection.
 func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (net.Conn, error) {
+	now := time.Now()
 	a.mu.Lock()
 	start := a.idx
 	probeDown := a.auto && start > 0 && time.Since(a.lastProbe) > 10*time.Minute
@@ -291,17 +317,48 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		a.lastProbe = time.Now()
 	}
 	total := a.tierCount()
+	sshIdx := a.sshTierIndex()
+	cooling := sshIdx >= 0 && now.Before(a.sshCooldown)
+	hostile := a.hostile
+	h3Idx := -1
+	if a.h3Fallback != nil {
+		h3Idx = len(profileOrder)
+	}
 	a.mu.Unlock()
 
 	order := []int{}
 	if probeDown {
 		order = append(order, 0)
 	}
+	// Hostile fast-path: on an inspected network the ws tiers are dead
+	// weight (constant pin failures). Queue the tiers that can traverse it
+	// first — h3 (QUIC), then ssh — so a working fallback is reached in
+	// one attempt; a ws probe still follows when the fallbacks fail, so a
+	// network change is discovered without waiting out the cool-off.
+	if hostile && !probeDown {
+		if h3Idx >= 0 {
+			order = append(order, h3Idx)
+		}
+		if sshIdx >= 0 && !cooling {
+			order = append(order, sshIdx)
+		}
+	}
 	for i := start; i < total; i++ {
 		if probeDown && i == 0 {
 			continue
 		}
+		if i == sshIdx && cooling {
+			continue
+		}
+		if hostile && !probeDown && (i == sshIdx || i == h3Idx) {
+			continue // already queued in the fast-path
+		}
 		order = append(order, i)
+	}
+	if len(order) == 0 {
+		// The only remaining tier is the ssh tier in cooldown: probe the
+		// fastest ws profile instead of failing every request outright.
+		order = append(order, 0)
 	}
 
 	var lastErr error
@@ -316,6 +373,10 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 			clearedHostile := false
 			a.mu.Lock()
 			a.failStreak = 0
+			if idx == sshIdx {
+				a.sshRejects = 0
+				a.sshCooldown = time.Time{}
+			}
 			if a.hostile && idx < len(profileOrder) {
 				a.hostile = false // clean ws-tls dial: network changed
 				clearedHostile = true
@@ -353,6 +414,10 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		}
 		if isDNSError(err) {
 			sawDNS = true
+		}
+		var keyRej *transport.SSHKeyRejectedError
+		if errors.As(err, &keyRej) {
+			a.noteSSHReject(keyRej)
 		}
 		a.mu.Lock()
 		lastErr = fmt.Errorf("tier %q: %w", a.tierName(idx), err)
@@ -442,6 +507,10 @@ func isDNSError(err error) bool {
 func (a *Adaptive) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Approval may have installed the key the ssh tier was refused for:
+	// clear the backoff even in fixed-profile mode.
+	a.sshRejects = 0
+	a.sshCooldown = time.Time{}
 	if !a.auto {
 		return
 	}
@@ -470,6 +539,25 @@ func (a *Adaptive) SetHostile(on bool) {
 			a.logger().Printf("adaptive: clean network â€” hostile mode off")
 		}
 	}
+}
+
+// noteSSHReject applies the ssh-tier backoff: the server refused this
+// device's key. Two consecutive rejections (one could be an approval
+// race) pause the tier for a jittered cooldown, so a dead key stops
+// costing every request — and stops presenting a failed login to the
+// server dozens of times a minute, which is exactly what a credential
+// attack looks like from its side.
+func (a *Adaptive) noteSSHReject(err *transport.SSHKeyRejectedError) {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sshRejects++
+	if a.sshRejects < 2 || now.Before(a.sshCooldown) {
+		return
+	}
+	d := sshRejectCooldown + time.Duration(rand.Int63n(int64(sshRejectCooldown)/5))
+	a.sshCooldown = now.Add(d)
+	a.logger().Printf("adaptive: %v — pausing the ssh tier for %s", err, d.Round(time.Minute))
 }
 
 // isPinFailure reports certificate-pin rejections (the MITM tell), as

@@ -174,3 +174,60 @@ func TestSSHFallbackTierRescuesTotalTLSInterception(t *testing.T) {
 		t.Fatalf("expected sticky escalation to ssh tier (idx=3), got idx=%d", a.idx)
 	}
 }
+
+// sshRejectTransport simulates sshd refusing the device key.
+type sshRejectTransport struct{ calls *int }
+
+func (s *sshRejectTransport) Name() string { return "fake-ssh-reject" }
+func (s *sshRejectTransport) Dial(ctx context.Context) (net.Conn, error) {
+	*s.calls++
+	return nil, &transport.SSHKeyRejectedError{Host: "fake:22", Err: errors.New("ssh: unable to authenticate")}
+}
+
+// TestSSHKeyRejectionBacksOffTier: two consecutive key rejections pause
+// the ssh tier for a jittered cooldown, so a key the server does not know
+// stops costing every request (and stops looking like credential
+// stuffing from the server's side). Reset() — fired on approval — clears
+// the pause.
+func TestSSHKeyRejectionBacksOffTier(t *testing.T) {
+	sshCalls := 0
+	a, addr, _, cleanup := startAdaptiveFixture(t, "auto", new(int), false)
+	defer cleanup()
+	a.EnableSSHFallback(func() transport.Transport { return &sshRejectTransport{calls: &sshCalls} })
+	a.AllowHostileSSH = true
+
+	a.mu.Lock()
+	a.idx = len(profileOrder) // start directly on the ssh tier
+	a.mu.Unlock()
+
+	if _, err := a.DialTunnel(context.Background(), addr); err == nil {
+		t.Fatal("first ssh dial must fail")
+	}
+	if _, err := a.DialTunnel(context.Background(), addr); err == nil {
+		t.Fatal("second ssh dial must fail")
+	}
+	if sshCalls != 2 {
+		t.Fatalf("ssh dials = %d, want 2", sshCalls)
+	}
+	a.mu.Lock()
+	cooling := time.Now().Before(a.sshCooldown)
+	a.mu.Unlock()
+	if !cooling {
+		t.Fatal("ssh tier must be cooling after two rejections")
+	}
+
+	// Third dial: the cooling ssh tier is skipped (the ladder probes a ws
+	// profile instead of re-presenting the dead key).
+	_, _ = a.DialTunnel(context.Background(), addr)
+	if sshCalls != 2 {
+		t.Fatalf("ssh tier presented while cooling: calls=%d", sshCalls)
+	}
+
+	a.Reset()
+	a.mu.Lock()
+	cooling = time.Now().Before(a.sshCooldown)
+	a.mu.Unlock()
+	if cooling {
+		t.Fatal("Reset must clear the ssh cooldown")
+	}
+}

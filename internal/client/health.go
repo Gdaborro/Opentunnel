@@ -44,6 +44,10 @@ type HealthReporter struct {
 	// pending device on an intercepting network (no tunnel, pinned HTTPS
 	// refused) would otherwise print the same failure every cycle.
 	lastFail bool
+
+	// hostileLogged throttles the "interception detected, skipping the
+	// pinned channel" notice to once per process.
+	hostileLogged bool
 }
 
 const probeWindow = 20 // rolling window size for loss/jitter
@@ -205,6 +209,18 @@ func (h *HealthReporter) reportOnce() {
 		}
 	}
 
+	// Hostile network (pinned TLS is being intercepted): the direct pinned
+	// POST can never succeed there, and retrying it every cycle leaks a
+	// bare failure line and looks like a retry storm to the middlebox.
+	// The in-band channel above is the report path on those networks.
+	if HostileMode() {
+		if !h.hostileLogged {
+			h.hostileLogged = true
+			log.Printf("health: TLS interception detected — pinned control channel skipped (in-band only)")
+		}
+		return
+	}
+
 	payload := map[string]any{
 		"token":          h.device.Token,
 		"version":        s.version,
@@ -231,7 +247,13 @@ func (h *HealthReporter) reportOnce() {
 	if err != nil {
 		if !h.lastFail {
 			h.lastFail = true
-			log.Printf("health: report failed: %v", err)
+			if isPinFailure(err) {
+				// Interception raced the hostile latch (or cleared it while
+				// the middlebox stayed): one human sentence, no raw x509.
+				log.Printf("health: pinned control channel unreachable (network interception) — relying on in-band reports")
+			} else {
+				log.Printf("health: report failed: %v", err)
+			}
 		}
 		return
 	}

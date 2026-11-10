@@ -125,6 +125,20 @@ func main() {
 		}
 	})
 
+	// Startup self-heal (2026-11-05 incident): an approved device whose
+	// line is missing from the file the running sshd actually reads can
+	// never authenticate — and nothing on the device can distinguish
+	// "not approved" from "key lost". Re-add every approved device's key
+	// on startup: only ADDS missing lines, never removes, so revocations
+	// and operator entries are untouched.
+	if _, err := os.Stat(akPath); err == nil {
+		if n, err := panel.ReconcileAuthorizedKeys(akPath, permitTarget, panelDB.ApprovedSSHPubKeys()); err != nil {
+			log.Printf("panel: authorized_keys reconcile: %v", err)
+		} else if n > 0 {
+			log.Printf("panel: authorized_keys reconcile: restored %d missing device key(s)", n)
+		}
+	}
+
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           ph.Handler(),

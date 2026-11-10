@@ -266,17 +266,29 @@ func run() {
 	if cfg.SSHKey != "" && !filepath.IsAbs(cfg.SSHKey) {
 		cfg.SSHKey = filepath.Join(filepath.Dir(*cfgPath), cfg.SSHKey)
 	}
-	// tun.key not shipped? Use the device's own SSH key (auto-generated in
-	// %LOCALAPPDATA%\opentunnel on first run and authorized by the panel on
-	// approval) — so the exe works fully standalone, no files needed.
-	if cfg.SSHKey != "" {
+	// Prefer the device's own SSH key (auto-generated in
+	// %LOCALAPPDATA%\opentunnel, installed by the panel on approval). The
+	// legacy shared tun.key is retired: one credential for the whole fleet
+	// means one missing line locks every client out of the ssh tier at
+	// once, and the panel's approve/revoke hooks manage per-device keys —
+	// never the shared one. A custom key path (anything not named
+	// tun.key) is still honored for advanced deployments.
+	useDeviceKey := cfg.SSHKey == "" || strings.EqualFold(filepath.Base(cfg.SSHKey), "tun.key")
+	if !useDeviceKey {
 		if _, err := os.Stat(cfg.SSHKey); err != nil {
-			if ts, terr := client.NewTokenStore(); terr == nil {
-				if _, kerr := ts.EnsureSSHKey(); kerr == nil {
-					cfg.SSHKey = ts.SSHPrivatePath()
-					fmt.Println("[i] ssh key: using this device's own key (auto-generated)")
-				}
+			useDeviceKey = true // configured key vanished: fall back
+		}
+	}
+	if useDeviceKey {
+		if ts, terr := client.NewTokenStore(); terr == nil {
+			if _, kerr := ts.EnsureSSHKey(); kerr == nil {
+				cfg.SSHKey = ts.SSHPrivatePath()
+				fmt.Println("[i] ssh key: using this device's own key")
+			} else if cfg.SSHKey == "" {
+				fmt.Println("[!] ssh key: device key unavailable — ssh tier disabled")
 			}
+		} else if cfg.SSHKey == "" {
+			fmt.Println("[!] ssh key: token store unavailable — ssh tier disabled")
 		}
 	}
 

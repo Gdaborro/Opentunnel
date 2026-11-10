@@ -46,3 +46,32 @@ The panel service runs as user 'otu' (ProtectHome=tmpfs) and cannot write
 (AuthorizedKeysCommand runs as root, so no file-ownership/StrictModes issues
 apply to the panel-managed file. Verified: fresh device key -> register ->
 auto-accept -> sshd 'Server accepts key' + 'Authenticated using publickey'.)
+
+The stock files live beside this note: `sshd-91-otu-keys.conf` and
+`otu-keys.sh` (install to the paths above, root-owned).
+
+Also add to the `Match User tun` block in `99-otu-tun.conf`:
+
+```
+    AuthorizedKeysFile none
+```
+
+Without it sshd still tries `/home/tun/.ssh/authorized_keys` first and logs
+`Could not open user 'tun' authorized keys ... Permission denied` on every
+attempt (the file is root-owned; the pre-auth reader is not). Harmless but
+misleading — the command above already serves the home file.
+
+## Authorized-keys self-heal (v1.1.3)
+
+`otu-panel` reconciles `/var/lib/opentunnel/authorized_keys` against the DB
+on every startup: every approved device's stored key is (re-)added if
+missing. Only adds, never removes. This is the fix for the 2026-11-05
+incident, where approved devices were missing from the file the running
+sshd serves and the ssh tier failed with "unable to authenticate" forever.
+Events: `panel: authorized_keys reconcile: restored N missing device key(s)`.
+
+Device keys are per-device and rotated through the panel: re-registration
+with a different key revokes the old line, stores the new key and sends the
+device back to pending (admin approves the rotation). The legacy shared
+`tun.key` line may stay in the home file during the fleet transition; it is
+not re-added by the reconcile if removed from the panel-managed file.

@@ -85,6 +85,35 @@ type SSHOptions struct {
 	ClientVersion string
 }
 
+// SSHKeyRejectedError marks sshd refusing the client's public key
+// ("unable to authenticate" / "no supported methods remain"). It is a
+// configuration state — the device's key is not (or no longer)
+// authorized — rather than a transient transport failure, so callers can
+// back the tier off instead of re-presenting a dead key for every
+// request (2026-11-05: a rotated device key made every target pay an
+// authentication failure).
+type SSHKeyRejectedError struct {
+	Host string
+	Err  error
+}
+
+func (e *SSHKeyRejectedError) Error() string {
+	return fmt.Sprintf("ssh: %s refused this device's key — it may need re-approval in the panel", e.Host)
+}
+
+func (e *SSHKeyRejectedError) Unwrap() error { return e.Err }
+
+// isSSHAuthRejection recognizes x/crypto/ssh's authentication-failure
+// text (the library exposes no typed error for it).
+func isSSHAuthRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "unable to authenticate") ||
+		strings.Contains(s, "no supported methods remain")
+}
+
 type sshTransport struct{ opt SSHOptions }
 
 func NewSSH(opt SSHOptions) Transport { return &sshTransport{opt: opt} }
@@ -144,6 +173,9 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 	}
 	client, err := ssh.Dial("tcp", hostPort, cfg)
 	if err != nil {
+		if isSSHAuthRejection(err) {
+			return nil, &SSHKeyRejectedError{Host: hostPort, Err: err}
+		}
 		return nil, fmt.Errorf("transport: ssh dial %s: %w", hostPort, err)
 	}
 

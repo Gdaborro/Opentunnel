@@ -52,6 +52,51 @@ func TestCanonicalSSHPubKey(t *testing.T) {
 	}
 }
 
+// TestReconcileAuthorizedKeys: the startup self-heal adds missing
+// approved keys, preserves every existing line (including a legacy shared
+// key), is idempotent, ignores junk, and refuses to create a missing file
+// (the caller gates on the sshd-managed file existing).
+func TestReconcileAuthorizedKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "authorized_keys")
+	a := testKeyLine(t)
+	b := testKeyLine(t)
+	legacy := testKeyLine(t)
+
+	if _, err := UpsertAuthorizedKey(path, a, "127.0.0.1:8081"); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(CanonicalAuthorizedKeyLine(legacy, "127.0.0.1:8081") + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	n, err := ReconcileAuthorizedKeys(path, "127.0.0.1:8081", []string{a, b, "junk", ""})
+	if err != nil || n != 1 {
+		t.Fatalf("reconcile: n=%d err=%v (want 1 added)", n, err)
+	}
+	raw, _ := os.ReadFile(path)
+	text := string(raw)
+	for _, k := range []string{a, b, legacy} {
+		if !strings.Contains(text, k) {
+			t.Fatalf("key missing after reconcile: %q\n%s", k, text)
+		}
+	}
+	if strings.Contains(text, "junk") {
+		t.Fatalf("junk must never reach the file: %s", text)
+	}
+
+	if n, err = ReconcileAuthorizedKeys(path, "127.0.0.1:8081", []string{a, b}); err != nil || n != 0 {
+		t.Fatalf("second reconcile must be a no-op: n=%d err=%v", n, err)
+	}
+	if _, err = ReconcileAuthorizedKeys(filepath.Join(t.TempDir(), "missing"), "127.0.0.1:8081", []string{a}); err == nil {
+		t.Fatal("missing file must error, not be created")
+	}
+}
+
 // TestAuthorizedKeyLifecycle (1.0.1, N-11/N-12): canonical lines carry the
 // forced command, upserts are idempotent and clean junk, and revocation
 // removes exactly the revoked key.

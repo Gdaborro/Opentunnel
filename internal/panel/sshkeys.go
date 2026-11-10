@@ -119,6 +119,57 @@ func UpsertAuthorizedKey(path, pub, permitTarget string) (changed bool, err erro
 	return true, writeAuthorizedKeys(path, lines)
 }
 
+// ReconcileAuthorizedKeys adds a canonical line for every key in pubs
+// that is missing from path, preserving every existing line (legacy and
+// operator entries included). It only ever ADDS: revocation stays an
+// explicit action (RemoveAuthorizedKey). This is the startup self-heal
+// for a deployment where a rewrite, migration or crash left approved
+// devices without their line — exactly the state that left a live device
+// retrying an impossible authentication for days (2026-11-05 incident).
+func ReconcileAuthorizedKeys(path, permitTarget string, pubs []string) (added int, err error) {
+	raw, rerr := os.ReadFile(path)
+	if rerr != nil {
+		return 0, rerr
+	}
+	var lines []string
+	present := map[string]bool{}
+	for _, l := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if k, ok := lineKey(l); ok {
+			present[k] = true
+		}
+		lines = append(lines, l)
+	}
+	for _, pub := range pubs {
+		canon, ok := CanonicalSSHPubKey(pub)
+		if !ok || present[canon] {
+			continue
+		}
+		lines = append(lines, CanonicalAuthorizedKeyLine(canon, permitTarget))
+		present[canon] = true
+		added++
+	}
+	if added == 0 {
+		return 0, nil
+	}
+	return added, writeAuthorizedKeys(path, lines)
+}
+
+// sameSSHKey compares a stored authorized key with a freshly presented
+// one after canonicalization: comments/options are ignored and malformed
+// input never matches.
+func sameSSHKey(a, b string) bool {
+	ca, okA := CanonicalSSHPubKey(a)
+	cb, okB := CanonicalSSHPubKey(b)
+	if !okA || !okB {
+		return false
+	}
+	return ca == cb
+}
+
 // RemoveAuthorizedKey drops every line whose key matches pub (N-12:
 // revocation). Returns true when anything was removed.
 func RemoveAuthorizedKey(path, pub string) (bool, error) {

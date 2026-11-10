@@ -26,6 +26,9 @@ func TestNilDBSafe(t *testing.T) {
 	if db.Setting("kill_switch") != "" {
 		t.Fatal("nil Setting must be empty")
 	}
+	if got := db.ApprovedSSHPubKeys(); got != nil {
+		t.Fatalf("nil ApprovedSSHPubKeys must be nil, got %v", got)
+	}
 	// Writes must be silent no-ops, not panics.
 	db.RecordTraffic("anything", 1, 2)
 	db.SetPeerIP("anything", "127.0.0.1")

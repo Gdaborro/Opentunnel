@@ -24,6 +24,29 @@ type DeviceHealth struct {
 	At           string  `json:"at"`
 }
 
+// ApprovedSSHPubKeys returns the stored public key of every approved
+// peer (canonical lines; malformed/empty rows skipped). The panel's
+// startup reconcile uses it so a dropped authorized_keys line self-heals
+// without admin action.
+func (db *DB) ApprovedSSHPubKeys() []string {
+	if db == nil {
+		return nil
+	}
+	rows, err := db.Query(`SELECT COALESCE(ssh_pubkey,'') FROM peers WHERE status='approved'`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var pub string
+		if rows.Scan(&pub) == nil && strings.TrimSpace(pub) != "" {
+			out = append(out, pub)
+		}
+	}
+	return out
+}
+
 // SSHPubKey returns the authorized-key-format public key registered for a
 // token ("" when none). The relay verifies v5 handshake signatures
 // against it.
