@@ -27,8 +27,8 @@ const ReleasePubKey = "XqEAMqVF/y1ZGrA0gID/cg+PZevHwDjEuYoLXnhkQfI="
 // v0.9.27 floor let an interceptor replay-freeze the fleet on any
 // genuinely-signed release above it (serve v0.9.30, block v1.x). Release
 // builds MUST pass the stamp; the default below keeps unstamped builds
-// safe at this release's floor (raised to each release, v1.1.3 now).
-var MinUpdateTag = "v1.1.3"
+// safe at this release's floor (raised to each release, v1.1.4 now).
+var MinUpdateTag = "v1.1.4"
 
 // ReleaseMsg builds the exact bytes a release manifest signature covers:
 // the tag and the asset hash are bound together, so a signature for one
