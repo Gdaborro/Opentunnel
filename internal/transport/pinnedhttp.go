@@ -68,6 +68,9 @@ func NewPinnedHTTPClient(opt PinnedHTTPOptions) (*http.Client, error) {
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			return VerifyPinSet(pins, rawCerts)
 		}
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			return verifyConnectionPins(pins, cs.PeerCertificates)
+		}
 	}
 	echList, echRejected := opt.ECHList, opt.ECHRejected
 	if echList == nil && echRejected == nil {
@@ -75,7 +78,8 @@ func NewPinnedHTTPClient(opt PinnedHTTPOptions) (*http.Client, error) {
 	}
 	d := &net.Dialer{Timeout: timeout}
 	return &http.Client{
-		Timeout: timeout,
+		Timeout:       timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
 			DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return dialTLSWithECH(ctx, d, "tcp", hostPort, cfg, opt.ChromeHello, echList, echRejected)

@@ -49,6 +49,7 @@ func TestHostileTierGate(t *testing.T) {
 	setHostileMode(false)
 	a := NewAdaptive("tok", transport.WSTLSOptions{}, "auto", 5*time.Second)
 	a.EnableSSHFallback(func() transport.Transport { return nil })
+	a.AllowHostileSSH = false // explicit opt-out; the connectivity default is on
 	if got := a.tierCount(); got != 4 {
 		t.Fatalf("want 4 tiers with SSH fallback, got %d", got)
 	}

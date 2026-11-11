@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -101,6 +102,9 @@ func (t *wsTLSTransport) tlsConfig(host string) (*tls.Config, error) {
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			return VerifyPinSet(pins, rawCerts)
 		}
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			return verifyConnectionPins(pins, cs.PeerCertificates)
+		}
 	}
 	return cfg, nil
 }
@@ -143,18 +147,19 @@ func VerifyPinSet(pins [][]byte, rawCerts [][]byte) error {
 		if len(pin) != len(got) {
 			continue
 		}
-		match := true
-		for i := range pin {
-			if pin[i] != got[i] {
-				match = false
-				break
-			}
-		}
-		if match {
+		if subtle.ConstantTimeCompare(pin, got) == 1 {
 			return nil
 		}
 	}
 	return errors.New("transport: server certificate fingerprint mismatch")
+}
+
+func verifyConnectionPins(pins [][]byte, certs []*x509.Certificate) error {
+	raw := make([][]byte, 0, len(certs))
+	for _, cert := range certs {
+		raw = append(raw, cert.Raw)
+	}
+	return VerifyPinSet(pins, raw)
 }
 
 func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
@@ -373,6 +378,17 @@ func tlsHandshake(ctx context.Context, raw net.Conn, cfg *tls.Config, chrome boo
 		// wiring PSK into the parrot spec is future work (see
 		// u_pre_shared_key.go Initializable).
 		PreferSkipResumptionOnNilExtension: true,
+	}
+	if cfg.VerifyPeerCertificate != nil {
+		// VerifyPeerCertificate is skipped on TLS resumption. VerifyConnection
+		// also rechecks the current pin set when a cached ticket is reused.
+		ucfg.VerifyConnection = func(cs utls.ConnectionState) error {
+			raw := make([][]byte, 0, len(cs.PeerCertificates))
+			for _, cert := range cs.PeerCertificates {
+				raw = append(raw, cert.Raw)
+			}
+			return cfg.VerifyPeerCertificate(raw, nil)
+		}
 	}
 	if len(echList) > 0 {
 		ucfg.EncryptedClientHelloConfigList = echList

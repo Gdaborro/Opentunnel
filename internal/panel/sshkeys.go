@@ -2,10 +2,16 @@ package panel
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
 )
+
+// The approve/revoke hooks can run concurrently. Serialize the complete
+// read-modify-write operation, not just the final rename, to avoid lost keys.
+var authorizedKeysMu sync.Mutex
 
 // sshkeys.go: authorized_keys hygiene for the ssh tier (1.0.1).
 //
@@ -71,6 +77,8 @@ func lineKey(line string) (string, bool) {
 // could contain injected material). Missing file = created. Returns true
 // when the file changed.
 func UpsertAuthorizedKey(path, pub, permitTarget string) (changed bool, err error) {
+	authorizedKeysMu.Lock()
+	defer authorizedKeysMu.Unlock()
 	pub, ok := CanonicalSSHPubKey(pub)
 	if !ok {
 		return false, os.ErrInvalid
@@ -78,6 +86,7 @@ func UpsertAuthorizedKey(path, pub, permitTarget string) (changed bool, err erro
 	want := CanonicalAuthorizedKeyLine(pub, permitTarget)
 
 	var lines []string
+	matched := false
 	if raw, rerr := os.ReadFile(path); rerr == nil {
 		for _, l := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
 			k, kok := lineKey(l)
@@ -88,6 +97,11 @@ func UpsertAuthorizedKey(path, pub, permitTarget string) (changed bool, err erro
 				continue
 			}
 			if k == pub {
+				if matched {
+					changed = true // exactly one line for this key
+					continue
+				}
+				matched = true
 				if strings.TrimSpace(l) != want {
 					lines = append(lines, want)
 					changed = true
@@ -127,6 +141,8 @@ func UpsertAuthorizedKey(path, pub, permitTarget string) (changed bool, err erro
 // devices without their line — exactly the state that left a live device
 // retrying an impossible authentication for days (2026-11-05 incident).
 func ReconcileAuthorizedKeys(path, permitTarget string, pubs []string) (added int, err error) {
+	authorizedKeysMu.Lock()
+	defer authorizedKeysMu.Unlock()
 	raw, rerr := os.ReadFile(path)
 	if rerr != nil {
 		return 0, rerr
@@ -173,6 +189,8 @@ func sameSSHKey(a, b string) bool {
 // RemoveAuthorizedKey drops every line whose key matches pub (N-12:
 // revocation). Returns true when anything was removed.
 func RemoveAuthorizedKey(path, pub string) (bool, error) {
+	authorizedKeysMu.Lock()
+	defer authorizedKeysMu.Unlock()
 	pub, ok := CanonicalSSHPubKey(pub)
 	if !ok {
 		return false, os.ErrInvalid
@@ -213,12 +231,24 @@ func writeAuthorizedKeys(path string, lines []string) error {
 	if len(lines) > 0 {
 		out = strings.Join(lines, "\n") + "\n"
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(out), 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".authorized-keys-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.WriteString(out); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	return nil

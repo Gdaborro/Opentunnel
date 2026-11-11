@@ -28,7 +28,8 @@ type Options struct {
 	// MuxByteCap overrides the per-session rotation byte cap (0 = default
 	// 160 MiB). The h3 tier sets this below Cloudflare's 100 MB proxied
 	// request-body limit so sessions rotate before the edge cuts them.
-	MuxByteCap int64
+	MuxByteCap  int64
+	MuxSessions int // warm-session cap; zero uses the general default
 	// OnAuthRejected is invoked when the server rejects the device token
 	// (unknown/purged/expired) so the caller can re-register with the panel.
 	OnAuthRejected func()
@@ -340,13 +341,24 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 
 func (c *Client) getPool() *MuxPool {
 	c.poolOnce.Do(func() {
-		c.pool = newMuxPool(c.muxSessionFactory, 8, c.opts.DialTimeout)
+		maxSessions := c.opts.MuxSessions
+		if maxSessions <= 0 {
+			maxSessions = 8
+		}
+		c.pool = newMuxPool(c.muxSessionFactory, maxSessions, c.opts.DialTimeout)
 		if c.opts.MuxByteCap > 0 {
 			c.pool.maxBytes = c.opts.MuxByteCap
+		}
+		if closer, ok := c.Transport.(interface{ Close() error }); ok {
+			context.AfterFunc(c.pool.ctx, func() { _ = closer.Close() })
 		}
 	})
 	return c.pool
 }
+
+func (c *Client) Drain() { c.getPool().Drain() }
+
+func (c *Client) Close() error { return c.getPool().Close() }
 
 // DialTunnel returns an AEAD-secured stream connected to target via the
 // server. It implements proxy.Dialer.

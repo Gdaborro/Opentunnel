@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -11,6 +12,8 @@ import (
 
 type DB struct {
 	*sql.DB
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func Open(path string, purgeAfterDays int) (*DB, error) {
@@ -19,11 +22,24 @@ func Open(path string, purgeAfterDays int) (*DB, error) {
 		return nil, err
 	}
 	if err := migrate(db); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
-	wrapped := &DB{db}
+	wrapped := &DB{DB: db, done: make(chan struct{})}
 	go reaper(wrapped, purgeAfterDays)
 	return wrapped, nil
+}
+
+func (db *DB) Close() error {
+	if db == nil {
+		return nil
+	}
+	db.closeOnce.Do(func() {
+		if db.done != nil {
+			close(db.done)
+		}
+	})
+	return db.DB.Close()
 }
 
 func migrate(db *sql.DB) error {
@@ -156,16 +172,22 @@ func reaper(db *DB, purgeAfterDays int) {
 	}
 	window := fmt.Sprintf("-%d days", purgeAfterDays)
 	ticker := time.NewTicker(1 * time.Hour)
-	for range ticker.C {
-		db.Exec(`DELETE FROM peers WHERE status IN ('approved','pending','expired','kicked') AND last_seen < datetime('now', ?)`, window)
-		db.Exec(`DELETE FROM visits WHERE token NOT IN (SELECT token FROM peers)`)
-		db.Exec(`DELETE FROM daily_usage WHERE token NOT IN (SELECT token FROM peers)`)
-		db.Exec(`DELETE FROM device_health WHERE token NOT IN (SELECT token FROM peers)`)
-		db.Exec(`DELETE FROM peer_ips WHERE token NOT IN (SELECT token FROM peers)`)
-		db.Exec(`DELETE FROM peer_ips WHERE at < datetime('now','-7 days')`)
-		db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE status='kicked' AND kick_expires IS NOT NULL AND kick_expires < datetime('now')`)
-		db.Exec(`DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 500)`)
-		db.offlineSweep()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-db.done:
+			return
+		case <-ticker.C:
+			db.Exec(`DELETE FROM peers WHERE status IN ('approved','pending','expired','kicked') AND last_seen < datetime('now', ?)`, window)
+			db.Exec(`DELETE FROM visits WHERE token NOT IN (SELECT token FROM peers)`)
+			db.Exec(`DELETE FROM daily_usage WHERE token NOT IN (SELECT token FROM peers)`)
+			db.Exec(`DELETE FROM device_health WHERE token NOT IN (SELECT token FROM peers)`)
+			db.Exec(`DELETE FROM peer_ips WHERE token NOT IN (SELECT token FROM peers)`)
+			db.Exec(`DELETE FROM peer_ips WHERE at < datetime('now','-7 days')`)
+			db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE status='kicked' AND kick_expires IS NOT NULL AND kick_expires < datetime('now')`)
+			db.Exec(`DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 500)`)
+			db.offlineSweep()
+		}
 	}
 }
 

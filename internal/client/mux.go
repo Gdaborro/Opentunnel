@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"net"
 	"sync"
@@ -42,6 +43,8 @@ const (
 // SSH pattern there is. Randomized per session like the age window.
 const rotationBytesBase = 160 << 20
 
+var ErrMuxCapacity = errors.New("client: mux pool is at capacity; retry after active streams finish")
+
 type MuxPool struct {
 	factory     func(ctx context.Context) (net.Conn, error)
 	maxSessions int
@@ -54,13 +57,21 @@ type MuxPool struct {
 	sessions    []*muxEntry
 	next        int
 	sweeper     bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	closed      bool
 
 	// dialing guards session creation so a page-load burst (dozens of
 	// domains at once) mints at most ONE full SSH+WS+auth handshake at a
 	// time; the rest wait briefly for it to land and then reuse it instead
 	// of stampeding the relay with parallel handshakes.
-	dialing bool
-	dialCh  chan struct{} // closed when the in-flight dial finishes
+	dialing    bool
+	dialCh     chan struct{} // closed when the in-flight dial finishes
+	dialResult *muxDialResult
+}
+
+type muxDialResult struct {
+	err error // immutable after the associated dialCh is closed
 }
 
 type muxEntry struct {
@@ -70,6 +81,7 @@ type muxEntry struct {
 	retireBytes int64
 	bytes       *atomic.Int64 // wire bytes crossing the underlying conn
 	draining    bool
+	drainAt     time.Time // bound the drain from when it actually started
 }
 
 // minRotationAge floors self-tuning: rotation never gets twitchier than this.
@@ -125,6 +137,7 @@ func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions
 	if dialTimeout <= 0 {
 		dialTimeout = 15 * time.Second
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &MuxPool{
 		factory:     factory,
 		maxSessions: maxSessions,
@@ -132,6 +145,8 @@ func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions
 		maxAge:      rotationAge,
 		maxBytes:    rotationBytesBase,
 		softCap:     softCapStreams,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -139,7 +154,15 @@ func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions
 // transport so byte-based rotation sees what the network sees.
 type countingConn struct {
 	net.Conn
-	n *atomic.Int64
+	n      *atomic.Int64
+	cancel context.CancelFunc
+}
+
+func (c *countingConn) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return c.Conn.Close()
 }
 
 func (c *countingConn) Read(p []byte) (int, error) {
@@ -155,8 +178,21 @@ func (c *countingConn) Write(p []byte) (int, error) {
 }
 
 func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
-	conn, err := p.factory(ctx)
+	// A successfully created warm session belongs to the pool, not the
+	// first browser request. Its context must survive that request ending.
+	// Cancellation and the setup budget apply only while the factory runs.
+	sessionCtx, cancel := context.WithCancel(p.ctx)
+	stopCaller := context.AfterFunc(ctx, cancel)
+	timer := time.AfterFunc(p.dialTimeout, cancel)
+	conn, err := p.factory(sessionCtx)
+	stopCaller()
+	timer.Stop()
+	if err == nil && sessionCtx.Err() != nil {
+		_ = conn.Close()
+		err = sessionCtx.Err()
+	}
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	now := time.Now()
@@ -165,7 +201,7 @@ func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
 	maxBytes := p.maxBytes
 	p.mu.Unlock()
 	var extra time.Duration
-	if maxAge > 0 {
+	if maxAge >= 4 {
 		extra = time.Duration(rand.Int63n(int64(maxAge) / 4))
 	}
 	if maxBytes <= 0 {
@@ -174,11 +210,15 @@ func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
 	// Slack defeats metronomic rotation: sessions retire unpredictably
 	// inside the window, never on a schedule — and byte caps drift so
 	// flow sizes never repeat exactly.
-	retireBytes := maxBytes + rand.Int63n(maxBytes/4)
+	retireBytes := maxBytes
+	if maxBytes >= 4 {
+		retireBytes += rand.Int63n(maxBytes / 4)
+	}
 	counter := &atomic.Int64{}
-	sess, err := smux.Client(&countingConn{Conn: conn, n: counter}, muxConfig())
+	sess, err := smux.Client(&countingConn{Conn: conn, n: counter, cancel: cancel}, muxConfig())
 	if err != nil {
 		conn.Close()
+		cancel()
 		return nil, err
 	}
 	return &muxEntry{
@@ -203,7 +243,11 @@ func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
 			continue
 		}
 		if e.draining {
-			if e.sess.NumStreams() == 0 || now.After(e.retireAt.Add(maxDrain)) {
+			drainAt := e.drainAt
+			if drainAt.IsZero() {
+				drainAt = e.retireAt
+			}
+			if e.sess.NumStreams() == 0 || now.After(drainAt.Add(maxDrain)) {
 				p.noteDeath(e.born)
 				dead = append(dead, e)
 				continue
@@ -213,6 +257,7 @@ func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
 		}
 		if now.After(e.retireAt) || (e.bytes != nil && e.bytes.Load() > e.retireBytes) {
 			e.draining = true
+			e.drainAt = now
 		}
 		alive = append(alive, e)
 	}
@@ -227,6 +272,9 @@ func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
 func (p *MuxPool) retire() {
 	p.mu.Lock()
 	dead := p.retireLocked(time.Now())
+	if p.closed && len(p.sessions) == 0 && p.cancel != nil {
+		p.cancel()
+	}
 	p.mu.Unlock()
 	for _, e := range dead {
 		_ = e.sess.Close()
@@ -247,12 +295,55 @@ func (p *MuxPool) sweep() {
 	p.sweeper = true
 	p.mu.Unlock()
 	go func() {
-		time.Sleep(time.Duration(rand.Int63n(int64(sweepEvery))))
+		if !poolWait(p.ctx, time.Duration(rand.Int63n(int64(sweepEvery)))) {
+			return
+		}
 		for {
-			time.Sleep(sweepEvery + time.Duration(rand.Int63n(int64(time.Minute))))
+			if !poolWait(p.ctx, sweepEvery+time.Duration(rand.Int63n(int64(time.Minute)))) {
+				return
+			}
 			p.retire()
 		}
 	}()
+}
+
+func poolWait(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// Drain rejects new streams while allowing existing ones to finish. Used
+// when pins/entries rebuild a tier client instead of leaking the old pool.
+func (p *MuxPool) Drain() {
+	p.mu.Lock()
+	p.closed = true
+	for _, e := range p.sessions {
+		e.draining = true
+		e.drainAt = time.Now()
+	}
+	p.mu.Unlock()
+	p.retire()
+}
+
+func (p *MuxPool) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	sessions := p.sessions
+	p.sessions = nil
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.mu.Unlock()
+	for _, e := range sessions {
+		_ = e.sess.Close()
+	}
+	return nil
 }
 
 // muxConfig returns the shared smux parameters. Keepalive jitter now
@@ -279,44 +370,59 @@ func (p *MuxPool) pick() *muxEntry {
 	p.retire()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	alive := p.sessions[:0]
-	var chosen *muxEntry
-	for i := 0; i < len(p.sessions); i++ {
-		e := p.sessions[(p.next+i)%len(p.sessions)]
-		if e.sess.IsClosed() {
-			continue
-		}
-		alive = append(alive, e)
-		if e.draining || overCap(e, p.softCap) {
-			continue
-		}
-		if chosen == nil {
-			chosen = e
-			p.next = (p.next + i + 1) % maxInt(1, len(p.sessions))
+	if p.closed || len(p.sessions) == 0 {
+		return nil
+	}
+	// Snapshot the start index. Mutating next and compacting the same backing
+	// slice during a rotated traversal duplicated entries and lost sessions.
+	n := len(p.sessions)
+	start := p.next % n
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		e := p.sessions[idx]
+		if !e.sess.IsClosed() && !e.draining && !overCap(e, p.softCap) {
+			p.next = (idx + 1) % n
+			return e
 		}
 	}
-	p.sessions = alive
-	if len(p.sessions) == 0 {
-		p.next = 0
-	}
-	return chosen
+	return nil
 }
 
-func (p *MuxPool) add(e *muxEntry) {
+func (p *MuxPool) add(e *muxEntry) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.addLocked(e)
+	return p.addLocked(e)
 }
 
-func (p *MuxPool) addLocked(e *muxEntry) {
-	if len(p.sessions) >= p.maxSessions {
-		// Replace the oldest; smux keepalive will retire it cleanly.
-		old := p.sessions[0]
-		go old.sess.Close()
-		p.sessions = p.sessions[1:]
+func (p *MuxPool) addLocked(e *muxEntry) error {
+	if p.closed {
+		go e.sess.Close()
+		return net.ErrClosed
+	}
+	if len(p.sessions) >= 2*p.maxSessions {
+		go e.sess.Close()
+		return ErrMuxCapacity
+	}
+	active := 0
+	for _, existing := range p.sessions {
+		if !existing.draining && !existing.sess.IsClosed() {
+			active++
+		}
+	}
+	if active >= p.maxSessions {
+		// Capacity is not permission to kill an active download. Retire the
+		// oldest warm session gracefully, bounded by the total drain cap.
+		for _, old := range p.sessions {
+			if !old.draining && !old.sess.IsClosed() {
+				old.draining = true
+				old.drainAt = time.Now()
+				break
+			}
+		}
 	}
 	p.sessions = append(p.sessions, e)
 	p.next = len(p.sessions) - 1
+	return nil
 }
 
 func (p *MuxPool) drop(e *muxEntry) {
@@ -340,6 +446,15 @@ func (p *MuxPool) drop(e *muxEntry) {
 // their own handshakes. If the wait runs long (hung dial), a caller may
 // break out and dial itself as a last resort.
 func (p *MuxPool) Open(ctx context.Context) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return nil, net.ErrClosed
+	}
 	const waiterCap = 10 * time.Second
 	p.sweep() // idle pools rotate too (no-op after the first call)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -368,9 +483,14 @@ func (p *MuxPool) Open(ctx context.Context) (net.Conn, error) {
 // getOrDial returns a usable session, dialing one if none exists. Only one
 // caller dials at a time; the rest wait for its result and reuse it.
 func (p *MuxPool) getOrDial(ctx context.Context, waiterCap time.Duration) (*muxEntry, error) {
-	deadline := time.Now().Add(waiterCap)
+	timer := time.NewTimer(waiterCap)
+	defer timer.Stop()
 	for {
 		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, net.ErrClosed
+		}
 		// A session appeared while we waited for the lock (skip draining
 		// and over-cap ones: retired sessions take no new streams).
 		for _, e := range p.sessions {
@@ -379,15 +499,25 @@ func (p *MuxPool) getOrDial(ctx context.Context, waiterCap time.Duration) (*muxE
 				return e, nil
 			}
 		}
+		if len(p.sessions) >= 2*p.maxSessions {
+			p.mu.Unlock()
+			return nil, ErrMuxCapacity // do not handshake just to discover the cap
+		}
 		if !p.dialing {
 			// We're the dialer.
 			p.dialing = true
 			ch := make(chan struct{})
 			p.dialCh = ch
+			result := &muxDialResult{}
+			p.dialResult = result
 			p.mu.Unlock()
 			entry, err := p.createSession(ctx)
 			p.mu.Lock()
 			p.dialing = false
+			if err == nil {
+				err = p.addLocked(entry)
+			}
+			result.err = err
 			if p.dialCh == ch {
 				close(ch)
 				p.dialCh = nil
@@ -396,26 +526,23 @@ func (p *MuxPool) getOrDial(ctx context.Context, waiterCap time.Duration) (*muxE
 				p.mu.Unlock()
 				return nil, err
 			}
-			p.addLocked(entry)
 			p.mu.Unlock()
 			return entry, nil
 		}
 		// Someone else is dialing: wait for them, bounded.
 		ch := p.dialCh
+		result := p.dialResult
 		p.mu.Unlock()
 		select {
 		case <-ch:
-			// loop: pick up the session (or become the dialer if it failed)
+			if result.err != nil {
+				return nil, result.err // same result even if another dial starts
+			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(time.Until(deadline)):
-			// The in-flight dial looks hung — dial one ourselves.
-			entry, err := p.createSession(ctx)
-			if err != nil {
-				return nil, err
-			}
-			p.add(entry)
-			return entry, nil
+		case <-timer.C:
+			// A waiter timeout must never create another parallel handshake.
+			return nil, fmt.Errorf("client: waiting for shared mux setup: %w", context.DeadlineExceeded)
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,6 +103,35 @@ func TestH3TunnelRoundTrip(t *testing.T) {
 			t.Fatalf("iter %d body=%q want %q", i, body, want)
 		}
 		up.Close()
+	}
+}
+
+func TestH3EntryAndLearnedPinsFollowAdaptiveUpdates(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	addr, fp := startH3Server(t)
+	a := client.NewAdaptive(token, transport.WSTLSOptions{
+		ServerAddr: "127.0.0.1:1", Fingerprint: strings.Repeat("ab", 32),
+	}, "auto", 5*time.Second)
+	a.EnableH3ForCurrentEntry()
+	a.EnableMux()
+	defer a.Close()
+	a.SetEntries([]transport.WSTLSOptions{{ServerAddr: addr, Fingerprint: strings.Repeat("ab", 32)}})
+	if !a.AddPin(fp) {
+		t.Fatal("valid renewal pin was not accepted")
+	}
+	if a.AddPin("not-a-pin") {
+		t.Fatal("invalid pin was accepted")
+	}
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("updated")) }))
+	defer target.Close()
+	host, port, _ := net.SplitHostPort(target.Listener.Addr().String())
+	stream, err := a.DialTunnel(t.Context(), mustParse(t, host, atoi(t, port)))
+	if err != nil {
+		t.Fatalf("H3 kept an obsolete entry or pin set: %v", err)
+	}
+	stream.Close()
+	if a.Current() != client.H3TierName {
+		t.Fatalf("expected H3 on updated entry, got %s", a.Current())
 	}
 }
 

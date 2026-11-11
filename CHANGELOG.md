@@ -1,5 +1,56 @@
 # Changelog
 
+## v1.1.5 - carrier reliability and identity hardening
+
+### Security
+- Minimum Go toolchain raised to 1.27.4 for the net/http crash advisory
+  GO-2026-6859; CI follows the patched minimum in `go.mod`.
+- Public bootstrap requests can no longer replace an approved device key or
+  use auto-accept to approve a conflicting identity. Administrator-assisted
+  replacement at `/admin/ssh-keys` requires separate approval.
+- Invalid-signature and downgrade attempts still raise critical alerts but
+  cannot auto-kick their named victim; sustained failures target the source.
+- TLS pins are rechecked during connection verification, including cached
+  sessions. Direct callers cannot spoof trusted panel proxy headers.
+- The configured v5 enforcement deadline now applies to keyless legacy rows.
+- Update tags and asset destinations are parsed strictly, metadata is bounded,
+  duplicate assets are refused, and manifest HTTP failures are checked.
+
+### Reliability
+- SSH setup is bounded beyond the TCP connect; legacy WS retry gets a fresh
+  forwarding channel. Losing the public-key cache does not regenerate identity.
+- Mux selection no longer corrupts its session list. Capacity drains active
+  streams gracefully, waiters share setup instead of stampeding, and warm
+  sessions outlive the request that created them.
+- Sticky SSH is not preceded by dead QUIC on every request. Control/probes
+  share backoff, profiles use their actual shaping settings, and H3 follows
+  current entries and learned pins.
+- Old pools, transports, telemetry loops and database workers shut down cleanly.
+- Throughput probes perform verified HTTPS and decode HTTP bodies; old loss
+  samples age out correctly. Encrypted frame writes are serialized and short
+  writes are rejected.
+- Updated clients wait for the old process before checking proxy-port ownership.
+- Standalone console scripts are hash-allowed by CSP without unsafe inline
+  scripting. The read-only device-limits endpoint works again.
+
+### Review and verification
+- Added reliability/security regression coverage, including repeated large
+  transfers through a synthetic authenticated SSH/WS/AEAD/mux stack.
+- Documented findings and the decision-gated Xray/REALITY carrier pilot in
+  `docs/REVIEW.md` and `docs/XRAY-REALITY.md`.
+- Version and update floor raised to v1.1.5. No new carrier is enabled and no
+  operational admission or kill-switch setting is changed by this release.
+
+## v1.1.4 - dependency security pins
+- Updated Brotli and klauspost/compress to fixed releases for reachable
+  decompression advisories; uTLS version unchanged.
+
+## v1.1.3 - SSH-tier recovery
+- Added startup authorized-key reconciliation, per-device SSH-key preference,
+  rejection backoff and reduced health/ECH log noise.
+- The public re-registration behavior introduced here is superseded by the
+  administrator-only replacement workflow in v1.1.5.
+
 ## v1.1.1 — sentinel console + hostile-network intel
 
 ### Added

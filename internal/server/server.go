@@ -315,6 +315,13 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 	// carry the key.
 	if status == protocol.StatusOK && opt.PanelDB != nil {
 		pub := opt.PanelDB.SSHPubKey(hs.Token)
+		if pub == "" && !opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After) {
+			// The migration deadline applies to keyless legacy rows too.
+			// A v5 version byte without a registered verification key is
+			// not proof of possession and cannot bypass enforcement.
+			_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
+			return
+		}
 		switch {
 		case hs.Version >= protocol.ProtoVersion:
 			if pub == "" {

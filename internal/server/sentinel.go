@@ -12,8 +12,8 @@ package server
 // countermeasures:
 //
 //   - auth-failure flood from one IP  → 30-minute guard ban + alert
-//   - stolen-token evidence (v5 signature mismatch / v4 downgrade after a
-//     proven v5 session) → 60-minute automated device kick + critical alert
+//   - unverified token use (v5 signature mismatch / v4 downgrade) → critical
+//     alert; sustained failures may ban the source, never the named victim
 //   - scanning/probing floods → alert only (probers already get the decoy;
 //     changing their response would itself fingerprint the relay)
 //
@@ -47,13 +47,12 @@ const (
 
 	sentinelThrottle = 30 * time.Minute // min gap between same-key alerts
 	sentinelBanTime  = 30 * time.Minute // auth-flood IP ban
-	sentinelKickTime = 60 * time.Minute // stolen-token device kick
 )
 
 // Reporter is the panel surface the sentinel reports through. The relay's
 // PanelDB interface satisfies it (RecordAlert is part of PanelDB). Optional
 // richer capabilities are discovered by type assertion: RecordAlertOnce,
-// RecordEvent, AutoKick and Setting (see *panel.DB). A nil reporter (tests,
+// RecordEvent and Setting (see *panel.DB). A nil reporter (tests,
 // legacy static-token mode) degrades to journal logging only.
 type Reporter interface {
 	RecordAlert(severity, kind, message string)
@@ -65,10 +64,6 @@ type alertOncer interface {
 
 type eventRecorder interface {
 	RecordEvent(kind, detail string)
-}
-
-type autoKicker interface {
-	AutoKick(token, reason string, until time.Time) bool
 }
 
 type settingsReader interface {
@@ -243,7 +238,7 @@ func (s *Sentinel) event(detail string) {
 // token scanning land here; sustained pressure escalates to a 30-minute
 // guard ban (respond mode) — the peer just keeps seeing the decoy.
 func (s *Sentinel) AuthFail(ip string) {
-	if ip == "" || !s.active() {
+	if ip == "" || isLoopbackIP(ip) || !s.active() {
 		return
 	}
 	n := s.hit("auth", ip, sentinelAuthWindow)
@@ -263,28 +258,19 @@ func (s *Sentinel) AuthFail(ip string) {
 	s.alert("auth|"+ip, "warning", "sentinel", msg)
 }
 
-// StolenToken: the strongest in-band evidence that a token no longer
-// belongs only to its device — a v5 signature mismatch, or a v4 downgrade
-// from a peer that has already proven v5 key possession. what names the
-// evidence for the alert text. Responds with a 60-minute automated kick
-// (never for allowlisted operator devices — AutoKick re-checks that).
+// StolenToken observes an attempt that knows a token but has not proven
+// private-key possession. Automatically kicking the named device here lets
+// a token thief disconnect the legitimate victim by sending one bad signature.
+// Alert on the evidence; only the failing source may be rate-limited.
 func (s *Sentinel) StolenToken(token, ip, what string) {
 	if token == "" || !s.active() {
 		return
 	}
 	s.hit("stolen", token, sentinelThrottle)
-	took := false
-	if s.respond() && s.throttle("act|stolen|"+token, sentinelThrottle) {
-		if k, ok := s.rep.(autoKicker); ok {
-			if k.AutoKick(token, "auto: "+what+" — possible stolen token", s.now().Add(sentinelKickTime)) {
-				took = true
-				s.event("auto-kicked " + shortToken(token) + " for " + sentinelKickTime.String() + " (" + what + ")")
-			}
-		}
-	}
+	s.AuthFail(ip)
 	msg := what + " for device " + shortToken(token) + " — possible stolen token"
-	if took {
-		msg += " — device auto-kicked " + sentinelKickTime.String()
+	if ip != "" && !isLoopbackIP(ip) {
+		msg += " (source " + ip + "; device left connected)"
 	}
 	s.alert("stolen|"+token, "critical", "security", msg)
 }

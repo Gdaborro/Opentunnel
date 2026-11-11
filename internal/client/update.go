@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -65,14 +66,21 @@ func LatestRelease(ctx context.Context, socksAddr string) (*Release, error) {
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("github: %s", resp.Status)
 	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 1<<20 {
+		return nil, errors.New("auto-update: release metadata exceeds 1 MiB")
+	}
 	var rel Release
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	if err := json.Unmarshal(data, &rel); err != nil {
 		return nil, err
 	}
 	return &rel, nil
 }
 
-var verRe = regexp.MustCompile(`v?(\d+)\.(\d+)\.(\d+)`)
+var verRe = regexp.MustCompile(`^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$`)
 
 // parseVersion extracts major/minor/patch from a tag like "v0.9.1".
 func parseVersion(s string) (major, minor, patch int, ok bool) {
@@ -80,9 +88,12 @@ func parseVersion(s string) (major, minor, patch int, ok bool) {
 	if m == nil {
 		return 0, 0, 0, false
 	}
-	a, _ := strconv.Atoi(m[1])
-	b, _ := strconv.Atoi(m[2])
-	c, _ := strconv.Atoi(m[3])
+	a, ea := strconv.Atoi(m[1])
+	b, eb := strconv.Atoi(m[2])
+	c, ec := strconv.Atoi(m[3])
+	if ea != nil || eb != nil || ec != nil {
+		return 0, 0, 0, false
+	}
 	return a, b, c, true
 }
 
@@ -110,7 +121,9 @@ func expectedSHA256(body string) string {
 		if strings.HasPrefix(l, "sha256:") {
 			sum := strings.TrimSpace(strings.TrimPrefix(l, "sha256:"))
 			if len(sum) == 64 {
-				return sum
+				if _, err := hex.DecodeString(sum); err == nil {
+					return sum
+				}
 			}
 		}
 	}
@@ -211,6 +224,9 @@ func socksDialContext(ctx context.Context, socksAddr, network, addr string) (net
 // sha256 line all ride channels a middlebox can rewrite, but a forged
 // binary cannot produce a valid signature for the offline private key.
 func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
+	if rel == nil {
+		return errors.New("auto-update: missing release metadata")
+	}
 	// Metadata validation first (platform-independent): the version floor
 	// and the signature requirement must hold anywhere this code runs —
 	// and must be exercisable by tests on every OS.
@@ -222,8 +238,14 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	for _, a := range rel.Assets {
 		switch a.Name {
 		case assetName:
+			if url != "" {
+				return errors.New("auto-update: duplicate client release asset")
+			}
 			url = a.URL
 		case "manifest.sig":
+			if sigURL != "" {
+				return errors.New("auto-update: duplicate release manifest")
+			}
 			sigURL = a.URL
 		}
 	}
@@ -237,6 +259,9 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 		// forged tag over a real old binary fails verification too
 		// (audit round three, N-3).
 		return fmt.Errorf("auto-update: release %s has no manifest signature — refusing install", rel.TagName)
+	}
+	if !validReleaseAssetURL(url, rel.TagName, assetName) || !validReleaseAssetURL(sigURL, rel.TagName, "manifest.sig") {
+		return errors.New("auto-update: release asset URL is outside the expected GitHub release")
 	}
 	// The swap/re-exec machinery is Windows-only.
 	if runtime.GOOS != "windows" {
@@ -262,6 +287,10 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	sresp, err := fetch(sigURL)
 	if err != nil {
 		return err
+	}
+	if sresp.StatusCode != http.StatusOK {
+		_ = sresp.Body.Close()
+		return fmt.Errorf("auto-update: manifest download %s", sresp.Status)
 	}
 	sigRaw, err := io.ReadAll(io.LimitReader(sresp.Body, 4096))
 	sresp.Body.Close()
@@ -338,11 +367,20 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Dir = ""
+	cmd.Env = append(os.Environ(), "OTU_UPDATE_PARENT_PID="+strconv.Itoa(os.Getpid()))
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("auto-update: re-exec failed (new binary in place): %w", err)
 	}
 	log.Printf("auto-update: updated to %s (signature verified) — restarting", rel.TagName)
 	return nil
+}
+
+func validReleaseAssetURL(raw, tag, name string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	return u.Path == "/"+updateRepo+"/releases/download/"+tag+"/"+name && u.RawPath == ""
 }
 
 // UpdateLoop checks for updates shortly after start and then periodically.

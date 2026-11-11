@@ -123,7 +123,9 @@ type SecureStream struct {
 	dec    *countedAEAD
 	params ProfileParams
 
-	rbuf []byte // decrypted-but-unconsumed payload
+	rbuf    []byte // decrypted-but-unconsumed payload
+	readMu  sync.Mutex
+	writeMu sync.Mutex
 }
 
 func newSecureStream(conn net.Conn, sendKey, recvKey []byte, sendDir byte, params ProfileParams) (*SecureStream, error) {
@@ -184,6 +186,11 @@ var frameBufPool = sync.Pool{
 }
 
 func (s *SecureStream) Write(p []byte) (int, error) {
+	// Nonce allocation and the corresponding frame write must stay in the
+	// same order. Locking only the nonce counter allowed concurrent writers
+	// to put frame N+1 on the wire before frame N, breaking decryption.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	written := 0
 	for written < len(p) {
 		chunk := p[written:]
@@ -206,7 +213,12 @@ func (s *SecureStream) Write(p []byte) (int, error) {
 		frameBufPool.Put(buf[:0])
 
 		// Single transport write per frame: fewer records, steadier shape.
-		if _, err := s.conn.Write(frame); err != nil {
+		n, err := s.conn.Write(frame)
+		if err == nil && n != len(frame) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			_ = s.conn.Close() // a partial encrypted frame cannot be retried safely
 			return written, err
 		}
 		written += len(chunk)
@@ -215,6 +227,8 @@ func (s *SecureStream) Write(p []byte) (int, error) {
 }
 
 func (s *SecureStream) Read(p []byte) (int, error) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
 	if len(s.rbuf) > 0 {
 		n := copy(p, s.rbuf)
 		s.rbuf = s.rbuf[n:]

@@ -27,6 +27,7 @@ type Handler struct {
 	rlMu    sync.Mutex
 	rlMap   map[string]*regLimit // per-IP rate-limit buckets (bucket|ip)
 	rlSwept time.Time            // last opportunistic expiry sweep
+	keyMu   sync.Mutex           // serialize registration and admin key lifecycle hooks
 
 	// OnApprove installs a device's SSH public key into the ssh tier's
 	// authorized_keys when an admin approves it (nil = not configured).
@@ -131,6 +132,9 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	// Standalone sentinel console (plain HTML, same reasoning as above):
 	// mode toggle + recent findings, no SPA rebuild needed.
 	mux.Handle("/admin/sentinel", h.auth.RequireAuth(http.HandlerFunc(h.sentinelPage)))
+	mux.Handle("/admin/ssh-keys", h.auth.RequireAuth(http.HandlerFunc(h.sshKeysPage)))
+	mux.Handle("/admin/ssh-keys.js", h.auth.RequireAuth(http.HandlerFunc(h.sshKeysScript)))
+	mux.Handle("/admin/api/ssh-keys", h.auth.RequireAuth(http.HandlerFunc(h.sshKeysAPI)))
 	mux.Handle("/admin/api/peers", h.auth.RequireAuth(http.HandlerFunc(h.apiPeers)))
 	mux.Handle("/admin/api/peers/", h.auth.RequireAuth(http.HandlerFunc(h.apiPeerAction)))
 	mux.Handle("/admin/api/blocklist", h.auth.RequireAuth(http.HandlerFunc(h.apiBlocklist)))
@@ -175,7 +179,7 @@ func securityHeaders(next http.Handler) http.Handler {
 			h.Set("Cache-Control", "no-store")
 		}
 		h.Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
+			"default-src 'self'; script-src 'self'"+adminInlineScriptHashes+"; style-src 'self' 'unsafe-inline'; "+
 				"img-src 'self' data:; font-src 'self'; connect-src 'self'; "+
 				"frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		next.ServeHTTP(w, r)
@@ -198,7 +202,7 @@ func csrfOriginCheck(next http.Handler) http.Handler {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if origin := r.Header.Get("Origin"); origin != "" {
 				hosts := []string{r.Host}
-				if fh := r.Header.Get("X-Otu-Original-Host"); fh != "" {
+				if fh := r.Header.Get("X-Otu-Original-Host"); fh != "" && trustedPanelProxy(r) {
 					hosts = append(hosts, fh)
 				}
 				ok := false
@@ -314,7 +318,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 // address when the relay is fronted). Direct requests (tests, emergency
 // panel access on loopback) fall back to RemoteAddr.
 func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Otu-Client-IP"); net.ParseIP(v) != nil {
+	if v := r.Header.Get("X-Otu-Client-IP"); net.ParseIP(v) != nil && trustedPanelProxy(r) {
 		return v
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -322,6 +326,15 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+func trustedPanelProxy(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -400,9 +413,6 @@ func requirePOST(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
-	if !requirePOST(w, r) {
-		return
-	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/peers/"), "/")
 	if len(parts) != 2 {
 		http.Error(w, "bad request", 400)
@@ -416,11 +426,59 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid token", 400)
 		return
 	}
+	if action != "limits" || r.Method != http.MethodGet {
+		if !requirePOST(w, r) {
+			return
+		}
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	h.keyMu.Lock()
+	defer h.keyMu.Unlock()
 	short := token
 	if len(short) > 8 {
 		short = short[:8]
 	}
 	switch action {
+	case "rekey":
+		var req struct {
+			PublicKey string `json:"ssh_pubkey"`
+			Expected  string `json:"expected_ssh_pubkey"`
+			Confirm   bool   `json:"confirm"`
+		}
+		if json.NewDecoder(r.Body).Decode(&req) != nil || !req.Confirm {
+			http.Error(w, "verify the new public key out of band and explicitly confirm replacement", http.StatusBadRequest)
+			return
+		}
+		pub, ok := CanonicalSSHPubKey(req.PublicKey)
+		if !ok {
+			http.Error(w, "ssh_pubkey must be one ed25519 public key", http.StatusBadRequest)
+			return
+		}
+		var old, fp, status string
+		if err := h.db.QueryRow(`SELECT COALESCE(ssh_pubkey,''), fingerprint, status FROM peers WHERE token=?`, token).
+			Scan(&old, &fp, &status); err != nil {
+			http.Error(w, "device not found", http.StatusNotFound)
+			return
+		}
+		if status == "banned" || h.db.IdentityBanned(fp, old) || h.db.IdentityBanned("", pub) {
+			http.Error(w, "unban the device before replacing its key", http.StatusForbidden)
+			return
+		}
+		if strings.TrimSpace(req.Expected) != strings.TrimSpace(old) {
+			http.Error(w, "stored key changed; refresh before confirming replacement", http.StatusConflict)
+			return
+		}
+		if !sameSSHKey(old, pub) {
+			if old != "" && h.OnRevoke != nil {
+				h.OnRevoke(token) // hook still sees the old key
+			}
+			if _, err := h.db.Exec(`UPDATE peers SET ssh_pubkey=?, status='pending' WHERE token=?`, pub, token); err != nil {
+				http.Error(w, "key replacement failed", http.StatusInternalServerError)
+				return
+			}
+			h.db.RecordEvent("ssh-key", short+" public key replaced by administrator; approval required")
+		}
+		// Never auto-approve a rekey, including during auto-accept windows.
 	case "approve":
 		h.db.Exec(`UPDATE peers SET status='approved', last_seen=datetime('now') WHERE token=?`, token)
 		h.db.RecordEvent("approve", short+" approved")
@@ -468,6 +526,9 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		h.db.Exec(`DELETE FROM daily_usage WHERE token=?`, token)
 	case "expire":
 		h.db.Exec(`UPDATE peers SET status='expired' WHERE token=?`, token)
+		if h.OnRevoke != nil {
+			h.OnRevoke(token)
+		}
 	case "limits":
 		if r.Method == "GET" {
 			var sched string
@@ -495,6 +556,9 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		}
 		h.db.SetPeerLimits(token, strings.TrimSpace(req.Schedule), req.MaxBps, req.QuotaBytes)
 		h.db.RecordEvent("limits", short+" limits updated")
+	default:
+		http.Error(w, "unknown device action", http.StatusBadRequest)
+		return
 	}
 	w.Write([]byte(`{"ok":true}`))
 }
@@ -828,7 +892,10 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		DeviceName  string `json:"device_name"`
 		SSHPubKey   string `json:"ssh_pubkey"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if json.NewDecoder(r.Body).Decode(&req) != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 	if req.Token == "" || req.Fingerprint == "" {
 		http.Error(w, "token and fingerprint required", 400)
 		return
@@ -877,69 +944,46 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	if h.autoApprove || h.db.AutoAcceptActive() {
 		status = "approved"
 	}
-	// Only set status on first insert; existing peers keep their current status
-	res, _ := h.db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen) VALUES(?,?,?, ?, ?, datetime('now'), datetime('now'))`,
+	h.keyMu.Lock()
+	defer h.keyMu.Unlock()
+	// A public bootstrap request is not proof of private-key possession.
+	// Existing identities are immutable here; only an authenticated admin
+	// can replace an approved key through the rekey action above.
+	res, err := h.db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen) VALUES(?,?,?, ?, ?, datetime('now'), datetime('now'))`,
 		req.Token, req.Fingerprint, req.DeviceName, req.SSHPubKey, status)
-	// Record the registrant's source IP (v1.1.0): feeds the registration-
-	// burst detector and the travel history until the first tunnel connects.
-	h.db.SetPeerIP(req.Token, clientIP(r))
+	if err != nil {
+		http.Error(w, "registration unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		var existingStatus, existingKey string
-		_ = h.db.QueryRow(`SELECT status, COALESCE(ssh_pubkey,'') FROM peers WHERE token=?`, req.Token).
-			Scan(&existingStatus, &existingKey)
+		var existingStatus, existingKey, existingFP string
+		if err := h.db.QueryRow(`SELECT status, COALESCE(ssh_pubkey,''), fingerprint FROM peers WHERE token=?`, req.Token).
+			Scan(&existingStatus, &existingKey, &existingFP); err != nil {
+			http.Error(w, "registration unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		status = existingStatus
-		switch {
-		case req.SSHPubKey == "":
-			// No key announced (early boot before the identity files are
-			// written): update liveness only — an empty string is not a
-			// key rotation.
+		if existingFP != req.Fingerprint || (req.SSHPubKey != "" &&
+			!sameSSHKey(existingKey, req.SSHPubKey) && !(existingKey == "" && status == "pending")) {
+			if h.db.throttleKV("key-conflict|"+req.Token, time.Hour) {
+				h.db.RecordAlert("warning", "security", "conflicting bootstrap identity for device "+shortPK(req.Token)+"; stored identity preserved")
+			}
+			http.Error(w, "identity conflict: an administrator must verify and replace the public key", http.StatusConflict)
+			return
+		}
+		if status == "pending" {
+			if existingKey == "" && req.SSHPubKey != "" {
+				h.db.Exec(`UPDATE peers SET ssh_pubkey=? WHERE token=?`, req.SSHPubKey, req.Token)
+			}
 			h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
-		case existingKey == "":
-			// Backfill: the row predates key storage (or the device's key
-			// was never recorded). For an approved device this is a repair,
-			// not a rotation — store the key and install its line now.
-			h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=? WHERE token=?`, req.SSHPubKey, req.Token)
-			if existingStatus == "approved" && h.OnApprove != nil {
-				h.OnApprove(req.Token)
-			}
-		case !sameSSHKey(existingKey, req.SSHPubKey):
-			// Key rotation. The old COALESCE-only update silently kept the
-			// stored key forever, so a reinstalled device presented a key
-			// the panel had never installed and the ssh tier failed on
-			// every attempt (2026-11-05 incident). Never silently keep a
-			// key the device no longer has:
-			//   - approved device: revoke the old line, store the new key
-			//     and send the device back through approval (a stolen
-			//     token can force a re-approval this way, but cannot gain
-			//     access — the key only becomes usable after an admin
-			//     approves the rotation);
-			//   - not-yet-approved device: just update the pending row.
-			if existingStatus != "approved" {
-				h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=? WHERE token=?`, req.SSHPubKey, req.Token)
-				break
-			}
-			if h.OnRevoke != nil {
-				h.OnRevoke(req.Token) // removes the OLD stored key
-			}
-			newStatus := "pending"
-			if h.autoApprove || h.db.AutoAcceptActive() {
-				newStatus = "approved"
-			}
-			h.db.Exec(`UPDATE peers SET last_seen=datetime('now'), ssh_pubkey=?, status=? WHERE token=?`,
-				req.SSHPubKey, newStatus, req.Token)
-			status = newStatus
-			h.db.RecordEvent("ssh-key", req.DeviceName+" presented a new ssh key — "+newStatus)
-			h.db.RecordAlert("warning", "nac", "device "+req.DeviceName+" presented a new SSH key — re-approval required")
-			if newStatus == "approved" && h.OnApprove != nil {
-				h.OnApprove(req.Token)
-			}
-		default:
-			h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
+			// Only bootstrap identities feed unauthenticated location history.
+			// Approved-device location comes from authenticated sessions.
+			h.db.SetPeerIP(req.Token, clientIP(r))
 		}
 		// A device that registered before an auto-accept window opened must
 		// not stay stuck pending forever: while the window is open, upgrade
 		// it and install its SSH key so early launchers connect too.
-		if status == "pending" && h.db.AutoAcceptActive() {
+		if status == "pending" && h.db.AutoAcceptActive() && req.SSHPubKey != "" {
 			h.db.Exec(`UPDATE peers SET status='approved' WHERE token=?`, req.Token)
 			status = "approved"
 			h.db.RecordEvent("auto-accept", req.DeviceName+" upgraded to approved (auto-accept window)")
@@ -948,11 +992,12 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
+		h.db.SetPeerIP(req.Token, clientIP(r))
 		h.db.RecordEvent("register", req.DeviceName+" registered ("+status+")")
 		h.db.RecordAlert("info", "nac", "new device "+req.DeviceName+" registered — status: "+status)
 		// Auto-approved via the window: install the SSH key now so
 		// standalone clients can use the ssh tier immediately.
-		if status == "approved" && h.OnApprove != nil && !h.autoApprove {
+		if status == "approved" && h.OnApprove != nil {
 			h.OnApprove(req.Token)
 		}
 	}

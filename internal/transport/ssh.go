@@ -1,8 +1,9 @@
 // Package transport: ssh.go adds an SSH-transport. The opentunnel protocol
 // runs inside a real SSH session (key-authenticated), which censorship
-// middleboxes that whitelist SSH commonly leave untouched. Confidentiality
-// does not depend on trusting the SSH hop: the inner AEAD layer still
-// end-to-end protects all traffic.
+// middleboxes that whitelist SSH may leave untouched. The SSH endpoint is
+// part of the trust boundary: the inner AEAD keys derive from a token and
+// salt visible to the carrier terminator. Inner framing is not independent
+// end-to-end secrecy from that endpoint; host-key verification remains vital.
 package transport
 
 import (
@@ -16,7 +17,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -171,28 +174,48 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 		MACs:              sshMACAlgos,
 		HostKeyAlgorithms: sshHostKeyAlgos,
 	}
-	client, err := ssh.Dial("tcp", hostPort, cfg)
+	// ssh.Dial's Timeout only bounds the TCP connect. A peer that accepts
+	// TCP and never sends an SSH banner used to hold a mux dial forever.
+	// Bound the entire SSH + forwarding + WS setup with the caller context
+	// and the underlying socket deadline, then transfer ownership to the conn.
+	raw, err := (&net.Dialer{Timeout: timeout}).DialContext(dctx, "tcp", hostPort)
 	if err != nil {
+		return nil, fmt.Errorf("transport: ssh dial %s: %w", hostPort, err)
+	}
+	owned := false
+	defer func() {
+		if !owned {
+			_ = raw.Close()
+		}
+	}()
+	if deadline, ok := dctx.Deadline(); ok {
+		_ = raw.SetDeadline(deadline)
+	}
+	stopSetup := context.AfterFunc(dctx, func() { _ = raw.Close() })
+	defer stopSetup()
+	sshConn, channels, requests, err := ssh.NewClientConn(raw, hostPort, cfg)
+	if err != nil {
+		if dctx.Err() != nil {
+			return nil, fmt.Errorf("transport: ssh setup: %w", dctx.Err())
+		}
 		if isSSHAuthRejection(err) {
 			return nil, &SSHKeyRejectedError{Host: hostPort, Err: err}
 		}
 		return nil, fmt.Errorf("transport: ssh dial %s: %w", hostPort, err)
 	}
+	client := ssh.NewClient(sshConn, channels, requests)
 
-	ch, err := openDirectTCPIP(client, t.opt.InternalWS)
-	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("transport: forward channel: %w", err)
-	}
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return ch, nil
-			},
-			ForceAttemptHTTP2: false,
+	httpTransport := &http.Transport{
+		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			// Each HTTP connection gets its own channel. A failed upgrade
+			// may close it; a legacy-path retry must never reuse that corpse.
+			return openDirectTCPIP(client, t.opt.InternalWS)
 		},
-		Timeout: timeout,
+		ForceAttemptHTTP2: false,
+	}
+	httpClient := &http.Client{
+		Transport: httpTransport,
+		Timeout:   timeout,
 	}
 	// Same legacy fallback as the outer tiers: a fresh config dials the
 	// boring path, which relays predating the migration don't mount (their
@@ -210,26 +233,35 @@ func (t *sshTransport) Dial(ctx context.Context) (net.Conn, error) {
 			// Surface body for diagnosis (decoy vs protocol error).
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			_ = resp.Body.Close()
-			ch.Close()
+			httpTransport.CloseIdleConnections()
 			client.Close()
 			return nil, fmt.Errorf("transport: websocket over ssh: %w (status=%d body=%q)", err, resp.StatusCode, string(body))
 		}
-		ch.Close()
+		httpTransport.CloseIdleConnections()
 		client.Close()
 		return nil, fmt.Errorf("transport: websocket over ssh: %w", err)
 	}
 	_ = resp
 
-	go func() {
-		<-ctx.Done()
-		wsConn.Close(websocket.StatusGoingAway, "")
-		client.Close()
-	}()
-
-	stream := websocket.NetConn(ctx, wsConn, websocket.MessageBinary)
+	if dctx.Err() != nil || !stopSetup() {
+		_ = wsConn.CloseNow()
+		_ = client.Close()
+		return nil, fmt.Errorf("transport: ssh setup deadline reached")
+	}
+	_ = raw.SetDeadline(time.Time{})
+	owned = true
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	stopLifetime := context.AfterFunc(streamCtx, func() { _ = client.Close() })
+	stream := websocket.NetConn(streamCtx, wsConn, websocket.MessageBinary)
 	return &sshStream{
-		Conn:   stream,
-		closer: func() { _ = wsConn.Close(websocket.StatusNormalClosure, ""); _ = client.Close() },
+		Conn: stream,
+		closer: func() {
+			stopLifetime()
+			cancelStream()
+			_ = client.Close()
+			_ = wsConn.CloseNow()
+			httpTransport.CloseIdleConnections()
+		},
 	}, nil
 }
 
@@ -268,8 +300,11 @@ func openDirectTCPIP(client *ssh.Client, target string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	var port uint32
-	fmt.Sscanf(portStr, "%d", &port)
+	pnum, err := strconv.Atoi(portStr)
+	if err != nil || pnum < 1 || pnum > 65535 || host == "" {
+		return nil, errors.New("transport: invalid SSH forwarding target")
+	}
+	port := uint32(pnum)
 	payload := ssh.Marshal(struct {
 		ListenAddr string
 		ListenPort uint32
@@ -306,10 +341,14 @@ func (a dummySSHAddr) String() string  { return a.s }
 type sshStream struct {
 	net.Conn
 	closer func()
+	once   sync.Once
+	err    error
 }
 
 func (s *sshStream) Close() error {
-	err := s.Conn.Close()
-	s.closer()
-	return err
+	s.once.Do(func() {
+		s.closer() // unblock socket IO before waiting for WebSocket teardown
+		s.err = s.Conn.Close()
+	})
+	return s.err
 }

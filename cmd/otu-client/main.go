@@ -130,6 +130,10 @@ var doubleClick bool
 // (the console may be hidden, so the file is the only trace).
 func main() {
 	setupCrashLog()
+	if err := client.WaitForUpdateParent(45 * time.Second); err != nil {
+		log.Printf("auto-update: replacement startup refused: %v", err)
+		return
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("PANIC (main): %v", r)
@@ -280,6 +284,7 @@ func run() {
 		}
 	}
 	if useDeviceKey {
+		cfg.SSHKey = "" // never fall back to the retired fleet key after a key error
 		if ts, terr := client.NewTokenStore(); terr == nil {
 			if _, kerr := ts.EnsureSSHKey(); kerr == nil {
 				cfg.SSHKey = ts.SSHPrivatePath()
@@ -454,10 +459,13 @@ func run() {
 		// and every response carries the relay's current leaf pin so
 		// certificate rotation heals itself.
 		knownPins := map[string]bool{}
+		var pinMu sync.Mutex
 		for _, fp := range fpSet {
 			knownPins[strings.ToLower(fp)] = true
 		}
 		learnPin := func(fp string) {
+			pinMu.Lock()
+			defer pinMu.Unlock()
 			fp = strings.ToLower(strings.TrimSpace(fp))
 			if fp == "" || knownPins[fp] {
 				return
@@ -492,6 +500,7 @@ func run() {
 		// If the panel no longer knows our device token (purged after
 		// inactivity), re-register and wait for approval again.
 		dialer.OnAuthRejected = func() { client.RegisterWithPanel(cfg, device) }
+		defer dialer.Close()
 
 		switch cfg.TransportKind() {
 		case "ssh":
@@ -571,15 +580,7 @@ func run() {
 		// HTTP/3 tier: QUIC survives TLS interception, engages only
 		// after every ws-tls profile fails, and reads as ordinary h3.
 		if cfg.H3TierEnabled() {
-			h3opts := transport.H3Options{
-				ServerAddr:   cfg.DialHostPort(),
-				ServerName:   cfg.SNIHost(),
-				Path:         cfg.WSPath,
-				Fingerprint:  cfg.Fingerprint,
-				Fingerprints: fpSet,
-				Insecure:     cfg.Insecure,
-			}
-			dialer.EnableH3(func() transport.Transport { return transport.NewH3(h3opts) })
+			dialer.EnableH3ForCurrentEntry()
 			fmt.Println("[i] h3 tier enabled (QUIC — engages after ws-tls)")
 		}
 		if cfg.Profile == "auto" {
@@ -608,7 +609,7 @@ func run() {
 			client.SetThinMode(false)
 		}
 		safeGo("health", func() {
-			hr.Start(60 * time.Second)
+			hr.Run(ctx, 60*time.Second)
 		})
 		if cfg.AutoUpdateEnabled() {
 			safeGo("update", func() { client.UpdateLoop(cfg.SOCKSAddr) })

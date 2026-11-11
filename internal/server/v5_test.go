@@ -141,6 +141,22 @@ func TestV5HandshakeSignatureEnforcement(t *testing.T) {
 	}
 }
 
+func TestV5DeadlineCannotBeBypassedByKeylessPeer(t *testing.T) {
+	const tok = "keyless-fixture-token"
+	opt := Options{PanelDB: v5Stub{token: tok}, RequireV5After: time.Now().Add(-time.Minute)}
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	go handleSession(c2, opt, "203.0.113.20", "")
+	_ = c1.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := protocol.WriteHandshakeV5(c1, tok, protocol.RandomSalt(), make([]byte, ed25519.SignatureSize)); err != nil {
+		t.Fatal(err)
+	}
+	_, status, err := protocol.ReadHandshakeStatus(c1)
+	if err != nil || status != protocol.StatusBadToken {
+		t.Fatalf("keyless v5 bypassed deadline: status=%d err=%v", status, err)
+	}
+}
+
 // TestV4DowngradeGate pins the audit round four fix: once a peer has
 // authenticated with a signature-verified v5 session, v4 handshakes for
 // its token are refused (a harvested token must not survive by

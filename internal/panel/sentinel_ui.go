@@ -51,7 +51,7 @@ const sentinelHTML = `<!doctype html>
       <button id="m_respond" type="button">Alert + auto-respond</button>
       <span id="msg"></span>
     </div>
-    <p class="muted">respond mode: auth-failure floods ban the source IP for 30 min (the peer keeps seeing the decoy page); stolen-token evidence and impossible travel kick the device for 30–60 min. Every action self-expires and operator-allowlisted devices are never auto-kicked. All findings appear under Alerts in the panel.</p>
+    <p class="muted">respond mode: auth-failure floods ban the source IP for 30 min; impossible travel may temporarily kick a device. Invalid-signature and downgrade attempts raise critical alerts but cannot kick their named victim. Actions self-expire and operator-allowlisted devices are exempt from auto-kicks. All findings appear under Alerts.</p>
   </div>
   <div class="card">
     <div class="row">

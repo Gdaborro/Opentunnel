@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -49,6 +50,50 @@ func TestCanonicalSSHPubKey(t *testing.T) {
 		if _, ok := CanonicalSSHPubKey(bad); ok {
 			t.Fatalf("bad input %q accepted", bad)
 		}
+	}
+}
+
+func TestConcurrentAuthorizedKeyUpdatesDoNotLoseKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "authorized_keys")
+	keys := make([]string, 16)
+	for i := range keys {
+		keys[i] = testKeyLine(t)
+	}
+	var wg sync.WaitGroup
+	for _, key := range keys {
+		wg.Add(1)
+		go func(pub string) {
+			defer wg.Done()
+			if _, err := UpsertAuthorizedKey(path, pub, "127.0.0.1:8081"); err != nil {
+				t.Error(err)
+			}
+		}(key)
+	}
+	wg.Wait()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys {
+		if strings.Count(string(raw), key) != 1 {
+			t.Fatal("concurrent update lost or duplicated a key")
+		}
+	}
+}
+
+func TestUpsertRemovesDuplicateTargetKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "authorized_keys")
+	key := testKeyLine(t)
+	line := CanonicalAuthorizedKeyLine(key, "127.0.0.1:8081") + "\n"
+	if err := os.WriteFile(path, []byte(line+line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpsertAuthorizedKey(path, key, "127.0.0.1:8081"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Count(string(raw), key) != 1 {
+		t.Fatal("duplicate authorization survived upsert")
 	}
 }
 

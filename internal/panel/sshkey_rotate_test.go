@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -20,18 +21,14 @@ func postRegister(t *testing.T, baseURL, token, fp, name, pub string) map[string
 		t.Fatalf("post: %v", err)
 	}
 	defer resp.Body.Close()
-	var out map[string]string
+	out := map[string]string{}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
+	out["http_status"] = strconv.Itoa(resp.StatusCode)
 	return out
 }
 
-// TestRegistrationKeyRotation: a different key presented by an approved
-// device revokes the old authorized_keys line, stores the new key and
-// forces re-approval; re-posting the same new key does not churn alerts;
-// approval installs the new line. Regression test for the 2026-11-05
-// incident: the old COALESCE-only update silently kept a key the device
-// no longer had, so the ssh tier failed on every attempt — forever, with
-// no panel signal.
+// Public bootstrap requests must not replace an active identity. An admin
+// explicitly verifies the new key, revokes the old one, and requests approval.
 func TestRegistrationKeyRotation(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "panel.db"), 14)
 	if err != nil {
@@ -72,31 +69,56 @@ func TestRegistrationKeyRotation(t *testing.T) {
 		t.Fatalf("same-key status = %q, want approved", res["status"])
 	}
 
-	// New key: pending, old line revoked, new key stored but NOT installed.
-	if res := postRegister(t, srv.URL, tok, "fp", dev, keyB); res["status"] != "pending" {
-		t.Fatalf("rotated status = %q, want pending", res["status"])
+	// A token holder without the original private key gets a conflict,
+	// not a way to disconnect or overwrite the legitimate device.
+	if res := postRegister(t, srv.URL, tok, "fp", dev, keyB); res["http_status"] != "409" {
+		t.Fatalf("unauthenticated replacement status = %q, want 409", res["http_status"])
 	}
 	raw, _ := os.ReadFile(akPath)
-	if bytes.Contains(raw, []byte(keyA)) {
-		t.Fatal("old key must be revoked on rotation")
+	if !bytes.Contains(raw, []byte(keyA)) {
+		t.Fatal("public conflict must leave the legitimate key authorized")
 	}
 	if bytes.Contains(raw, []byte(keyB)) {
 		t.Fatal("new key must not be installed before approval")
 	}
-	if got := h.SSHKeyPath(tok); got != keyB {
-		t.Fatalf("stored key = %q, want the new key", got)
+	if got := h.SSHKeyPath(tok); got != keyA {
+		t.Fatal("public conflict replaced the stored identity")
 	}
 
 	// Re-posting the same new key must not rotate or alert again.
 	var alerts1 int
 	db.QueryRow(`SELECT COUNT(*) FROM alerts`).Scan(&alerts1)
-	if res := postRegister(t, srv.URL, tok, "fp", dev, keyB); res["status"] != "pending" {
-		t.Fatalf("repeat status = %q, want pending", res["status"])
+	h.autoApprove = true // an auto-approve policy must not permit takeover either
+	if res := postRegister(t, srv.URL, tok, "fp", dev, keyB); res["http_status"] != "409" {
+		t.Fatalf("repeat status = %q, want 409", res["http_status"])
 	}
 	var alerts2 int
 	db.QueryRow(`SELECT COUNT(*) FROM alerts`).Scan(&alerts2)
 	if alerts2 != alerts1 {
 		t.Fatalf("repeat registration re-alerted: %d -> %d", alerts1, alerts2)
+	}
+	if _, err := db.Exec(`INSERT INTO admins(username,password_hash) VALUES('fixture','not-a-login-hash')`); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{"ssh_pubkey": keyB, "expected_ssh_pubkey": keyA, "confirm": true})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/api/peers/"+tok+"/rekey", bytes.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: "panel_session", Value: h.auth.CreateSession("fixture")})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || h.SSHKeyPath(tok) != keyB {
+		t.Fatal("authenticated administrative replacement did not succeed")
+	}
+	var state string
+	db.QueryRow(`SELECT status FROM peers WHERE token=?`, tok).Scan(&state)
+	if state != "pending" {
+		t.Fatal("admin rekey must require approval, even with auto-approve enabled")
+	}
+	raw, _ = os.ReadFile(akPath)
+	if bytes.Contains(raw, []byte(keyA)) || bytes.Contains(raw, []byte(keyB)) {
+		t.Fatal("rekey must revoke the old key without authorizing the new one yet")
 	}
 
 	// Approval installs the new line, exactly once.
@@ -111,9 +133,7 @@ func TestRegistrationKeyRotation(t *testing.T) {
 	}
 }
 
-// TestRegistrationKeyBackfill: a row without a stored key accepts and
-// installs the device's announced key when it is already approved (a
-// repair, not a rotation).
+// Only a still-pending bootstrap row can backfill an initially absent key.
 func TestRegistrationKeyBackfill(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "panel.db"), 14)
 	if err != nil {
@@ -134,12 +154,14 @@ func TestRegistrationKeyBackfill(t *testing.T) {
 
 	const tok = "backfill-test-token-123456"
 	if _, err := db.Exec(`INSERT INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen)
-		VALUES(?, 'fp', 'backfill-device', '', 'approved', datetime('now'), datetime('now'))`, tok); err != nil {
+		VALUES(?, 'fp', 'backfill-device', '', 'pending', datetime('now'), datetime('now'))`, tok); err != nil {
 		t.Fatal(err)
 	}
-	if res := postRegister(t, srv.URL, tok, "fp", "backfill-device", key); res["status"] != "approved" {
-		t.Fatalf("backfill status = %q, want approved", res["status"])
+	if res := postRegister(t, srv.URL, tok, "fp", "backfill-device", key); res["status"] != "pending" {
+		t.Fatalf("backfill status = %q, want pending", res["status"])
 	}
+	db.Exec(`UPDATE peers SET status='approved' WHERE token=?`, tok)
+	h.OnApprove(tok)
 	raw, _ := os.ReadFile(akPath)
 	if !bytes.Contains(raw, []byte(key)) {
 		t.Fatal("backfilled key was not installed")

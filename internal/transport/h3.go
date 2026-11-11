@@ -70,6 +70,14 @@ func NewH3(opt H3Options) Transport { return &h3Transport{opt: opt} }
 
 func (t *h3Transport) Name() string { return "h3" }
 
+func (t *h3Transport) Close() error {
+	t.trOnce.Do(func() { t.trErr = net.ErrClosed })
+	if t.tr != nil {
+		return t.tr.Close()
+	}
+	return nil
+}
+
 func (o *H3Options) pathOrDefault() string {
 	if o.Path == "" {
 		return DefaultWSPath
@@ -97,6 +105,9 @@ func (t *h3Transport) tlsConfig(host string) (*tls.Config, error) {
 		}
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			return VerifyPinSet(pins, rawCerts)
+		}
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			return verifyConnectionPins(pins, cs.PeerCertificates)
 		}
 	}
 	return cfg, nil
@@ -144,6 +155,12 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 	}
 
 	pr, pw := io.Pipe()
+	defer func() {
+		if !owned {
+			_ = pr.Close()
+			_ = pw.Close()
+		}
+	}()
 	req, err := http.NewRequestWithContext(rctx, http.MethodPost,
 		"https://"+hostPort+t.opt.pathOrDefault(), pr)
 	if err != nil {
@@ -169,12 +186,20 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 	ch := make(chan rtResult, 1)
 	go func() {
 		resp, rerr := tr.RoundTrip(req)
+		if rctx.Err() != nil && resp != nil {
+			_ = resp.Body.Close()
+			resp = nil
+			rerr = rctx.Err()
+		}
 		ch <- rtResult{resp, rerr}
 	}()
 	var resp *http.Response
 	select {
 	case r := <-ch:
 		resp, err = r.resp, r.err
+	case <-ctx.Done():
+		rcancel()
+		return nil, ctx.Err()
 	case <-time.After(timeout):
 		rcancel()
 		return nil, fmt.Errorf("transport: h3 dial %s: timeout", hostPort)

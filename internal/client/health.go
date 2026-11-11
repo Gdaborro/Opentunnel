@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"math"
+	"net/http"
 	"runtime"
 	"sync"
 	"time"
@@ -39,6 +40,7 @@ type HealthReporter struct {
 	probes    int
 	fails     int
 	reports   int // report cycles (drives the throughput cadence)
+	samples   []healthProbe
 
 	// lastFail throttles the report-failure log to transitions only: a
 	// pending device on an intercepting network (no tunnel, pinned HTTPS
@@ -48,6 +50,11 @@ type HealthReporter struct {
 	// hostileLogged throttles the "interception detected, skipping the
 	// pinned channel" notice to once per process.
 	hostileLogged bool
+}
+
+type healthProbe struct {
+	latency time.Duration
+	failed  bool
 }
 
 const probeWindow = 20 // rolling window size for loss/jitter
@@ -60,23 +67,35 @@ func NewHealthReporter(cfg *config.ClientConf, device *deviceFile, probe func(ct
 
 // Start runs the report loop in a goroutine.
 func (h *HealthReporter) Start(interval time.Duration) {
+	go h.Run(context.Background(), interval)
+}
+
+// Run is the context-owned loop; the executable calls it from its guarded
+// health goroutine so shutdown stops telemetry rather than leaking a worker.
+func (h *HealthReporter) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
-	go func() {
-		time.Sleep(5 * time.Second) // let the tunnel come up first
-		for {
-			h.reportOnce()
-			h.maybeThroughputProbe()
-			time.Sleep(jittered(interval))
+	if !poolWait(ctx, 5*time.Second) {
+		return
+	}
+	for ctx.Err() == nil {
+		h.reportWithContext(ctx)
+		h.throughputWithContext(ctx)
+		if !poolWait(ctx, jittered(interval)) {
+			return
 		}
-	}()
+	}
 }
 
 // maybeThroughputProbe samples tunnel goodput every fourth report (~4 min).
 // A shaping verdict goes to OnShaped, a clean one to OnHealthy; probe
 // errors are inconclusive (no verdict either way).
 func (h *HealthReporter) maybeThroughputProbe() {
+	h.throughputWithContext(context.Background())
+}
+
+func (h *HealthReporter) throughputWithContext(parent context.Context) {
 	if h.ThroughputProbe == nil {
 		return
 	}
@@ -87,7 +106,7 @@ func (h *HealthReporter) maybeThroughputProbe() {
 	if !due {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
 	defer cancel()
 	ttfb, bps, err := h.ThroughputProbe(ctx)
 	if err != nil {
@@ -105,20 +124,18 @@ func (h *HealthReporter) maybeThroughputProbe() {
 func (h *HealthReporter) recordProbe(d time.Duration, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.probes++
-	if h.probes > probeWindow {
-		h.probes = probeWindow
+	h.samples = append(h.samples, healthProbe{latency: d, failed: err != nil})
+	if len(h.samples) > probeWindow {
+		h.samples = h.samples[len(h.samples)-probeWindow:]
 	}
-	if err != nil {
-		h.fails++
-		if h.fails > probeWindow {
-			h.fails = probeWindow
+	h.probes, h.fails = len(h.samples), 0
+	h.latencies = h.latencies[:0]
+	for _, sample := range h.samples {
+		if sample.failed {
+			h.fails++
+		} else {
+			h.latencies = append(h.latencies, sample.latency)
 		}
-		return
-	}
-	h.latencies = append(h.latencies, d)
-	if len(h.latencies) > probeWindow {
-		h.latencies = h.latencies[len(h.latencies)-probeWindow:]
 	}
 }
 
@@ -154,14 +171,18 @@ type healthSample struct {
 }
 
 func (h *HealthReporter) reportOnce() {
+	h.reportWithContext(context.Background())
+}
+
+func (h *HealthReporter) reportWithContext(parent context.Context) {
 	s := healthSample{version: version.Version, osName: runtime.GOOS, arch: runtime.GOARCH}
-	if pcts, err := cpu.Percent(time.Second, false); err == nil && len(pcts) > 0 {
+	if pcts, err := cpu.PercentWithContext(parent, time.Second, false); err == nil && len(pcts) > 0 {
 		s.cpuPct = math.Round(pcts[0]*10) / 10
 	}
 	if vm, err := mem.VirtualMemory(); err == nil {
 		s.memPct = math.Round(vm.UsedPercent*10) / 10
 	}
-	if temps, err := sensors.TemperaturesWithContext(context.Background()); err == nil {
+	if temps, err := sensors.TemperaturesWithContext(parent); err == nil {
 		var max float64
 		for _, t := range temps {
 			if t.Temperature > max && t.Temperature < 150 {
@@ -174,7 +195,7 @@ func (h *HealthReporter) reportOnce() {
 		s.uptimeS = int64(up)
 	}
 	if h.probe != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 12*time.Second)
 		d, err := h.probe(ctx)
 		cancel()
 		h.recordProbe(d, err)
@@ -187,7 +208,7 @@ func (h *HealthReporter) reportOnce() {
 	// Tunnel first: the in-band channel keeps the panel informed on
 	// networks where pinned HTTPS cannot connect (TLS interception).
 	if fn := currentCtrl(); fn != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), ctrlTimeout)
+		ctx, cancel := context.WithTimeout(parent, ctrlTimeout)
 		resp, err := fn(ctx, protocol.CtrlRequest{
 			Op: "health", Token: h.device.Token,
 			Version: s.version, OS: s.osName, Arch: s.arch,
@@ -243,7 +264,12 @@ func (h *HealthReporter) reportOnce() {
 		}
 		return
 	}
-	resp, err := cl.Post(base+"/api/token/health", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(parent, http.MethodPost, base+"/api/token/health", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := cl.Do(req)
 	if err != nil {
 		if !h.lastFail {
 			h.lastFail = true

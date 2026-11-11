@@ -1,14 +1,15 @@
 package client
 
 import (
-	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -138,8 +139,10 @@ type Adaptive struct {
 
 	// sshCooldown/sshRejects implement the ssh-tier backoff after sshd
 	// refuses the device key (see noteSSHReject).
-	sshCooldown time.Time
-	sshRejects  int
+	sshCooldown  time.Time
+	sshRejects   int
+	tierCooldown map[int]time.Time // transient carrier failures, shared by data/control/probes
+	closed       bool
 
 	// hostile latches when every ws tier fails certificate pinning (TLS
 	// interception): stealth shaping is locked on and beacons stretch.
@@ -157,6 +160,7 @@ type Adaptive struct {
 	// probe at their own infrastructure.
 	ProbeURL         string
 	ProbeSampleBytes int64
+	probeTLSConfig   *tls.Config // local test roots; production uses normal TLS verification
 
 	// OnAuthRejected is forwarded to every built client: it fires when the
 	// panel no longer knows the device token (purged/expired) so the device
@@ -169,7 +173,7 @@ func (a *Adaptive) EnableMux() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.mux = true
-	a.clients = nil // rebuilt lazily with the new setting
+	a.invalidateClientsLocked()
 }
 
 // EnableSSHFallback adds the ssh last-resort tier to the ladder.
@@ -177,7 +181,7 @@ func (a *Adaptive) EnableSSHFallback(builder func() transport.Transport) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sshFallback = builder
-	a.clients = nil // rebuilt lazily with the new setting
+	a.invalidateClientsLocked()
 }
 
 // EnableH3 adds the HTTP/3 tier to the ladder (between ws-tls and ssh).
@@ -185,7 +189,25 @@ func (a *Adaptive) EnableH3(builder func() transport.Transport) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.h3Fallback = builder
-	a.clients = nil // rebuilt lazily with the new setting
+	a.invalidateClientsLocked()
+}
+
+// EnableH3ForCurrentEntry keeps QUIC aligned with entry rotation and pins
+// learned in-band. A closure over the startup config kept obsolete pins and
+// the old entry forever, even after the WS tiers had learned a renewal.
+func (a *Adaptive) EnableH3ForCurrentEntry() {
+	a.EnableH3(func() transport.Transport {
+		// defaultFactory invokes this while holding a.mu.
+		return transport.NewH3(transport.H3Options{
+			ServerAddr:   a.base.ServerAddr,
+			ServerName:   a.base.ServerName,
+			Path:         a.base.WSPath,
+			Fingerprint:  a.base.Fingerprint,
+			Fingerprints: append([]string(nil), a.base.Fingerprints...),
+			Insecure:     a.base.Insecure,
+			DialTimeout:  a.dialTimeout,
+		})
+	})
 }
 
 // UseTransportBuilder overrides how per-profile transports are constructed.
@@ -193,7 +215,7 @@ func (a *Adaptive) UseTransportBuilder(f func(profile string) transport.Transpor
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.transportBuilder = f
-	a.clients = nil // rebuilt lazily with the new setting
+	a.invalidateClientsLocked()
 }
 
 func (a *Adaptive) logger() *log.Logger {
@@ -205,11 +227,12 @@ func (a *Adaptive) logger() *log.Logger {
 
 func NewAdaptive(token string, base transport.WSTLSOptions, profile string, dialTimeout time.Duration) *Adaptive {
 	a := &Adaptive{
-		token:       token,
-		base:        base,
-		auto:        profile == "auto",
-		ttfbBudget:  3 * time.Second,
-		dialTimeout: dialTimeout,
+		token:           token,
+		base:            base,
+		auto:            profile == "auto",
+		ttfbBudget:      3 * time.Second,
+		dialTimeout:     dialTimeout,
+		AllowHostileSSH: true,
 	}
 	a.factory = defaultFactory
 	if !a.auto {
@@ -257,8 +280,14 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		Mux:            a.mux,
 		OnAuthRejected: a.OnAuthRejected,
 	}
+	if idx < len(profileOrder) {
+		opts.Profile = name // fast/balanced/stealth must actually shape differently
+	}
 	if name == H3TierName {
 		opts.MuxByteCap = h3MuxByteCap
+	}
+	if tr.Name() == SshTierName {
+		opts.MuxSessions = 2 // two warm + two draining fit the relay's loopback cap
 	}
 	return NewWithOptions(tr, opts)
 }
@@ -284,9 +313,11 @@ func fatalUpstream(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
+	if errors.Is(err, ErrMuxCapacity) {
+		return true // saturation must not create more pools on other carriers
 	}
+	// Caller cancellation is checked by adaptiveAttempt. A transport's own
+	// shorter setup deadline must not prevent trying a different carrier.
 	var pend *PendingError
 	if errors.As(err, &pend) {
 		return true
@@ -301,8 +332,21 @@ func fatalUpstream(err error) bool {
 
 // DialTunnel implements proxy.Dialer with adaptive tier selection.
 func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (net.Conn, error) {
-	now := time.Now()
+	return adaptiveAttempt(a, ctx, func(cl *Client) (net.Conn, error) {
+		return cl.DialTunnel(ctx, target)
+	})
+}
+
+// All users of the carrier ladder share selection and cooldowns. Previously
+// the control/probe paths bypassed both and could keep trying rejected keys
+// while the data path claimed the SSH tier was paused.
+func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client) (T, error)) (T, error) {
+	var zero T
 	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return zero, net.ErrClosed
+	}
 	start := a.idx
 	probeDown := a.auto && start > 0 && time.Since(a.lastProbe) > 10*time.Minute
 	// Probe downward early if the current tier keeps failing (e.g. the
@@ -317,67 +361,68 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		a.lastProbe = time.Now()
 	}
 	total := a.tierCount()
-	sshIdx := a.sshTierIndex()
-	cooling := sshIdx >= 0 && now.Before(a.sshCooldown)
 	hostile := a.hostile
-	h3Idx := -1
-	if a.h3Fallback != nil {
-		h3Idx = len(profileOrder)
+	auto := a.auto
+	if start >= total || start < 0 {
+		start = 0
 	}
 	a.mu.Unlock()
 
-	order := []int{}
+	var order []int
 	if probeDown {
 		order = append(order, 0)
-	}
-	// Hostile fast-path: on an inspected network the ws tiers are dead
-	// weight (constant pin failures). Queue the tiers that can traverse it
-	// first — h3 (QUIC), then ssh — so a working fallback is reached in
-	// one attempt; a ws probe still follows when the fallbacks fail, so a
-	// network change is discovered without waiting out the cool-off.
-	if hostile && !probeDown {
-		if h3Idx >= 0 {
-			order = append(order, h3Idx)
-		}
-		if sshIdx >= 0 && !cooling {
-			order = append(order, sshIdx)
+		for idx := len(profileOrder); idx < start; idx++ {
+			order = append(order, idx) // occasionally recheck a faster carrier too
 		}
 	}
-	for i := start; i < total; i++ {
-		if probeDown && i == 0 {
-			continue
-		}
-		if i == sshIdx && cooling {
-			continue
-		}
-		if hostile && !probeDown && (i == sshIdx || i == h3Idx) {
-			continue // already queued in the fast-path
-		}
-		order = append(order, i)
+	// Honor the sticky working carrier. In particular, when SSH is working,
+	// do NOT put blocked QUIC in front of it again on every browser request.
+	if hostile && auto && start < len(profileOrder) {
+		start = len(profileOrder)
 	}
-	if len(order) == 0 {
-		// The only remaining tier is the ssh tier in cooldown: probe the
-		// fastest ws profile instead of failing every request outright.
-		order = append(order, 0)
+	if !auto {
+		order = []int{start} // fixed profile means exactly one tier
+	} else {
+		for i := start; i < total; i++ {
+			if probeDown && i == 0 {
+				continue
+			}
+			order = append(order, i)
+		}
 	}
 
 	var lastErr error
 	sawPin := false
 	sawDNS := false
 	for _, idx := range order {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		if sawPin && idx < len(profileOrder) {
+			continue // changing padding cannot fix the identical failed pin
+		}
+		a.mu.Lock()
+		allowed := idx < a.tierCount() // hostile latching may hide the SSH tier mid-call
+		sshIdx := a.sshTierIndex()
+		cooling := time.Now().Before(a.tierCooldown[idx]) || (idx == sshIdx && time.Now().Before(a.sshCooldown))
+		a.mu.Unlock()
+		if cooling || !allowed {
+			continue
+		}
 		cl := a.build(idx)
 		t0 := time.Now()
-		conn, err := cl.DialTunnel(ctx, target)
+		value, err := call(cl)
 		if err == nil {
 			elapsed := time.Since(t0)
 			clearedHostile := false
 			a.mu.Lock()
 			a.failStreak = 0
+			delete(a.tierCooldown, idx)
 			if idx == sshIdx {
 				a.sshRejects = 0
 				a.sshCooldown = time.Time{}
 			}
-			if a.hostile && idx < len(profileOrder) {
+			if a.hostile && idx < len(profileOrder) && cl.Transport.Name() == "ws-tls" {
 				a.hostile = false // clean ws-tls dial: network changed
 				clearedHostile = true
 			}
@@ -386,7 +431,7 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 				a.idx = 0 // lower profile healthy again â€” stay fast
 				a.logger().Printf("adaptive: fast profile healthy again â€” back to %q", ProfileFast)
 			default:
-				if idx > a.idx {
+				if a.auto && idx != a.idx {
 					a.idx = idx // escalated this call: stick here
 					a.logger().Printf("adaptive: escalated to %q", a.tierName(idx))
 					// Re-probe lower tiers only after a cool-off.
@@ -404,13 +449,17 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 			if clearedHostile {
 				a.SetHostile(false)
 			}
-			return conn, nil
+			return value, nil
+		}
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
 		}
 		if fatalUpstream(err) {
-			return nil, err
+			return zero, err
 		}
 		if isPinFailure(err) {
 			sawPin = true
+			a.SetHostile(true)
 		}
 		if isDNSError(err) {
 			sawDNS = true
@@ -418,6 +467,19 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		var keyRej *transport.SSHKeyRejectedError
 		if errors.As(err, &keyRej) {
 			a.noteSSHReject(keyRej)
+		} else if idx >= len(profileOrder) {
+			// One failure is enough to pause a blocked carrier briefly.
+			// Periodic downward probes still detect network recovery.
+			a.mu.Lock()
+			if a.tierCooldown == nil {
+				a.tierCooldown = make(map[int]time.Time)
+			}
+			gap := time.Minute
+			if idx == sshIdx {
+				gap = 30 * time.Second
+			}
+			a.tierCooldown[idx] = time.Now().Add(gap + time.Duration(rand.Int63n(int64(gap)/4)))
+			a.mu.Unlock()
 		}
 		a.mu.Lock()
 		lastErr = fmt.Errorf("tier %q: %w", a.tierName(idx), err)
@@ -427,10 +489,7 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		a.mu.Unlock()
 	}
 	if lastErr == nil {
-		lastErr = errors.New("client: no tiers available")
-	}
-	if sawPin {
-		a.SetHostile(true) // every ws tier hit pinning: TLS interception
+		lastErr = errors.New("client: no carrier currently available; failed carriers are cooling down")
 	}
 	if sawDNS {
 		// Sinkholed entry hostname: go hostile-quiet instead of storming
@@ -438,7 +497,7 @@ func (a *Adaptive) DialTunnel(ctx context.Context, target *protocol.Address) (ne
 		a.SetHostile(true)
 		a.RotateEntry("dns")
 	}
-	return nil, lastErr
+	return zero, lastErr
 }
 
 // SetEntries installs the rotatable endpoint pool (primary first). The
@@ -451,7 +510,7 @@ func (a *Adaptive) SetEntries(entries []transport.WSTLSOptions) {
 	a.entries = append([]transport.WSTLSOptions(nil), entries...)
 	a.entryIdx = 0
 	a.base = entries[0]
-	a.clients = nil
+	a.invalidateClientsLocked()
 	a.mu.Unlock()
 }
 
@@ -469,7 +528,7 @@ func (a *Adaptive) RotateEntry(reason string) bool {
 	a.idx = 0
 	a.failStreak = 0
 	a.lastProbe = time.Time{}
-	a.clients = nil
+	a.invalidateClientsLocked()
 	addr := a.base.ServerAddr
 	a.mu.Unlock()
 	a.logger().Printf("adaptive: rotating entry (%s) -> %s", reason, addr)
@@ -511,6 +570,7 @@ func (a *Adaptive) Reset() {
 	// clear the backoff even in fixed-profile mode.
 	a.sshRejects = 0
 	a.sshCooldown = time.Time{}
+	a.tierCooldown = nil
 	if !a.auto {
 		return
 	}
@@ -529,6 +589,9 @@ func (a *Adaptive) SetHostile(on bool) {
 	a.hostile = on
 	if on && a.auto && a.idx < len(profileOrder)-1 {
 		a.idx = len(profileOrder) - 1 // lock stealth shaping
+	}
+	if on && changed {
+		a.lastProbe = time.Now()
 	}
 	a.mu.Unlock()
 	setHostileMode(on)
@@ -582,10 +645,9 @@ func (a *Adaptive) Current() string {
 // CtrlExchange runs one in-band control exchange on the current tier's
 // client (see control.go).
 func (a *Adaptive) CtrlExchange(ctx context.Context, req protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
-	a.mu.Lock()
-	idx := a.idx
-	a.mu.Unlock()
-	return a.build(idx).CtrlExchange(ctx, req)
+	return adaptiveAttempt(a, ctx, func(cl *Client) (*protocol.CtrlResponse, error) {
+		return cl.CtrlExchange(ctx, req)
+	})
 }
 
 // AddPin appends a rotation pin to the base config and every entry, then
@@ -594,6 +656,9 @@ func (a *Adaptive) CtrlExchange(ctx context.Context, req protocol.CtrlRequest) (
 func (a *Adaptive) AddPin(fp string) bool {
 	fp = strings.TrimSpace(fp)
 	if fp == "" {
+		return false
+	}
+	if _, err := transport.ParseFingerprint(fp); err != nil {
 		return false
 	}
 	a.mu.Lock()
@@ -611,9 +676,30 @@ func (a *Adaptive) AddPin(fp string) bool {
 		}
 	}
 	if changed {
-		a.clients = nil // rebuild transports with the extended pin set
+		a.invalidateClientsLocked()
+		a.tierCooldown = nil
+		a.lastProbe = time.Time{} // trusted pin rotation warrants an immediate clean-path probe
 	}
 	return changed
+}
+
+func (a *Adaptive) invalidateClientsLocked() {
+	for _, cl := range a.clients {
+		cl.Drain()
+	}
+	a.clients = nil
+}
+
+func (a *Adaptive) Close() error {
+	a.mu.Lock()
+	a.closed = true
+	clients := a.clients
+	a.clients = nil
+	a.mu.Unlock()
+	for _, cl := range clients {
+		_ = cl.Close()
+	}
+	return nil
 }
 
 // pinKnown reports whether fp is already accepted (primary or rotation set).
@@ -632,19 +718,17 @@ func pinKnown(primary string, extra []string, fp string) bool {
 // Probe measures tunnel setup latency on the current tier (transport dial +
 // handshake), then tears the connection down. Used for health telemetry.
 func (a *Adaptive) Probe(ctx context.Context) (time.Duration, error) {
-	a.mu.Lock()
-	idx := a.idx
-	a.mu.Unlock()
-	return a.build(idx).ProbeSession(ctx)
+	return adaptiveAttempt(a, ctx, func(cl *Client) (time.Duration, error) {
+		return cl.ProbeSession(ctx)
+	})
 }
 
 // OpenUDPRelay returns a UDP relay stream using the currently selected
 // profile. It implements proxy.UDPDialer.
 func (a *Adaptive) OpenUDPRelay(ctx context.Context) (net.Conn, error) {
-	a.mu.Lock()
-	idx := a.idx
-	a.mu.Unlock()
-	return a.build(idx).OpenUDPRelay(ctx)
+	return adaptiveAttempt(a, ctx, func(cl *Client) (net.Conn, error) {
+		return cl.OpenUDPRelay(ctx)
+	})
 }
 
 // Throughput probe defaults: a small sample from a stock speedtest file.
@@ -687,54 +771,57 @@ func (a *Adaptive) ProbeThroughput(ctx context.Context) (ttfb time.Duration, bps
 	if err != nil {
 		return 0, 0, err
 	}
-	port := pu.Port()
-	if port == "" {
-		port = "443"
-		if pu.Scheme == "http" {
-			port = "80"
-		}
+	if (pu.Scheme != "http" && pu.Scheme != "https") || pu.Hostname() == "" || pu.User != nil || n > 64<<20 {
+		return 0, 0, errors.New("client: invalid throughput probe URL or sample size")
 	}
-	pnum, err := strconv.Atoi(port)
-	if err != nil || pnum < 1 || pnum > 65535 {
-		return 0, 0, fmt.Errorf("client: bad probe port %q", port)
+	tr := &http.Transport{
+		DialContext: func(dctx context.Context, network, hostPort string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(hostPort)
+			if err != nil {
+				return nil, err
+			}
+			pnum, err := strconv.Atoi(port)
+			if err != nil {
+				return nil, err
+			}
+			addr, err := protocol.ParseAddress(host, pnum)
+			if err != nil {
+				return nil, err
+			}
+			return a.DialTunnel(dctx, addr)
+		},
+		DisableCompression:     true,
+		DisableKeepAlives:      true,
+		TLSClientConfig:        a.probeTLSConfig,
+		TLSHandshakeTimeout:    15 * time.Second,
+		ResponseHeaderTimeout:  20 * time.Second,
+		MaxResponseHeaderBytes: 16 << 10,
 	}
-	addr, err := protocol.ParseAddress(pu.Hostname(), pnum)
+	defer tr.CloseIdleConnections()
+	cl := &http.Client{Transport: tr, Timeout: 3 * time.Minute}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return 0, 0, err
 	}
+	req.Header.Set("User-Agent", transport.BrowserUA)
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Range", "bytes=0-"+strconv.FormatInt(n-1, 10))
 	t0 := time.Now()
-	conn, err := a.DialTunnel(ctx, addr)
+	// HTTPS targets need an inner TLS handshake, not plaintext HTTP on :443.
+	// net/http also checks status and decodes chunked bodies correctly.
+	resp, err := cl.Do(req)
 	if err != nil {
 		return 0, 0, err
 	}
-	defer conn.Close()
-	if _, err := io.WriteString(conn, probeRequest(pu.RequestURI(), pu.Host, n)); err != nil {
-		return 0, 0, err
-	}
-	br := bufio.NewReader(conn)
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			return 0, 0, err
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return 0, 0, fmt.Errorf("client: throughput probe returned %s", resp.Status)
 	}
 	ttfb = time.Since(t0)
 	bodyStart := time.Now()
-	var got int64
-	buf := make([]byte, 64*1024)
-	for got < n {
-		m := int64(len(buf))
-		if m > n-got {
-			m = n - got
-		}
-		k, err := io.ReadFull(br, buf[:m])
-		got += int64(k)
-		if err != nil {
-			return 0, 0, err
-		}
+	got, err := io.CopyN(io.Discard, resp.Body, n)
+	if err != nil {
+		return 0, 0, err
 	}
 	return ttfb, float64(got) / time.Since(bodyStart).Seconds(), nil
 }

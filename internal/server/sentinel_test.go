@@ -123,23 +123,22 @@ func TestSentinelModes(t *testing.T) {
 	}
 }
 
-// TestSentinelStolenTokenAutoKicks: the strongest stolen-token evidence
-// kicks the device once per throttle window and raises a critical alert.
-func TestSentinelStolenTokenAutoKicks(t *testing.T) {
+// A bad signature must not give a token thief a remote victim-kick primitive.
+func TestSentinelStolenTokenCannotKickVictim(t *testing.T) {
 	st := newSentinelStub()
 	s := NewSentinel(st, nil)
 
 	s.StolenToken("stolen-token-abcdef", "203.0.113.77", "handshake signature mismatch")
-	if st.kickCount() != 1 {
-		t.Fatalf("want 1 auto-kick, got %d", st.kickCount())
+	if st.kickCount() != 0 {
+		t.Fatalf("unverified evidence kicked the victim: %d", st.kickCount())
 	}
 	if got := st.alertText(); !strings.Contains(got, "critical|security|") || !strings.Contains(got, "possible stolen token") {
 		t.Fatalf("want critical security alert, got %q", got)
 	}
 	// Repeat attempts are throttled: no kick storm, no alert storm.
 	s.StolenToken("stolen-token-abcdef", "203.0.113.77", "handshake signature mismatch")
-	if st.kickCount() != 1 {
-		t.Fatalf("repeat must not re-kick, got %d", st.kickCount())
+	if st.kickCount() != 0 {
+		t.Fatalf("repeat unverified evidence kicked the victim: %d", st.kickCount())
 	}
 	if n := strings.Count(st.alertText(), "possible stolen token"); n != 1 {
 		t.Fatalf("want 1 alert, got %d", n)

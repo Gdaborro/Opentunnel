@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -72,17 +74,26 @@ func plainHTTPClient() *http.Client {
 func RegisterWithPanel(cfg *config.ClientConf, device *deviceFile) {
 	// Fire-and-forget initial registration; retry a few times
 	for i := 0; i < 3; i++ {
-		if err := doRegister(cfg, device); err == nil {
+		err := doRegister(cfg, device)
+		if err == nil {
 			break
+		}
+		if errors.Is(err, errRegistrationIdentityConflict) {
+			log.Printf("registration: stored device identity differs; verify the public key in the panel SSH-key recovery page")
+			return
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
 func doRegister(cfg *config.ClientConf, device *deviceFile) error {
-	pub := ""
-	if ts, err := NewTokenStore(); err == nil {
-		pub, _ = ts.EnsureSSHKey()
+	ts, err := NewTokenStore()
+	if err != nil {
+		return err
+	}
+	pub, err := ts.EnsureSSHKey()
+	if err != nil {
+		return err // never announce a missing/stale public-key cache
 	}
 	body, _ := json.Marshal(map[string]string{
 		"token": device.Token, "fingerprint": device.Fingerprint, "device_name": device.DeviceName, "ssh_pubkey": pub,
@@ -105,19 +116,13 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 			return perr
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusForbidden {
-			return fmt.Errorf("banned")
-		}
-		return nil
+		return registrationResponse(resp)
 	}
 	if cl, base, err := panelHTTP(cfg); err == nil {
 		if resp, perr := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body)); perr == nil {
 			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusForbidden {
-				return fmt.Errorf("banned")
-			}
 			if resp.StatusCode != http.StatusTooManyRequests {
-				return nil
+				return registrationResponse(resp)
 			}
 		}
 	}
@@ -126,10 +131,22 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == 403 {
-		return fmt.Errorf("banned")
+	return registrationResponse(resp)
+}
+
+var errRegistrationIdentityConflict = errors.New("registration identity conflict")
+
+func registrationResponse(resp *http.Response) error {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusConflict:
+		return errRegistrationIdentityConflict
+	case http.StatusForbidden:
+		return errors.New("registration forbidden")
+	default:
+		return fmt.Errorf("registration returned HTTP %d", resp.StatusCode)
 	}
-	return nil
 }
 
 // TokenStatus queries the panel for this device's admission state.
