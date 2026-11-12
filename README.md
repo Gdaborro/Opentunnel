@@ -49,7 +49,8 @@ on a VPS (`otu-server`); one runs locally without administrator rights
   are intentionally retained; shutdown, denied writes and disk failure remain
   explicit limitations, not a "zero residue on every crash" guarantee.
 
-> Last published release: v1.1.5. Local unreleased hardening is described in
+> Release availability: [GitHub Releases](https://github.com/Gdaborro/Opentunnel/releases).
+> Hardening introduced in v1.1.6 is described in
 > [docs/HARDENING.md](docs/HARDENING.md). This is an application proxy, not a
 > system-wide TUN VPN; unconfigured applications may use the direct network.
 >

@@ -1,6 +1,6 @@
 # Signed updates and supervised replacement
 
-This is an unreleased update contract. A source push is not a release or a
+This is the v1.1.6 update contract. A source push is not a release or a
 fleet rollout. Publication must include the complete signed asset set.
 
 ## Integrity and freshness

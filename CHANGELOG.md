@@ -1,5 +1,44 @@
 # Changelog
 
+## v1.1.6 - relay hardening and supervised updates
+
+### Security and recovery
+- New streams and traffic reservations use fresh authoritative policy; pending,
+  revoked, expired and failed policy reads deny data. Identity generations bind
+  warm sessions; bans remain durable after device deletion.
+- Device rates/quotas are aggregate across sessions, carriers and directions.
+  SQLite writer transactions lock before snapshot reads to prevent stale
+  read-to-write upgrades interrupting legitimate transfers.
+- Updates preserve existing signature compatibility and add signed, bounded
+  freshness metadata. Replacement is supervised for readiness/stability, with
+  verified rollback and interrupted-transaction recovery.
+- Windows proxy recovery verifies readback, retains conflict/failure journals
+  and uses an independent parent-exit helper. Recovery remains subject to OS,
+  disk and permission limitations.
+- Host networking/crypto dependencies are patched; source and release-binary
+  vulnerability scans are required independently.
+
+### Reliability and panel
+- Forwarded WebSocket/mux closure is delivered before cancellation, avoiding
+  orphaned relay sessions. HTTP/3 uses native stream deadlines and checked flush.
+- HTTP/SOCKS proxy buffering, half-close, upgrades and UDP association teardown
+  are bounded and regression-tested.
+- The first-run panel setup API works with the SPA. Kill-switch detail saves
+  preserve concurrent operator toggles and refresh the displayed state.
+- Telemetry proofs, relay-heartbeat metrics, auth/session bounds, frontend
+  dependency audit and source/embed reproducibility are strengthened.
+
+### Optional additions and rollout
+- Managed fixed-target RAW/VLESS/REALITY companion and independent pinned
+  mutual TLS 1.3 are available **only when explicitly provisioned and enabled**.
+  This release does not automatically download Xray, open a new public listener,
+  change DNS/firewalls, require inner TLS, or change existing admission policy.
+- Version and update floor raised to v1.1.6. Legacy signature assets remain
+  available for the first upgrade; offline or auto-update-disabled clients need
+  reconnection/manual delivery. Upload success is not proof of fleet adoption.
+- See `docs/HARDENING.md`, `docs/REALITY-MANAGED.md` and
+  `docs/UPDATE-TRANSACTION.md` for validation and rollout boundaries.
+
 ## v1.1.5 - carrier reliability and identity hardening
 
 ### Security

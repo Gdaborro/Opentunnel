@@ -1,8 +1,9 @@
-# Unreleased hardening and acceptance gates
+# v1.1.6 hardening and acceptance gates
 
-This describes unreleased source changes based on v1.1.5, reviewed on 2026-11-11/12.
-It is not a published release, a universal-bypass claim or a production-readiness
-certificate. No network-specific measurements or fleet credentials belong here.
+This describes hardening introduced after v1.1.5, reviewed on 2026-11-11/12.
+Release availability is recorded separately in GitHub Releases; this document
+is not a universal-bypass claim or a production-readiness certificate.
+No network-specific measurements or fleet credentials belong here.
 
 ## Shared invariants
 
