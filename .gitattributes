@@ -5,6 +5,7 @@
 *.yaml text eol=lf
 Dockerfile text eol=lf
 *.md text eol=lf
+*.html text eol=lf
 # Preserve byte-for-byte Vite output. Some generated template strings contain
 # whitespace-only lines; source whitespace checks remain enabled everywhere else.
 internal/panel/ui/dist/assets/*.js whitespace=-blank-at-eol

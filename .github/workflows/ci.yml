@@ -39,7 +39,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Companion build failed' }
           "OTU_TEST_XRAY=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: authenticated REALITY confinement and supervision
-        run: go test -race -count=1 -timeout 180s ./internal/reality
+        run: go test -race -count=3 -v -timeout 180s ./internal/reality
 
   test:
     strategy:

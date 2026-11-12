@@ -33,7 +33,12 @@ func Open(path string, purgeAfterDays int) (*DB, error) {
 	// WAL mode is configured on a bounded dedicated migration connection.
 	// Putting its pragma in every lazy connection initializer can return
 	// SQLITE_BUSY immediately when relay/panel open the same file together.
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	// Every explicit transaction in this package writes. Acquire its writer
+	// lock BEFORE reading admission/accounting snapshots. Deferred read-to-write
+	// upgrades can return SQLITE_BUSY_SNAPSHOT immediately when an independent
+	// relay/panel metadata write commits between the read and the reservation.
+	// busy_timeout cannot retry that stale snapshot; BEGIN IMMEDIATE avoids it.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}

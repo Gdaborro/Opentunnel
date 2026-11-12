@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func accessPeer(t *testing.T, db *DB) string {
@@ -210,6 +211,89 @@ func TestConcurrentRelayAndPanelMigrations(t *testing.T) {
 		if err := <-results; err != nil {
 			t.Fatalf("concurrent startup failed: %v", err)
 		}
+	}
+}
+
+func TestWriterTransactionLocksBeforeReadingItsSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "writer-snapshot.db")
+	a, err := Open(path, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	token := accessPeer(t, a)
+	b, err := Open(path, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	tx, err := a.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	// With a deferred transaction, another process can commit before this
+	// first policy read. Writer transactions must reserve the lock at BEGIN.
+	other, err := b.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	// Keep the synthetic competitor's SQLite wait below the owner's lifetime.
+	// Some driver busy waits outlast a canceled query context.
+	if _, err := other.ExecContext(t.Context(), `PRAGMA busy_timeout=100`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.ExecContext(t.Context(), `UPDATE peers SET last_ip='192.0.2.1' WHERE token=?`, token); err == nil {
+		t.Fatal("competing writer committed before the transaction's snapshot lock")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.ExecContext(t.Context(), `UPDATE peers SET last_ip='192.0.2.1' WHERE token=?`, token); err != nil {
+		t.Fatal("writer lock was not released", err)
+	}
+}
+
+func TestReservationsSurviveIndependentMetadataWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metadata-contention.db")
+	a, err := Open(path, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	token := accessPeer(t, a)
+	b, err := Open(path, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	metadataDone := make(chan error, 1)
+	go func() {
+		for range 100 {
+			if _, err := b.ExecContext(ctx, `UPDATE peers SET last_seen=datetime('now'),last_ip='192.0.2.2' WHERE token=?`, token); err != nil {
+				metadataDone <- err
+				return
+			}
+		}
+		metadataDone <- nil
+	}()
+	for range 100 {
+		r, err := a.ReserveTraffic(ctx, token, "epoch-a", "carrier", true, 1024)
+		if err != nil || r.Bytes != 1024 {
+			t.Fatal("independent metadata writer interrupted admitted payload reservation", err)
+		}
+	}
+	if err := <-metadataDone; err != nil {
+		t.Fatal(err)
+	}
+	p, err := a.AccessPolicy(token)
+	if err != nil || p.UsedBytes != 100*1024 {
+		t.Fatal("contention corrupted reservation accounting", err)
 	}
 }
 

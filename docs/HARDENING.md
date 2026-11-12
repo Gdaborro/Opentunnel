@@ -27,6 +27,9 @@ The relay obtains a consistent SQL snapshot of admission, identity, schedules,
 quotas, kill-switch state/allowlist and SSH containment policy. Caches belong to
 one handler/database, not to a global token namespace. New-stream admission
 and reservations read authority directly; only hot-path checks use bounded caching.
+Writer transactions acquire SQLite's writer lock before reading a snapshot;
+this avoids a deferred read-to-write upgrade losing to independent metadata
+writers and aborting an otherwise admitted transfer.
 
 Payload writes are durably reserved before transmission. Quotas are aggregate,
 not a per-stream completion estimate. SSH daily usage is stored in

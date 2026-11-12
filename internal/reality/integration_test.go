@@ -161,10 +161,15 @@ func TestREALITYAuthenticatedTunnelAndConfinement(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-	_, _ = io.WriteString(c, "GET / HTTP/1.0\r\nHost: fixture\r\n\r\n")
+	if _, err := io.WriteString(c, "GET / HTTP/1.0\r\nHost: fixture\r\n\r\n"); err != nil {
+		_ = c.Close()
+		t.Fatal("authenticated REALITY request write failed", err)
+	}
 	data, err := io.ReadAll(c)
 	_ = c.Close()
 	if err != nil || !bytes.HasSuffix(data, bulk) {
+		p, policyErr := db.AccessPolicy(device.Token)
+		t.Logf("relay state at transfer failure: status=%s used_bytes=%d policy_error=%v live_requests=%d", p.Status, p.UsedBytes, policyErr, activeIngress.Load())
 		t.Fatalf("authenticated REALITY bulk failed: %v bytes=%d", err, len(data))
 	}
 	// In-band status remains available while the global data switch is on.

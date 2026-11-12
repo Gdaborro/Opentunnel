@@ -657,7 +657,10 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	defer stopWatch()
 	up := &trafficConn{ReadWriteCloser: upstream, o: opt, ctx: ctx, token: token, status: peerStatus, ingress: ingress}
 	down := &trafficConn{ReadWriteCloser: rw, o: opt, ctx: ctx, token: token, status: peerStatus, ingress: ingress, down: true}
-	n1, n2, _ := streamio.Pipe(ctx, down, up)
+	n1, n2, transferErr := streamio.Pipe(ctx, down, up)
+	if transferErr != nil && ctx.Err() == nil {
+		opt.logger().Printf("server: relay transfer stopped for %s (up=%d down=%d): %v", shortToken(token), n1, n2, transferErr)
+	}
 	if _, durable := opt.PanelDB.(trafficStore); !durable && opt.PanelDB != nil && token != "" {
 		opt.PanelDB.RecordTraffic(token, n1, n2)
 	}
