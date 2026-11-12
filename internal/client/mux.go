@@ -20,7 +20,7 @@ import (
 // handshake. Fewer connections also look more like ordinary browsing.
 // softCapStreams caps how many concurrent streams pile onto one session
 // before the pool spills over to a fresh session. The relay drops streams
-// past its per-session cap (currently 256); without spillover every retry
+// past its per-session cap (currently 512); without spillover every retry
 // lands on the same saturated session and the failure feeds itself — mass
 // EOFs under page-load bursts. 192 keeps headroom under the relay cap.
 const softCapStreams = 192
@@ -159,10 +159,14 @@ type countingConn struct {
 }
 
 func (c *countingConn) Close() error {
+	// A graceful carrier close must run while its session context is still
+	// alive. Canceling first dropped the WebSocket close frame on SSH/REALITY
+	// forwarding; the relay kept sending mux keepalives to an orphaned pipe.
+	err := c.Conn.Close()
 	if c.cancel != nil {
 		c.cancel()
 	}
-	return c.Conn.Close()
+	return err
 }
 
 func (c *countingConn) Read(p []byte) (int, error) {
@@ -336,12 +340,12 @@ func (p *MuxPool) Close() error {
 	p.closed = true
 	sessions := p.sessions
 	p.sessions = nil
-	if p.cancel != nil {
-		p.cancel()
-	}
 	p.mu.Unlock()
 	for _, e := range sessions {
 		_ = e.sess.Close()
+	}
+	if p.cancel != nil {
+		p.cancel()
 	}
 	return nil
 }

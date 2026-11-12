@@ -1,17 +1,18 @@
-import { useCallback, useEffect, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useState } from "react"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { AppSidebar, type PageKey } from "@/components/app-sidebar"
 import { SiteHeader } from "@/components/site-header"
 import { AuthPage } from "@/pages/auth"
-import { Overview } from "@/pages/overview"
-import { Monitoring } from "@/pages/monitoring"
-import { Security } from "@/pages/security"
-import { Devices } from "@/pages/devices"
-import { Clients } from "@/pages/clients"
-import { Filtering } from "@/pages/filtering"
-import { SystemPage } from "@/pages/system"
 import { api, authState } from "@/lib/api"
+
+const Overview = lazy(() => import("@/pages/overview").then((m) => ({ default: m.Overview })))
+const Monitoring = lazy(() => import("@/pages/monitoring").then((m) => ({ default: m.Monitoring })))
+const Security = lazy(() => import("@/pages/security").then((m) => ({ default: m.Security })))
+const Devices = lazy(() => import("@/pages/devices").then((m) => ({ default: m.Devices })))
+const Clients = lazy(() => import("@/pages/clients").then((m) => ({ default: m.Clients })))
+const Filtering = lazy(() => import("@/pages/filtering").then((m) => ({ default: m.Filtering })))
+const SystemPage = lazy(() => import("@/pages/system").then((m) => ({ default: m.SystemPage })))
 
 const subtitles: Record<PageKey, string> = {
   Overview: "Network operations at a glance",
@@ -94,6 +95,7 @@ export default function App() {
             pending={pending}
           />
           <main key={page} className="@container/main flex flex-1 flex-col gap-4 p-4 lg:p-6">
+            <Suspense fallback={<p className="p-4 text-sm text-muted-foreground">Loading page…</p>}>
             {page === "Overview" && <Overview />}
             {page === "Monitoring" && <Monitoring />}
             {page === "Security" && <Security />}
@@ -101,6 +103,7 @@ export default function App() {
             {page === "Clients" && <Clients />}
             {page === "Filtering" && <Filtering />}
             {page === "System" && <SystemPage />}
+            </Suspense>
           </main>
         </SidebarInset>
       </SidebarProvider>

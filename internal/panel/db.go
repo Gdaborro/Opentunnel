@@ -1,7 +1,9 @@
 package panel
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,12 +14,26 @@ import (
 
 type DB struct {
 	*sql.DB
-	done      chan struct{}
-	closeOnce sync.Once
+	accountGate                  chan struct{}
+	done                         chan struct{}
+	closeOnce                    sync.Once
+	accountMu                    sync.Mutex // serialize traffic reservations within this process
+	block                        blockCache
+	policyMu                     sync.Mutex
+	killOn                       bool
+	killAt                       time.Time
+	killReason                   string
+	killAllow                    map[string]bool
+	killDetailAt                 time.Time
+	sshMax, sshDaily, sshTrickle int64
+	sshAt                        time.Time
 }
 
 func Open(path string, purgeAfterDays int) (*DB, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	// WAL mode is configured on a bounded dedicated migration connection.
+	// Putting its pragma in every lazy connection initializer can return
+	// SQLITE_BUSY immediately when relay/panel open the same file together.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +58,74 @@ func (db *DB) Close() error {
 	return db.DB.Close()
 }
 
+type schemaDB interface {
+	Exec(string, ...any) (sql.Result, error)
+	QueryRow(string, ...any) *sql.Row
+}
+type schemaConn struct {
+	conn *sql.Conn
+	ctx  context.Context
+}
+
+func (s schemaConn) Exec(q string, args ...any) (sql.Result, error) {
+	return s.conn.ExecContext(s.ctx, q, args...)
+}
+func (s schemaConn) QueryRow(q string, args ...any) *sql.Row {
+	return s.conn.QueryRowContext(s.ctx, q, args...)
+}
+
+// Relay and panel may start together. Serialize migrations at the database
+// write lock, not with a process-local mutex or a racy check-then-ALTER pair.
 func migrate(db *sql.DB) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := schemaExecRetry(ctx, conn, "PRAGMA journal_mode=WAL"); err != nil {
+		return err
+	}
+	if err := schemaExecRetry(ctx, conn, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	if err := migrateSchema(schemaConn{conn: conn, ctx: ctx}); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, "COMMIT")
+	return err
+}
+
+func schemaExecRetry(ctx context.Context, conn *sql.Conn, query string) error {
+	for {
+		_, err := conn.ExecContext(ctx, query)
+		if !sqliteBusy(err) {
+			return err
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func sqliteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	var code interface{ Code() int }
+	if errors.As(err, &code) {
+		return code.Code()&0xff == 5 || code.Code()&0xff == 6
+	}
+	return false
+}
+
+func migrateSchema(db schemaDB) error {
 	_, err := db.Exec(`
 	CREATE TABLE IF NOT EXISTS admins (
 		id INTEGER PRIMARY KEY,
@@ -99,12 +182,25 @@ func migrate(db *sql.DB) error {
 		down INTEGER DEFAULT 0,
 		PRIMARY KEY(token, day)
 	);
+	CREATE TABLE IF NOT EXISTS ingress_usage (
+		token TEXT NOT NULL,
+		ingress TEXT NOT NULL,
+		day TEXT NOT NULL,
+		up INTEGER NOT NULL DEFAULT 0,
+		down INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(token, ingress, day)
+	);
 	CREATE INDEX IF NOT EXISTS idx_peers_status ON peers(status);
 	CREATE INDEX IF NOT EXISTS idx_peers_fingerprint ON peers(fingerprint);
 	CREATE INDEX IF NOT EXISTS idx_visits_domain ON visits(domain);
 	CREATE TABLE IF NOT EXISTS settings (
 		key TEXT PRIMARY KEY,
 		value TEXT
+	);
+	CREATE TABLE IF NOT EXISTS relay_metrics (
+		id INTEGER PRIMARY KEY CHECK(id=1),
+		snapshot TEXT NOT NULL,
+		at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE TABLE IF NOT EXISTS blocked_categories (
 		category TEXT PRIMARY KEY,
@@ -147,18 +243,30 @@ func migrate(db *sql.DB) error {
 		// sticky upgrade — once a peer proved key possession, v4
 		// handshakes for its token are downgrade attempts).
 		{"v5_seen", "DATETIME"},
+		// Explicit approval cannot be confused with ordinary bootstrap state.
+		{"approval_required", "INTEGER NOT NULL DEFAULT 0"},
+		// A new generation invalidates already-authenticated sessions, even
+		// if the identity is subsequently approved again or its key restored.
+		{"auth_epoch", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var n int
-		db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name=?`, col.name).Scan(&n)
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name=?`, col.name).Scan(&n); err != nil {
+			return err
+		}
 		if n == 0 {
 			if _, err := db.Exec(`ALTER TABLE peers ADD COLUMN ` + col.name + ` ` + col.def); err != nil {
 				return err
 			}
 		}
 	}
+	if _, err := db.Exec(`UPDATE peers SET auth_epoch=hex(randomblob(16)) WHERE auth_epoch=''`); err != nil {
+		return err
+	}
 	// Seed the built-in categories (disabled until an admin enables them).
 	for cat := range categoryLists {
-		db.Exec(`INSERT OR IGNORE INTO blocked_categories(category,enabled) VALUES(?,0)`, cat)
+		if _, err := db.Exec(`INSERT OR IGNORE INTO blocked_categories(category,enabled) VALUES(?,0)`, cat); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -181,6 +289,7 @@ func reaper(db *DB, purgeAfterDays int) {
 			db.Exec(`DELETE FROM peers WHERE status IN ('approved','pending','expired','kicked') AND last_seen < datetime('now', ?)`, window)
 			db.Exec(`DELETE FROM visits WHERE token NOT IN (SELECT token FROM peers)`)
 			db.Exec(`DELETE FROM daily_usage WHERE token NOT IN (SELECT token FROM peers)`)
+			db.Exec(`DELETE FROM ingress_usage WHERE token NOT IN (SELECT token FROM peers) OR day < date('now','-30 days')`)
 			db.Exec(`DELETE FROM device_health WHERE token NOT IN (SELECT token FROM peers)`)
 			db.Exec(`DELETE FROM peer_ips WHERE token NOT IN (SELECT token FROM peers)`)
 			db.Exec(`DELETE FROM peer_ips WHERE at < datetime('now','-7 days')`)
@@ -299,55 +408,16 @@ type Peer struct {
 
 func (db *DB) CheckToken(token string) (status, reason, kickExpires string, err error) {
 	if db == nil {
-		// No panel database (legacy static-token mode): unknown here, so
-		// the caller treats the token as not-yet-approved, same as a DB
-		// miss below. Never approve blindly on a nil receiver.
 		return "pending", "", "", nil
 	}
-	var s, kr, br, ke, fp, pub, sched string
-	var quota, up, down int64
-	err = db.QueryRow(`SELECT status, COALESCE(kick_reason,''), COALESCE(ban_reason,''), COALESCE(kick_expires,''), fingerprint, COALESCE(ssh_pubkey,''), COALESCE(schedule,''), COALESCE(quota_bytes,0), COALESCE(bytes_up,0), COALESCE(bytes_down,0) FROM peers WHERE token=?`, token).Scan(&s, &kr, &br, &ke, &fp, &pub, &sched, &quota, &up, &down)
+	p, err := db.AccessPolicy(token)
+	if err == sql.ErrNoRows {
+		return "pending", "", "", nil
+	}
 	if err != nil {
-		return "pending", "", "", nil
+		return "pending", "", "", err
 	}
-	// Identity bans trump peer status: a banned device stays banned even if
-	// its row was manipulated back to approved.
-	if db.IdentityBanned(fp, pub) {
-		if br == "" {
-			br = db.identityBanReason(fp, pub)
-		}
-		return "banned", br, "", nil
-	}
-	if s == "banned" {
-		return "banned", br, "", nil
-	}
-	if s == "kicked" {
-		// Expired kicks clear inline so devices aren't locked out until the
-		// hourly reaper happens to tick.
-		if ke != "" {
-			if exp, perr := time.Parse("2006-01-02 15:04:05", ke); perr == nil && time.Now().UTC().After(exp) {
-				db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE token=?`, token)
-				s = "approved"
-			}
-		}
-		if s == "kicked" {
-			return "kicked", kr, ke, nil
-		}
-	}
-	if s == "pending" || s == "expired" {
-		return s, "", "", nil
-	}
-	// approved — ISP controls: data quota, then access schedule.
-	if quota > 0 && up+down >= quota {
-		db.quotaAlert(token)
-		return "kicked", "data quota exceeded", "", nil
-	}
-	if !scheduleAllows(sched, time.Now()) {
-		db.scheduleAlert(token)
-		return "kicked", "outside allowed hours (schedule)", nextScheduleStart(sched, time.Now()).Format("2006-01-02 15:04:05"), nil
-	}
-	db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, token)
-	return "approved", "", "", nil
+	return p.Status, p.Reason, p.Expires, nil
 }
 
 func (db *DB) RecordTraffic(token string, up, down int64) {

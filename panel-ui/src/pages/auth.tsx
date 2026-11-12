@@ -24,7 +24,7 @@ async function api(path: string, body: unknown): Promise<boolean> {
     })
     if (res.ok) return true
     if (res.status === 403 && path === "/admin/api/setup") {
-      toast.error("Setup is already complete — sign in instead")
+      toast.error("Setup refused — check the one-time token or whether setup is complete")
     } else if (res.status === 401 || res.status === 403) {
       toast.error("Invalid credentials")
     } else {
@@ -48,11 +48,16 @@ export function AuthPage({
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [confirm, setConfirm] = useState("")
+  const [setupToken, setSetupToken] = useState("")
   const [busy, setBusy] = useState(false)
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (busy) return
+    if (username.length > 64 || new TextEncoder().encode(password).length > 72) {
+      toast.error("Username must be at most 64 characters; password at most 72 UTF-8 bytes")
+      return
+    }
     if (mode === "setup" && password !== confirm) {
       toast.error("Passwords do not match")
       return
@@ -61,7 +66,7 @@ export function AuthPage({
     const ok =
       mode === "login"
         ? await api("/admin/api/login", { username, password })
-        : await api("/admin/api/setup", { username, password })
+        : await api("/admin/api/setup", { username, password, setup_token: setupToken })
     setBusy(false)
     if (ok) onDone()
   }
@@ -92,7 +97,8 @@ export function AuthPage({
                   <Input
                     id="username"
                     autoComplete="username"
-                    placeholder="admin"
+                     placeholder="admin"
+                     maxLength={64}
                     required
                     value={username}
                     onChange={(e) => setUsername(e.target.value)}
@@ -112,6 +118,13 @@ export function AuthPage({
                     onChange={(e) => setPassword(e.target.value)}
                   />
                 </Field>
+                {mode === "setup" && (
+                  <Field>
+                    <FieldLabel htmlFor="setup-token">One-time setup token</FieldLabel>
+                    <Input id="setup-token" type="password" autoComplete="off" required value={setupToken} onChange={(e) => setSetupToken(e.target.value)} />
+                    <FieldDescription>Provided privately by the operator through OTU_SETUP_TOKEN.</FieldDescription>
+                  </Field>
+                )}
                 {mode === "setup" && (
                   <Field>
                     <FieldLabel htmlFor="confirm">Confirm password</FieldLabel>

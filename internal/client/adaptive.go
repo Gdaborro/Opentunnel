@@ -47,6 +47,7 @@ const sshRejectCooldown = 15 * time.Minute
 // the ws-tls profiles and the ssh last resort, and carries bulk traffic
 // on hostile networks so SSH doesn't have to.
 const H3TierName = "h3"
+const CarrierTierName = "carrier"
 
 // tierCount returns how many tiers exist including the optional h3 and
 // ssh fallbacks. In hostile mode the SSH tier is hidden unless explicitly
@@ -54,6 +55,9 @@ const H3TierName = "h3"
 // intercepting net. The h3 tier stays: it reads as ordinary HTTP/3.
 func (a *Adaptive) tierCount() int {
 	n := len(profileOrder)
+	if a.carrierFallback != nil {
+		n++
+	}
 	if a.h3Fallback != nil {
 		n++
 	}
@@ -68,7 +72,14 @@ func (a *Adaptive) tierName(idx int) string {
 	if idx < len(profileOrder) {
 		return profileOrder[idx]
 	}
-	if a.h3Fallback != nil && idx == len(profileOrder) {
+	n := len(profileOrder)
+	if a.carrierFallback != nil {
+		if idx == n {
+			return CarrierTierName
+		}
+		n++
+	}
+	if a.h3Fallback != nil && idx == n {
 		return H3TierName
 	}
 	return SshTierName
@@ -81,10 +92,14 @@ func (a *Adaptive) sshTierIndex() int {
 	if a.sshFallback == nil || (a.hostile && !a.AllowHostileSSH) {
 		return -1
 	}
-	if a.h3Fallback != nil {
-		return len(profileOrder) + 1
+	n := len(profileOrder)
+	if a.carrierFallback != nil {
+		n++
 	}
-	return len(profileOrder)
+	if a.h3Fallback != nil {
+		n++
+	}
+	return n
 }
 
 // ParseProfile validates a configured profile name ("auto" handled by NewAdaptive).
@@ -130,7 +145,9 @@ type Adaptive struct {
 	// h3Fallback, when set, adds the HTTP/3 tier between the ws-tls
 	// profiles and ssh: QUIC cannot be transparently intercepted, so the
 	// pinned handshake reaches the relay untouched on MITM networks.
-	h3Fallback func() transport.Transport
+	h3Fallback      func() transport.Transport
+	carrierFallback func() transport.Transport
+	innerTLSPins    []string
 
 	// AllowHostileSSH permits the SSH tier while hostile mode is active
 	// (TLS-intercepting network). Default true preserves connectivity;
@@ -182,6 +199,31 @@ func (a *Adaptive) EnableSSHFallback(builder func() transport.Transport) {
 	defer a.mu.Unlock()
 	a.sshFallback = builder
 	a.invalidateClientsLocked()
+}
+
+// EnableCarrier adds an opt-in managed carrier before QUIC/SSH. It does not
+// install, launch or configure a companion, or implicitly trust its credentials.
+func (a *Adaptive) EnableCarrier(builder func() transport.Transport) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.carrierFallback = builder
+	a.invalidateClientsLocked()
+}
+
+func (a *Adaptive) EnableInnerTLS(pins []string) error {
+	for _, value := range pins {
+		if _, err := protocol.ParsePublicKeyPin(value); err != nil {
+			return err
+		}
+	}
+	if len(pins) == 0 {
+		return errors.New("inner TLS requires a relay identity pin")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.innerTLSPins = append([]string(nil), pins...)
+	a.invalidateClientsLocked()
+	return nil
 }
 
 // EnableH3 adds the HTTP/3 tier to the ladder (between ws-tls and ssh).
@@ -264,7 +306,9 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 			opt.ChromeHello = true // every tier mimics Chrome (see const block)
 			tr = transport.NewWSTLS(opt)
 		}
-	case a.h3Fallback != nil && idx == len(profileOrder):
+	case name == CarrierTierName && a.carrierFallback != nil:
+		tr = a.carrierFallback()
+	case name == H3TierName && a.h3Fallback != nil:
 		tr = a.h3Fallback()
 	case a.sshFallback != nil:
 		tr = a.sshFallback()
@@ -279,6 +323,13 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		Profile:        "balanced", // under h3/ssh, mild padding; harmless elsewhere
 		Mux:            a.mux,
 		OnAuthRejected: a.OnAuthRejected,
+	}
+	if len(a.innerTLSPins) > 0 {
+		wrapped, err := WithInnerTLS(tr, a.innerTLSPins)
+		if err != nil {
+			panic("validated inner TLS pin configuration changed")
+		}
+		tr = wrapped
 	}
 	if idx < len(profileOrder) {
 		opts.Profile = name // fast/balanced/stealth must actually shape differently

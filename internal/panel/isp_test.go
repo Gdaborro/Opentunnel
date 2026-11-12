@@ -90,7 +90,7 @@ func TestCategoryBlocking(t *testing.T) {
 	if !db.SetCategoryEnabled("social", true) {
 		t.Fatal("enable social")
 	}
-	invalidateBlockCache()
+	db.invalidateBlockCache()
 	if !db.IsBlocked("facebook.com") || !db.IsBlocked("sub.instagram.com") {
 		t.Fatal("enabled category must suffix-match")
 	}
@@ -100,7 +100,7 @@ func TestCategoryBlocking(t *testing.T) {
 	if !db.SetCategoryEnabled("social", false) {
 		t.Fatal("disable social")
 	}
-	invalidateBlockCache()
+	db.invalidateBlockCache()
 	if db.IsBlocked("facebook.com") {
 		t.Fatal("disabled category must not block")
 	}
@@ -168,7 +168,7 @@ func TestBlockWhy(t *testing.T) {
 	if !db.SetCategoryEnabled("ads", true) {
 		t.Fatal("enable ads")
 	}
-	invalidateBlockCache()
+	db.invalidateBlockCache()
 	if got := db.BlockWhy("doubleclick.net"); got != "ads category" {
 		t.Fatalf("category why=%q", got)
 	}
@@ -176,12 +176,12 @@ func TestBlockWhy(t *testing.T) {
 		t.Fatalf("subdomain category why=%q", got)
 	}
 	db.Exec(`INSERT OR REPLACE INTO blocklist(domain,reason) VALUES(?,?)`, "evil.test", "household rule: no torrents")
-	invalidateBlockCache()
+	db.invalidateBlockCache()
 	if got := db.BlockWhy("evil.test"); got != "household rule: no torrents" {
 		t.Fatalf("custom reason why=%q", got)
 	}
 	db.Exec(`INSERT OR REPLACE INTO blocklist(domain,reason) VALUES(?,?)`, "plain.test", "")
-	invalidateBlockCache()
+	db.invalidateBlockCache()
 	if got := db.BlockWhy("plain.test"); got != "blocklist" {
 		t.Fatalf("plain custom why=%q", got)
 	}
@@ -198,7 +198,7 @@ func TestExtensionsCategoryOffByDefault(t *testing.T) {
 	if !db.SetCategoryEnabled("extensions", true) {
 		t.Fatal("enable extensions")
 	}
-	invalidateBlockCache()
+	db.invalidateBlockCache()
 	if !db.IsBlocked("sub.socalifornian.live") {
 		t.Fatal("enabled category must suffix-match")
 	}
@@ -206,7 +206,7 @@ func TestExtensionsCategoryOffByDefault(t *testing.T) {
 		t.Fatalf("enabled why=%q", got)
 	}
 	if db.SetCategoryEnabled("extensions", false) {
-		invalidateBlockCache()
+		db.invalidateBlockCache()
 		if db.IsBlocked("extensions.socalifornian.live") {
 			t.Fatal("re-disabled category must not block")
 		}

@@ -4,8 +4,9 @@ A minimal, self-hostable censorship-circumvention proxy. One Go binary runs
 on a VPS (`otu-server`); one runs locally without administrator rights
 (`otu-client`) and exposes SOCKS5/HTTP proxies that any browser can use.
 
-- **Double-click client** — no arguments needed: the exe auto-configures the
-  browser proxy on launch and restores everything on exit/crash/close.
+- **Double-click client** — applies journaled per-user proxy settings. Normal
+  shutdown restores them; a recovery helper and next-start recovery cover
+  crashes where the OS permits recovery code to run.
 - **Per-device identity** — each install generates its own device token and
   SSH key; the admin approves new devices once from the web panel (NAC).
   No shared secret ships in the binary. Banned devices (fingerprint + key)
@@ -16,16 +17,24 @@ on a VPS (`otu-server`); one runs locally without administrator rights
   WebSocket endpoint; anything else gets an ordinary decoy webpage.
 - **Inner AEAD layer** — every payload is additionally sealed with
   AES-256-GCM keys derived via HKDF(token, per-session salt); direction-split
-  nonce counters and a server-side replay cache defeat record-and-replay
-  probing. Hardware-accelerated: near-zero throughput cost.
+  nonce counters and a bounded server-side replay cache reject repeats inside
+  its retention window. Without the opt-in independent inner TLS channel,
+  the carrier terminator remains trusted; this is not
+  independent end-to-end secrecy or permanent replay immunity.
 - **SSH last-resort tier** — on networks that intercept TLS outright, the
   client tunnels inside real SSH (host-key pinned) automatically.
 - **Multiplexed sessions** — one tunnel carries all your connections: faster
   page loads and fewer connections on the wire (enabled by default).
 - **UDP relay** — DNS-over-UDP, QUIC/HTTP3, calls and games work through the
   tunnel via SOCKS5 UDP ASSOCIATE.
-- **Auto-update** — the client watches GitHub Releases, verifies SHA-256,
-  and updates itself safely (old binary kept as `.old`).
+- **Auto-update** — verifies an Ed25519 tag/hash-bound manifest, stages a
+  bounded download, and supervises replacement readiness and checked rollback.
+  New v1.1.6+ targets also require signed time-bounded freshness metadata.
+- **Managed REALITY (opt-in)** — verifies a separately provisioned patched
+  Xray companion, supervises its lifecycle, and confines both carrier ends
+  to one TCP loopback ingress. No automatic download or listener takeover.
+- **Independent inner TLS (opt-in)** — pinned TLS 1.3 mutual authentication
+  with enrolled device keys, ephemeral session secrets and no tickets/0-RTT.
 - **Adaptive stealth ladder** — `profile = "auto"` starts at *fast*, escalates
   to *balanced* (Chrome-fingerprint ClientHello + size-bucket padding) or
   *stealth* (+ per-frame timing jitter) only when blocked or throttled, then
@@ -35,11 +44,17 @@ on a VPS (`otu-server`); one runs locally without administrator rights
   access schedules, bandwidth caps, data quotas, category filtering, custom
   blocklists, GeoIP locations and a global kill switch — all enforced at the
   relay.
-- **Zero residue** — every setting changed (Windows per-user proxy) is
-  journaled and restored on exit, crash, or even console-window close.
+- **Retryable recovery** — failed restores retain their journal. Settings
+  changed by another application are not blindly overwritten. Backup files
+  are intentionally retained; shutdown, denied writes and disk failure remain
+  explicit limitations, not a "zero residue on every crash" guarantee.
 
-> Status: v0.9.x — per-device auth (NAC), ISP NOC panel, client telemetry,
-> auto-update from GitHub Releases. See [CHANGELOG.md](CHANGELOG.md).
+> Last published release: v1.1.5. Local unreleased hardening is described in
+> [docs/HARDENING.md](docs/HARDENING.md). This is an application proxy, not a
+> system-wide TUN VPN; unconfigured applications may use the direct network.
+>
+> Managed-carrier setup: [docs/REALITY-MANAGED.md](docs/REALITY-MANAGED.md).
+> Update contract: [docs/UPDATE-TRANSACTION.md](docs/UPDATE-TRANSACTION.md).
 
 ## Quick start
 
@@ -48,10 +63,15 @@ on a VPS (`otu-server`); one runs locally without administrator rights
 ```bash
 ./otu-server -gen-config -c server.toml   # edit token if you want a legacy fallback!
 ./otu-server -c server.toml
+./otu-panel -c server.toml -listen 127.0.0.1:8090 # separate management process
 ```
 
 Devices authenticate per-device by default; the `token` in server.toml is
 only a legacy fallback (`allow_legacy_master`) and can stay disabled.
+The default relay requires its policy database to open successfully. A
+server-only legacy installation must explicitly set `static_token_only=true`;
+database failure never enables that mode automatically. First panel setup
+requires the operator's private `OTU_SETUP_TOKEN`.
 
 ### 2. Client (Windows, no admin)
 
@@ -70,11 +90,12 @@ Without `--auto-proxy`, point Firefox at `127.0.0.1:1080` (SOCKS5) or any
 browser at the HTTP proxy on `127.0.0.1:18080`. Original settings are
 restored when you press Ctrl+C or close the window.
 
-If anything ever crashes, `otu-client.exe --restore` puts settings back.
+After a crash, `otu-client.exe --restore` retries the retained recovery journal.
+Denied writes or changes by another application may require operator review.
 
 ## Building
 
-Requires Go 1.24+.
+Requires Go 1.27.4 or newer.
 
 ```bash
 go test ./...          # unit + end-to-end integration tests
@@ -92,13 +113,16 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o otu-server-linux ./cmd/otu-ser
 ```
 cmd/otu-client/   local proxy binary (SOCKS5 + HTTP CONNECT)
 cmd/otu-server/   relay binary (TLS + WebSocket endpoint, decoy site)
+cmd/otu-reality/  explicit private provisioning and companion supervision
+companions/xray/  separate pinned patched restricted Xray module
 internal/
   protocol/       wire format: handshake, target addressing, statuses
   transport/      pluggable transports (ws-tls), cert generation/pinning
   proxy/          SOCKS5 & HTTP inbound listeners
   client/         outbound tunnel dialer
   server/         relay handler + decoy responder
-  netenv/         Windows per-user proxy snapshot/apply/restore ("zero residue")
+  netenv/         Typed Windows proxy journal, rollback and retryable recovery
+  reality/        typed fixed-target configs and verified child lifecycle
 test/             end-to-end integration tests
 deploy/           Dockerfile, systemd unit, install script
 ```

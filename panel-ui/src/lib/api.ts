@@ -80,6 +80,9 @@ export interface AlertItem {
 }
 
 export interface ServerHealth {
+  relay_online?: boolean
+  metrics_age_s?: number
+  panel_version?: string
   version: string
   process_uptime_s: number
   goroutines: number

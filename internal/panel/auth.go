@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,8 +19,9 @@ type Auth struct {
 	mu       sync.RWMutex
 
 	// login throttle: per-IP failed attempts
-	lmu   sync.Mutex
-	fails map[string]*loginFail
+	lmu         sync.Mutex
+	fails       map[string]*loginFail
+	bootstrapMu sync.Mutex
 }
 
 type session struct {
@@ -45,31 +47,49 @@ func NewAuth(db *DB) *Auth {
 
 func (a *Auth) NeedsSetup() bool {
 	var count int
-	_ = a.db.QueryRow(`SELECT COUNT(*) FROM admins`).Scan(&count)
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM admins`).Scan(&count); err != nil {
+		return false
+	}
 	return count == 0
 }
 
 func (a *Auth) EnsureAdmin(username, password string) error {
 	var count int
-	a.db.QueryRow(`SELECT COUNT(*) FROM admins WHERE username=?`, username).Scan(&count)
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM admins WHERE username=?`, username).Scan(&count); err != nil {
+		return err
+	}
 	if count > 0 {
 		return nil
 	}
-	hash, _ := bcrypt.GenerateFromPassword([]byte(password), 12)
-	_, err := a.db.Exec(`INSERT INTO admins(username,password_hash) VALUES(?,?)`, username, string(hash))
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		return err
+	}
+	_, err = a.db.Exec(`INSERT INTO admins(username,password_hash) VALUES(?,?)`, username, string(hash))
 	return err
 }
 
 func (a *Auth) CreateAdmin(username, password string) error {
+	a.bootstrapMu.Lock()
+	defer a.bootstrapMu.Unlock()
 	if !a.NeedsSetup() {
 		return sql.ErrNoRows
 	}
-	if len(username) < 3 || len(password) < 8 {
+	if len(username) < 3 || len(username) > 64 || len(password) < 8 || len(password) > 72 {
 		return sql.ErrTxDone
 	}
-	hash, _ := bcrypt.GenerateFromPassword([]byte(password), 12)
-	_, err := a.db.Exec(`INSERT INTO admins(username,password_hash) VALUES(?,?)`, username, string(hash))
-	return err
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		return err
+	}
+	res, err := a.db.Exec(`INSERT INTO admins(username,password_hash) SELECT ?,? WHERE NOT EXISTS(SELECT 1 FROM admins)`, username, string(hash))
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return errors.New("administrator setup already completed")
+	}
+	return nil
 }
 
 func (a *Auth) Login(username, password string) (bool, error) {
@@ -86,9 +106,20 @@ func (a *Auth) Login(username, password string) (bool, error) {
 
 func (a *Auth) CreateSession(username string) string {
 	b := make([]byte, 32)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
 	sid := base64.RawURLEncoding.EncodeToString(b)
 	a.mu.Lock()
+	for sid, s := range a.sessions {
+		if time.Since(s.created) > sessionTTL {
+			delete(a.sessions, sid)
+		}
+	}
+	if len(a.sessions) >= 1024 {
+		a.mu.Unlock()
+		return ""
+	}
 	a.sessions[sid] = &session{user: username, created: time.Now()}
 	a.mu.Unlock()
 	return sid
@@ -124,6 +155,9 @@ func (a *Auth) LoginLocked(ip string) bool {
 	a.lmu.Lock()
 	defer a.lmu.Unlock()
 	f := a.fails[ip]
+	if f == nil {
+		f = a.fails["overflow"]
+	}
 	return f != nil && time.Now().Before(f.until)
 }
 
@@ -133,6 +167,16 @@ func (a *Auth) RecordLoginFail(ip string) {
 	a.lmu.Lock()
 	defer a.lmu.Unlock()
 	now := time.Now()
+	if len(a.fails) >= 8192 {
+		for key, f := range a.fails {
+			if now.Sub(f.last) > loginLockWindow && !now.Before(f.until) {
+				delete(a.fails, key)
+			}
+		}
+		if len(a.fails) >= 8192 {
+			ip = "overflow"
+		}
+	}
 	f := a.fails[ip]
 	if f == nil || now.Sub(f.last) > loginLockWindow {
 		f = &loginFail{}
@@ -160,6 +204,10 @@ func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 			return
 		}
 		if a.NeedsSetup() {
+			if strings.HasPrefix(r.URL.Path, "/admin/api/") {
+				http.Error(w, "unauthorized: administrator setup required", http.StatusUnauthorized)
+				return
+			}
 			http.Redirect(w, r, "/admin/setup", http.StatusFound)
 			return
 		}

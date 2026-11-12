@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"opentunnel/internal/netenv"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/proxy"
+	"opentunnel/internal/reality"
 	"opentunnel/internal/share"
 	"opentunnel/internal/transport"
 	"opentunnel/internal/version"
@@ -129,10 +131,36 @@ var doubleClick bool
 // restored before the process exits, and the panic is recorded in crash.log
 // (the console may be hidden, so the file is the only trace).
 func main() {
+	// Signed update preflight is a pure version query. Do not open identity,
+	// crash logs or recovery journals for a temporary staged executable.
+	if len(os.Args) == 2 && (os.Args[1] == "-version" || os.Args[1] == "--version") {
+		fmt.Println("opentunnel client", version.Version)
+		return
+	}
+	if handled, err := client.RunUpdateHelper(os.Args[1:]); handled {
+		if err != nil {
+			log.Printf("update recovery: %v", err)
+		}
+		return
+	}
+	if handled, err := netenv.RunRecoveryHelper(os.Args[1:]); handled {
+		if err != nil {
+			log.Printf("recovery helper: %v", err)
+		}
+		return
+	}
 	setupCrashLog()
 	if err := client.WaitForUpdateParent(45 * time.Second); err != nil {
 		log.Printf("auto-update: replacement startup refused: %v", err)
 		return
+	}
+	if os.Getenv("OTU_UPDATE_READY_FILE") == "" {
+		if restarted, err := client.RecoverPendingUpdate(); err != nil {
+			log.Printf("pending update recovery: %v", err)
+			return
+		} else if restarted {
+			return
+		}
 	}
 	defer func() {
 		if r := recover(); r != nil {
@@ -235,7 +263,7 @@ func run() {
 	// force-killed while system proxy was applied. In non-auto-proxy mode a
 	// live-owner conflict is tolerated (that owner restores on its own exit).
 	if mgr != nil {
-		if err := mgr.Recover(); err != nil && *autoProxy {
+		if err := recoverNetwork(mgr); err != nil && *autoProxy {
 			log.Fatalf("%v", err)
 		}
 	}
@@ -320,6 +348,37 @@ func run() {
 			stopSignals()
 		})
 	}
+	defer requestStop()
+	var carrierOpts transport.CarrierOptions
+	if cfg.Reality != nil && cfg.Reality.Enabled {
+		profile, err := reality.LoadProfile(cfg.Reality.ProfilePath)
+		if err != nil {
+			log.Printf("REALITY profile: %v", err)
+			return
+		}
+		user, password, err := reality.LocalAuth()
+		if err != nil {
+			log.Printf("REALITY local auth generation failed")
+			return
+		}
+		data, err := reality.ClientJSON(profile, cfg.Reality.SOCKSListen, user, password)
+		if err != nil {
+			log.Printf("REALITY configuration rejected: %v", err)
+			return
+		}
+		supervisor, err := reality.Start(ctx, reality.ProcessOptions{Executable: cfg.Reality.Executable, SHA256: cfg.Reality.SHA256, StateDir: filepath.Join(tokenStore.Dir, "companions"), Listen: cfg.Reality.SOCKSListen, Target: profile.Target, Mode: "client", Config: data})
+		if err != nil {
+			log.Printf("REALITY companion startup failed: %v", err)
+			return
+		}
+		defer supervisor.Close()
+		cfg.CarrierSOCKS, cfg.CarrierTarget = cfg.Reality.SOCKSListen, profile.Target
+		carrierOpts = transport.CarrierOptions{SOCKSAddr: cfg.CarrierSOCKS, Target: cfg.CarrierTarget, Path: cfg.WSPath, DialTimeout: 15 * time.Second, SOCKSUser: user, SOCKSPassword: password, Ready: supervisor.WaitReady}
+		defer client.InstallCarrierControl(cfg, carrierOpts)()
+		fmt.Println("[i] verified managed REALITY companion initialized (outer connectivity checked by authenticated tunnel dials)")
+	} else {
+		carrierOpts = transport.CarrierOptions{SOCKSAddr: cfg.CarrierSOCKS, Target: cfg.CarrierTarget, Path: cfg.WSPath, DialTimeout: 15 * time.Second}
+	}
 
 	// Live ban check: a stale local marker never blocks startup on its own
 	// (an admin unban clears server state; the markers clear below). A live
@@ -327,6 +386,11 @@ func run() {
 	// for the grace period — then disconnect.
 	banGate := &proxy.BanGate{}
 	var dialer *client.Adaptive
+	defer func() {
+		if dialer != nil {
+			_ = dialer.Close()
+		}
+	}()
 	var graceStop *time.Timer
 	graceStart := false
 	if reason, isBanned := checkBanAtStartup(cfg, device.Token, tokenStore); isBanned {
@@ -438,6 +502,13 @@ func run() {
 			}
 		}
 		dialer = client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
+		if len(cfg.InnerTLSPins) > 0 {
+			if err := dialer.EnableInnerTLS(cfg.InnerTLSPins); err != nil {
+				log.Printf("inner TLS configuration rejected")
+				return
+			}
+			fmt.Println("[i] independent pinned mutual TLS enabled on all tunnel carriers")
+		}
 		dialer.AllowHostileSSH = cfg.AllowHostileSSH()
 		// Rotatable entries: primary plus fallbacks (same cert assumed).
 		// IP literals already applied to the primary via DialHostPort.
@@ -453,6 +524,17 @@ func run() {
 			entries = append(entries, e)
 		}
 		dialer.SetEntries(entries)
+		if cfg.CarrierSOCKS != "" {
+			builder := func() transport.Transport {
+				return transport.NewCarrier(carrierOpts)
+			}
+			if cfg.TransportKind() == "carrier" {
+				dialer.UseTransportBuilder(func(string) transport.Transport { return builder() })
+			} else {
+				dialer.EnableCarrier(builder)
+			}
+			fmt.Println("[i] external managed carrier enabled (operator-provided authenticated companion required)")
+		}
 		dialer.Logger = log.Default()
 		// In-band control channel: status + health ride the authenticated
 		// session (the only path that works on TLS-intercepting networks),
@@ -503,6 +585,8 @@ func run() {
 		defer dialer.Close()
 
 		switch cfg.TransportKind() {
+		case "carrier":
+			fmt.Println("[i] transport: managed fixed-target carrier")
 		case "ssh":
 			internal := cfg.SSHInternal
 			if internal == "" {
@@ -579,7 +663,7 @@ func run() {
 		}
 		// HTTP/3 tier: QUIC survives TLS interception, engages only
 		// after every ws-tls profile fails, and reads as ordinary h3.
-		if cfg.H3TierEnabled() {
+		if cfg.H3TierEnabled() && cfg.TransportKind() != "carrier" && cfg.TransportKind() != "ssh" {
 			dialer.EnableH3ForCurrentEntry()
 			fmt.Println("[i] h3 tier enabled (QUIC — engages after ws-tls)")
 		}
@@ -612,7 +696,7 @@ func run() {
 			hr.Run(ctx, 60*time.Second)
 		})
 		if cfg.AutoUpdateEnabled() {
-			safeGo("update", func() { client.UpdateLoop(cfg.SOCKSAddr) })
+			safeGo("update", func() { client.RunUpdateLoop(ctx, cfg.SOCKSAddr, requestStop) })
 			fmt.Println("[i] auto-update: watching GitHub releases")
 		}
 		// Loop guard: entry hosts dial direct instead of entering the tunnel
@@ -643,7 +727,7 @@ func run() {
 		if err != nil {
 			portFailExit(socksAddr, err, mgr)
 		}
-		safeGo("socks", func() { proxy.ServeSOCKS5(ctx, lnSOCKS, serveDialer, log.Default()) })
+		safeGo("socks", func() { defer requestStop(); proxy.ServeSOCKS5(ctx, lnSOCKS, serveDialer, log.Default()) })
 		fmt.Printf("[+] SOCKS5     -> %s\n", socksAddr)
 	}
 	if httpAddr != "" {
@@ -651,13 +735,14 @@ func run() {
 		if err != nil {
 			portFailExit(httpAddr, err, mgr)
 		}
-		safeGo("http", func() { proxy.ServeHTTPProxy(ctx, lnHTTP, serveDialer, log.Default()) })
+		safeGo("http", func() { defer requestStop(); proxy.ServeHTTPProxy(ctx, lnHTTP, serveDialer, log.Default()) })
 		fmt.Printf("[+] HTTP proxy -> %s\n", httpAddr)
 	}
 
 	if *autoProxy {
 		if err := mgr.Recover(); err != nil {
-			log.Fatalf("%v", err)
+			log.Printf("settings recovery: %v", err)
+			return
 		}
 		addr := httpAddr
 		if addr == "" {
@@ -665,13 +750,24 @@ func run() {
 		}
 		host, port, _ := net.SplitHostPort(addr)
 		sysProxy := net.JoinHostPort(firstNonEmpty(host, "127.0.0.1"), port)
-		if err := mgr.Begin(sysProxy, cfg.BypassList); err != nil {
-			log.Fatalf("auto-proxy: %v", err)
+		restore := func() {
+			if err := mgr.Restore(); err != nil {
+				log.Printf("settings restore incomplete; journal retained for retry: %v", err)
+			}
 		}
-		defer func() { _ = mgr.Restore() }()
-		// Cover window-close / logoff / shutdown, which bypass os/signal.
-		netenv.InstallTerminalEventHandler(func() { _ = mgr.Restore() })
-		fmt.Printf("[+] System proxy set to %s (restored on any exit)\n", sysProxy)
+		// Register cleanup BEFORE mutation. Begin also rolls back a partial
+		// apply itself; forced termination is covered by the independent helper.
+		defer restore()
+		netenv.InstallTerminalEventHandler(restore)
+		if err := netenv.StartRecoveryWatcher(); err != nil {
+			log.Printf("auto-proxy not applied: %v; restart without --auto-proxy to configure application proxies manually", err)
+			return
+		}
+		if err := mgr.Begin(sysProxy, cfg.BypassList); err != nil {
+			log.Printf("auto-proxy: %v", err)
+			return
+		}
+		fmt.Printf("[+] System proxy set to %s (journaled restore + crash-recovery helper)\n", sysProxy)
 	}
 
 	if graceStart {
@@ -699,6 +795,10 @@ func run() {
 		fmt.Println("[i] Point your browser at the SOCKS5 or HTTP proxy above, or press Ctrl+C to stop.")
 	}
 
+	if err := client.ReportUpdateReady(); err != nil {
+		log.Printf("replacement readiness failed: %v", err)
+		requestStop()
+	}
 	<-ctx.Done()
 	if lnSOCKS != nil {
 		_ = lnSOCKS.Close()
@@ -792,6 +892,19 @@ func warnIfExposed(addr, name string) {
 		return
 	}
 	fmt.Printf("[!] WARNING: %s = %s is not loopback — the proxy has NO authentication; anyone who can reach it can use your tunnel\n", name, addr)
+}
+
+func recoverNetwork(mgr *netenv.Manager) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := mgr.Recover()
+		if !client.IsUpdateReplacement() || !errors.Is(err, netenv.ErrAlreadyRunning) || time.Now().After(deadline) {
+			return err
+		}
+		// A recovery helper may briefly own the lease after the old process
+		// exits. Wait for its bounded restore before starting the replacement.
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func boolPtr(b bool) *bool { return &b }

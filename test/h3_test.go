@@ -23,6 +23,10 @@ import (
 // startH3Server runs the relay handler over HTTP/3 on a loopback UDP
 // port, mirroring cmd/otu-server's listener wiring.
 func startH3Server(t *testing.T) (addr, fp string) {
+	return startH3ServerWithOptions(t, server.Options{Token: token, AllowRestrictedTargets: true})
+}
+
+func startH3ServerWithOptions(t *testing.T, options server.Options) (addr, fp string) {
 	t.Helper()
 	tmp := t.TempDir()
 	cert, certFP, err := transport.LoadOrCreateCert(tmp+"/c.pem", tmp+"/k.pem", "127.0.0.1")
@@ -44,7 +48,7 @@ func startH3Server(t *testing.T) (addr, fp string) {
 	}
 	h3srv := &http3.Server{
 		TLSConfig: h3TLS,
-		Handler:   server.Handler(server.Options{Token: token, AllowRestrictedTargets: true}),
+		Handler:   server.Handler(options),
 	}
 	go func() { _ = h3srv.Serve(udpConn) }()
 	t.Cleanup(func() {
@@ -79,6 +83,7 @@ func TestH3TunnelRoundTrip(t *testing.T) {
 		Mux:         true,
 		DialTimeout: 10 * time.Second,
 	})
+	defer cl.Close()
 
 	for i := 0; i < 3; i++ {
 		taddr, err := protocol.ParseAddress(tgtHost, atoi(t, tgtPort))

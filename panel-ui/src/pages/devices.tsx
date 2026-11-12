@@ -46,7 +46,7 @@ export function Devices() {
           </CardDescription>
         </CardHeader>
         <CardContent className="grid grid-cols-2 gap-4 text-sm @2xl/main:grid-cols-4 @4xl/main:grid-cols-6">
-          <Metric label="Status" value={health ? "online" : "—"} good={!!health} />
+          <Metric label="Status" value={health?.relay_online ? "heartbeat current" : "relay heartbeat unavailable"} good={!!health?.relay_online} />
           <Metric
             label="Host uptime"
             value={health?.host_uptime_s ? formatDuration(health.host_uptime_s) : "—"}

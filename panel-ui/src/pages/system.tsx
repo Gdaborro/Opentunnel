@@ -29,6 +29,7 @@ export function SystemPage() {
   const [kill, setKill] = useState(false)
   const [health, setHealth] = useState<ServerHealth | null>(null)
   const [loaded, setLoaded] = useState(false)
+  const [toggleBusy, setToggleBusy] = useState(false)
   const [reason, setReason] = useState("")
   const [allow, setAllow] = useState("")
   const [devices, setDevices] = useState<{ token: string; device_name?: string }[]>([])
@@ -54,7 +55,7 @@ export function SystemPage() {
         setSshTrickleKbps(String(t.ssh_tier_trickle_kbps ?? 0))
         setLoaded(true)
       })
-      .catch(() => {})
+      .catch(() => setLoaded(false))
     api.serverHealth().then(setHealth).catch(() => {})
     fetch("/admin/api/devices")
       .then((r) => r.json())
@@ -64,8 +65,12 @@ export function SystemPage() {
   useEffect(load, [load])
 
   const toggleKill = (on: boolean) => {
+    if (toggleBusy) return
+    setToggleBusy(true)
     setKill(on)
-    api.setKillSwitch(on).catch(() => setKill(!on))
+    api.setKillSwitch(on)
+      .catch(() => setKill(!on))
+      .finally(() => setToggleBusy(false))
   }
 
   const saveKillDetail = () => {
@@ -73,7 +78,6 @@ export function SystemPage() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        kill_switch: kill,
         kill_switch_reason: reason,
         kill_switch_allow: allow.split("\n").map((t) => t.trim()).filter(Boolean),
       }),
@@ -81,6 +85,9 @@ export function SystemPage() {
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         setSaved("saved")
+        // Preserve a concurrent administrator toggle, and refresh its displayed
+        // state after saving details instead of keeping a stale switch value.
+        api.settings().then((s) => setKill(s.kill_switch)).catch(() => setLoaded(false))
         setTimeout(() => setSaved(""), 3000)
       })
       .catch((e) => setSaved(`save failed: ${e.message}`))
@@ -118,7 +125,7 @@ export function SystemPage() {
             Global Kill Switch
           </CardTitle>
           <CardDescription>
-            Suspends all tunnel traffic instantly — new connections are refused
+            Suspends non-allowlisted traffic after the relay policy refresh — new connections are refused
             and existing streams are blocked. Devices stay registered and
             approved; flip it off to resume.
           </CardDescription>
@@ -129,15 +136,17 @@ export function SystemPage() {
               className={kill ? "size-8 text-destructive" : "size-8 text-muted-foreground"}
             />
             <p className={kill ? "font-medium text-destructive" : "font-medium text-muted-foreground"}>
-              {kill ? "SUSPENDED — all traffic blocked" : "Traffic flowing normally"}
+              {!loaded ? "Policy status unavailable" : kill ? "SUSPENDED — operator allowlist applies" : "Traffic flowing normally"}
             </p>
           </div>
-          {loaded && <Switch checked={kill} onCheckedChange={toggleKill} />}
+          {loaded && <Switch aria-label="Global Kill Switch" checked={kill} disabled={toggleBusy} onCheckedChange={toggleKill} />}
         </CardContent>
         <CardContent className="flex flex-col gap-3 border-t border-border/50 pt-4 text-sm">
           <div className="flex flex-col gap-1.5">
-            <span className="font-medium">Reason shown to every client while down</span>
+            <label htmlFor="kill-reason" className="font-medium">Reason shown to every client while down</label>
             <textarea
+              id="kill-reason"
+              maxLength={500}
               className="min-h-14 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
               placeholder="Shut down till further notice"
               value={reason}
@@ -145,8 +154,9 @@ export function SystemPage() {
             />
           </div>
           <div className="flex flex-col gap-1.5">
-            <span className="font-medium">Allowed devices keep browsing (one token per line)</span>
+            <label htmlFor="kill-allowlist" className="font-medium">Allowed devices keep browsing (one token per line)</label>
             <textarea
+              id="kill-allowlist"
               className="min-h-11 w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
               value={allow}
               onChange={(e) => setAllow(e.target.value)}
@@ -168,7 +178,7 @@ export function SystemPage() {
             </div>
           )}
           <div className="flex items-center gap-3">
-            <Button onClick={saveKillDetail}>Save reason + allowlist</Button>
+            <Button disabled={!loaded || toggleBusy} onClick={saveKillDetail}>Save reason + allowlist</Button>
             <span className="text-xs text-muted-foreground">{saved}</span>
           </div>
         </CardContent>
@@ -181,11 +191,10 @@ export function SystemPage() {
             SSH-tier containment
           </CardTitle>
           <CardDescription>
-            Keeps the ssh transport — the only tier that survives TLS
-            interception with blocked UDP — from reading as a media relay:
-            cap each device's sustained rate and give it a daily byte budget.
-            After the budget is spent, new streams degrade to the post-budget
-            rate (pages keep loading, video cannot).
+            Applies an aggregate per-device rate cap and daily byte budget
+            on SSH ingress. After the budget is spent, traffic is paced at
+            the post-budget rate. This is resource containment, not proof
+            of undetectability or guaranteed page/video behavior.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3 text-sm">
@@ -231,7 +240,7 @@ export function SystemPage() {
             </label>
           </div>
           <div className="flex items-center gap-3">
-            <Button onClick={saveSshTier}>Save containment policy</Button>
+            <Button disabled={!loaded} onClick={saveSshTier}>Save containment policy</Button>
             <span className="text-xs text-muted-foreground">{sshSaved}</span>
           </div>
         </CardContent>
@@ -262,7 +271,7 @@ export function SystemPage() {
           </div>
           <div className="flex items-center justify-between">
             <span className="text-muted-foreground">Client delivery</span>
-            <span>GitHub Releases (auto-update, sha256-verified)</span>
+            <span>GitHub Releases (signed targets, supervised replacement)</span>
           </div>
           <Separator />
           <p className="text-xs text-muted-foreground">

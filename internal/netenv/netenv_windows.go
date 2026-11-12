@@ -1,118 +1,20 @@
 //go:build windows
 
-// Package netenv manages the machine's user-level proxy configuration with a
-// guaranteed snapshot/change/restore lifecycle ("zero residue" invariant).
 package netenv
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
+	"opentunnel/internal/privatefile"
 	"opentunnel/internal/version"
 )
-
-const regKeyPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-
-// Chromium-family browsers (Chrome, Brave, Edge, Vivaldi, Opera...) read the
-// WinINET proxy at startup and ignore later broadcasts in some versions. The
-// per-user policy keys below ARE watched live, so we set both: WinINET for
-// Edge/Firefox/most apps, and policies for every Chromium fork. All HKCU —
-// no UAC, no admin — and journaled for restore like the rest.
-var chromiumPolicyPaths = []string{
-	`Software\Policies\Google\Chrome`,
-	`Software\Policies\Microsoft\Edge`,
-	`Software\Policies\BraveSoftware\Brave`,
-	`Software\Policies\Vivaldi`,
-	`Software\Policies\Chromium`,
-}
-
-const (
-	polMode   = "ProxyMode"
-	polServer = "ProxyServer"
-	polBypass = "ProxyBypassList"
-)
-
-const (
-	optSettingsChanged = 39
-	optRefresh         = 37
-)
-
-var (
-	wininet               = windows.NewLazySystemDLL("wininet.dll")
-	procInternetSetOption = wininet.NewProc("InternetSetOptionW")
-
-	user32                 = windows.NewLazySystemDLL("user32.dll")
-	procSendMessageTimeout = user32.NewProc("SendMessageTimeoutW")
-)
-
-const (
-	wmSettingChange  = 0x001A
-	hwndBroadcast    = 0xFFFF
-	smwtoAbortIfHung = 0x0002
-)
-
-// notifySystem tells running apps the proxy changed: the WinINET refresh +
-// a broadcast WM_SETTINGCHANGE("Internet Settings"). Chromium's proxy watcher
-// (ProxyConfigServiceWin) reacts to the broadcast, so browsers pick up the
-// new proxy without a restart in most cases.
-func notifySystem() {
-	if err := wininet.Load(); err == nil {
-		_, _, _ = procInternetSetOption.Call(0, optSettingsChanged, 0, 0)
-		_, _, _ = procInternetSetOption.Call(0, optRefresh, 0, 0)
-	}
-	if err := user32.Load(); err == nil {
-		internetSettings, _ := windows.UTF16PtrFromString("Internet Settings")
-		_, _, _ = procSendMessageTimeout.Call(
-			hwndBroadcast,
-			wmSettingChange,
-			0,
-			uintptr(unsafe.Pointer(internetSettings)),
-			smwtoAbortIfHung, 1000, 0,
-		)
-	}
-}
-
-type stringVal struct {
-	Exists bool   `json:"exists"`
-	Data   string `json:"data,omitempty"`
-}
-
-type policySnap struct {
-	Mode   stringVal `json:"mode"`
-	Server stringVal `json:"server"`
-	Bypass stringVal `json:"bypass"`
-	// HadKey records whether the policy key existed at all, so restore can
-	// remove keys we created instead of leaving empty shells behind.
-	HadKey bool `json:"had_key"`
-}
-
-type snapshot struct {
-	ProxyEnable   uint32                `json:"proxy_enable"`
-	ProxyServer   stringVal             `json:"proxy_server"`
-	ProxyOverride stringVal             `json:"proxy_override"`
-	AutoConfigURL stringVal             `json:"autoconfig_url"`
-	Policies      map[string]policySnap `json:"policies,omitempty"`
-	// OtuAppliedServer records the proxy address otu applied AFTER this
-	// snapshot was taken. Restore compares EXACTLY (a prefix heuristic
-	// used to match 127.0.0.1:1080 — the standard SOCKS port — plus
-	// "<local>;", i.e. virtually every proxy config ever, and wiped
-	// users' real Privoxy/Clash settings instead of restoring them).
-	OtuAppliedServer string `json:"otu_applied_server,omitempty"`
-}
-
-// Manager owns the journal directory (%LOCALAPPDATA%\opentunnel).
-type Manager struct{ Dir string }
 
 func NewManager() (*Manager, error) {
 	base := os.Getenv("LOCALAPPDATA")
@@ -120,326 +22,212 @@ func NewManager() (*Manager, error) {
 		return nil, errors.New("netenv: LOCALAPPDATA is not set")
 	}
 	dir := filepath.Join(base, version.ProductName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := privatefile.EnsureDir(dir); err != nil {
 		return nil, err
 	}
-	return &Manager{Dir: dir}, nil
+	return &Manager{Dir: dir, store: windowsStore{}, notify: notifySystem, leaseFactory: acquireWindowsLease,
+		owner: currentWindowsOwner, ownerAlive: windowsOwnerAlive, backup: backupSnapshot}, nil
 }
 
-func (m *Manager) snapPath() string { return filepath.Join(m.Dir, "snapshot.json") }
-func (m *Manager) lockPath() string { return filepath.Join(m.Dir, "lock.pid") }
+type windowsStore struct{}
 
-func (m *Manager) hasSnapshot() bool { _, err := os.Stat(m.snapPath()); return err == nil }
+func (windowsStore) KeyExists(path string) (bool, error) {
+	k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.QUERY_VALUE)
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_ = k.Close()
+	return true, nil
+}
 
-// Recover checks for orphaned state from a previous crashed session and
-// restores it. Safe to call on every start.
-func (m *Manager) Recover() error {
-	if !m.hasSnapshot() {
+func (windowsStore) Read(path, name string) (registryValue, error) {
+	v := registryValue{}
+	k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.QUERY_VALUE)
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return v, nil
+	}
+	if err != nil {
+		return v, err
+	}
+	defer k.Close()
+	size, kind, err := k.GetValue(name, nil)
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return v, nil
+	}
+	if err != nil && !errors.Is(err, windows.ERROR_MORE_DATA) {
+		return v, err
+	}
+	if size > 64<<10 {
+		return v, errors.New("netenv: registry value too large to journal")
+	}
+	v.Exists, v.Kind = true, kind
+	switch kind {
+	case registry.SZ, registry.EXPAND_SZ:
+		v.Text, _, err = k.GetStringValue(name)
+	case registry.DWORD, registry.QWORD:
+		v.Integer, _, err = k.GetIntegerValue(name)
+	case registry.MULTI_SZ:
+		v.Strings, _, err = k.GetStringsValue(name)
+	case registry.BINARY:
+		v.Bytes, _, err = k.GetBinaryValue(name)
+	default:
+		err = errors.New("netenv: unsupported registry value type; settings left unchanged")
+	}
+	return v, err
+}
+
+func (windowsStore) Write(path, name string, v registryValue) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.SET_VALUE)
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && !v.Exists {
 		return nil
 	}
-	pidFile := m.lockPath()
-	stale := true
-	if raw, err := os.ReadFile(pidFile); err == nil {
-		if pid, perr := strconv.Atoi(strings.TrimSpace(string(raw))); perr == nil {
-			alive := processAlive(uint32(pid)) && isOtuProcess(uint32(pid))
-			stale = !alive
-		}
+	if err != nil && v.Exists {
+		k, _, err = registry.CreateKey(registry.CURRENT_USER, path, registry.SET_VALUE)
 	}
-	if !stale {
-		return errors.New("netenv: another opentunnel client appears to be running")
-	}
-	if err := m.Restore(); err != nil {
+	if err != nil {
 		return err
 	}
-	fmt.Println("netenv: recovered settings left over from a previous crashed session")
-	return nil
+	defer k.Close()
+	if !v.Exists {
+		err := k.DeleteValue(name)
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return nil
+		}
+		return err
+	}
+	switch v.Kind {
+	case registry.SZ:
+		return k.SetStringValue(name, v.Text)
+	case registry.EXPAND_SZ:
+		return k.SetExpandStringValue(name, v.Text)
+	case registry.DWORD:
+		return k.SetDWordValue(name, uint32(v.Integer))
+	case registry.QWORD:
+		return k.SetQWordValue(name, v.Integer)
+	case registry.MULTI_SZ:
+		return k.SetStringsValue(name, v.Strings)
+	case registry.BINARY:
+		return k.SetBinaryValue(name, v.Bytes)
+	default:
+		return errors.New("netenv: invalid registry restoration type")
+	}
+}
+
+func (windowsStore) DeleteEmptyKey(path string) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.QUERY_VALUE|registry.ENUMERATE_SUB_KEYS)
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	values, verr := k.ReadValueNames(-1)
+	subkeys, serr := k.ReadSubKeyNames(-1)
+	_ = k.Close()
+	if verr != nil {
+		return verr
+	}
+	if serr != nil {
+		return serr
+	}
+	// Preserve any values/subkeys added by the user or another application.
+	if len(values) != 0 || len(subkeys) != 0 {
+		return nil
+	}
+	return registry.DeleteKey(registry.CURRENT_USER, path)
+}
+
+func acquireWindowsLease(dir string) (func(), error) {
+	path, err := windows.UTF16PtrFromString(filepath.Join(dir, "network-settings.lease"))
+	if err != nil {
+		return nil, err
+	}
+	h, err := windows.CreateFile(path, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		return nil, ErrAlreadyRunning
+	}
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = windows.CloseHandle(h) }, nil
+}
+
+func currentWindowsOwner() (journalOwner, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return journalOwner{}, err
+	}
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(windows.CurrentProcess(), &created, &exited, &kernel, &user); err != nil {
+		return journalOwner{}, err
+	}
+	return journalOwner{PID: os.Getpid(), Image: exe, Created: uint64(created.HighDateTime)<<32 | uint64(created.LowDateTime)}, nil
+}
+
+func windowsOwnerAlive(o journalOwner) (bool, error) {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(o.PID))
+	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return false, err
+	}
+	if code != 259 {
+		return false, nil
+	} // STILL_ACTIVE
+	if o.Created == 0 {
+		return isOtuProcess(uint32(o.PID)), nil
+	} // legacy journal
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {
+		return false, err
+	}
+	return o.Created == uint64(created.HighDateTime)<<32|uint64(created.LowDateTime), nil
 }
 
 func processAlive(pid uint32) bool {
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-	if err != nil {
-		return false
-	}
-	_ = windows.CloseHandle(h)
-	return true
+	alive, err := windowsOwnerAlive(journalOwner{PID: int(pid)})
+	return err == nil && alive
 }
 
-// isOtuProcess reports whether the given live pid is one of ours by checking
-// its process image path. This defeats PID reuse, where a recycled pid would
-// otherwise be mistaken for a live client and trap the proxy settings on.
 func isOtuProcess(pid uint32) bool {
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return false
 	}
 	defer windows.CloseHandle(h)
-	var buf [windows.MAX_PATH]uint16
+	buf := make([]uint16, 32768)
 	size := uint32(len(buf))
 	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
 		return false
 	}
-	image := strings.ToLower(windows.UTF16ToString(buf[:size]))
-	return strings.Contains(image, version.ProcessID)
+	name := strings.ToLower(filepath.Base(windows.UTF16ToString(buf[:size])))
+	name = strings.TrimSuffix(name, ".old")
+	return name == strings.ToLower(version.ProcessID)+".exe" || name == strings.ToLower(version.ProcessID)+"-windows-amd64.exe"
 }
 
-// Begin snapshots current proxy settings, journals them to disk, then applies
-// proxyAddr as the system (per-user) proxy.
-func (m *Manager) Begin(proxyAddr string, bypass []string) error {
-	k, err := registry.OpenKey(registry.CURRENT_USER, regKeyPath, registry.QUERY_VALUE)
-	if err != nil {
-		return fmt.Errorf("netenv: open registry: %w", err)
-	}
-	snap := snapshot{}
-	if v, _, err := k.GetIntegerValue("ProxyEnable"); err == nil {
-		snap.ProxyEnable = uint32(v)
-	}
-	snap.ProxyServer = readString(k, "ProxyServer")
-	snap.ProxyOverride = readString(k, "ProxyOverride")
-	snap.AutoConfigURL = readString(k, "AutoConfigURL")
-	_ = k.Close()
-	snap.Policies = snapshotPolicies()
-	// Journal the address we are ABOUT to apply: a crashed session can
-	// journal otu's own settings as the "original", and restore must be
-	// able to tell — by exact match, not by heuristic (the old prefix
-	// check matched 127.0.0.1:1080 + "<local>;", i.e. any real proxy
-	// config, and wiped it instead of restoring it).
-	snap.OtuAppliedServer = proxyAddr
+var (
+	wininet                = windows.NewLazySystemDLL("wininet.dll")
+	procInternetSetOption  = wininet.NewProc("InternetSetOptionW")
+	user32                 = windows.NewLazySystemDLL("user32.dll")
+	procSendMessageTimeout = user32.NewProc("SendMessageTimeoutW")
+)
 
-	raw, err := json.Marshal(&snap)
-	if err != nil {
-		return err
+func notifySystem() {
+	if err := wininet.Load(); err == nil {
+		_, _, _ = procInternetSetOption.Call(0, 39, 0, 0)
+		_, _, _ = procInternetSetOption.Call(0, 37, 0, 0)
 	}
-	if err := os.WriteFile(m.snapPath(), raw, 0o600); err != nil {
-		return fmt.Errorf("netenv: write snapshot: %w", err)
-	}
-	if err := os.WriteFile(m.lockPath(), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
-		return fmt.Errorf("netenv: write lock: %w", err)
-	}
-	backupSnapshot(raw)
-	return m.apply(proxyAddr, bypass)
-}
-
-// backupSnapshot mirrors the journaled snapshot into settings-backup next
-// to the executable, with a generated restore helper: the folder the client
-// runs from always contains a restorable copy of the machine's pre-tunnel
-// proxy state. Best effort only — read-only install dirs silently skip.
-func backupSnapshot(raw []byte) {
-	exe, err := os.Executable()
-	if err != nil {
-		return
-	}
-	dir := filepath.Join(filepath.Dir(exe), "settings-backup")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return
-	}
-	name := filepath.Join(dir, "network-settings-"+time.Now().Format("20060102-150405")+".json")
-	if err := os.WriteFile(name, raw, 0o600); err != nil {
-		return
-	}
-	// Rolling window: keep the newest three, prune the rest.
-	entries, _ := filepath.Glob(filepath.Join(dir, "network-settings-*.json"))
-	sort.Strings(entries) // timestamped names sort chronologically
-	for len(entries) > 3 {
-		_ = os.Remove(entries[0])
-		entries = entries[1:]
-	}
-	// Restore helper, rewritten each time so it always points at the
-	// freshest backup; the executable sits one level above settings-backup.
-	// It stops a running client first so the exit-time restore cannot race.
-	bat := "@echo off\r\n" +
-		"taskkill /IM " + filepath.Base(exe) + " /F >nul 2>&1\r\n" +
-		"\"%~dp0..\\" + filepath.Base(exe) + "\" --restore-from \"" + name + "\"\r\n" +
-		"echo Network settings restored from backup.\r\n" +
-		"pause\r\n"
-	_ = os.WriteFile(filepath.Join(dir, "restore-network.bat"), []byte(bat), 0o755)
-}
-
-func readString(k registry.Key, name string) stringVal {
-	v, _, err := k.GetStringValue(name)
-	return stringVal{Exists: err == nil, Data: v}
-}
-
-func (m *Manager) apply(proxyAddr string, bypass []string) error {
-	override := "localhost;127.0.0.1;<local>"
-	for _, b := range bypass {
-		override += ";" + b
-	}
-	k, err := registry.OpenKey(registry.CURRENT_USER, regKeyPath, registry.SET_VALUE|registry.QUERY_VALUE)
-	if err != nil {
-		return fmt.Errorf("netenv: open registry for write: %w", err)
-	}
-	defer k.Close()
-	_ = k.DeleteValue("AutoConfigURL") // PAC would bypass our proxy
-	if err := k.SetDWordValue("ProxyEnable", 1); err != nil {
-		return err
-	}
-	if err := k.SetStringValue("ProxyServer", proxyAddr); err != nil {
-		return err
-	}
-	if err := k.SetStringValue("ProxyOverride", override); err != nil {
-		return err
-	}
-	applyPolicies(proxyAddr, bypassList(override))
-	notifySystem()
-	return nil
-}
-
-// snapshotPolicies records the proxy state of every policy key otu can touch.
-// Paths that don't exist yet are recorded with HadKey=false so restore can
-// delete keys otu created — leaving zero trace.
-func snapshotPolicies() map[string]policySnap {
-	out := make(map[string]policySnap)
-	for _, path := range chromiumPolicyPaths {
-		k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.QUERY_VALUE)
-		if err != nil {
-			out[path] = policySnap{HadKey: false}
-			continue
-		}
-		ps := policySnap{Mode: readString(k, polMode), Server: readString(k, polServer), Bypass: readString(k, polBypass), HadKey: true}
-		_ = k.Close()
-		out[path] = ps
-	}
-	return out
-}
-
-// applyPolicies points every Chromium fork at the tunnel via HKCU policy
-// keys, which Chromium watches live (no browser restart needed). On
-// managed machines (e.g. school group policy) HKCU\Software\Policies may be
-// read-only for the user; we report that once so the user knows a browser
-// restart makes WinINET apply instead.
-func applyPolicies(proxyAddr string, bypass string) {
-	appliedAny := false
-	for _, path := range chromiumPolicyPaths {
-		k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.SET_VALUE)
-		if err != nil {
-			k, _, err = registry.CreateKey(registry.CURRENT_USER, path, registry.SET_VALUE)
-			if err != nil {
-				continue
-			}
-		}
-		_ = k.SetStringValue(polMode, "fixed_servers")
-		_ = k.SetStringValue(polServer, proxyAddr)
-		_ = k.SetStringValue(polBypass, strings.ReplaceAll(bypass, ";", ","))
-		_ = k.Close()
-		appliedAny = true
-	}
-	if !appliedAny {
-		fmt.Println("[i] browser policy keys are locked (managed PC): browsers already open may need a restart to route through otu")
-	}
-}
-
-// restorePolicies puts back exactly what snapshotPolicies captured. Keys otu
-// created are deleted outright (no empty shells left behind); keys that
-// existed keep their exact original values.
-func restorePolicies(snaps map[string]policySnap) {
-	for path, ps := range snaps {
-		if !ps.HadKey {
-			// otu created this key — remove it entirely. If something added
-			// subkeys in the meantime, fall back to clearing our values.
-			if err := registry.DeleteKey(registry.CURRENT_USER, path); err == nil {
-				continue
-			}
-			if k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.SET_VALUE); err == nil {
-				_ = k.DeleteValue(polMode)
-				_ = k.DeleteValue(polServer)
-				_ = k.DeleteValue(polBypass)
-				_ = k.Close()
-			}
-			continue
-		}
-		k, err := registry.OpenKey(registry.CURRENT_USER, path, registry.SET_VALUE)
-		if err != nil {
-			continue
-		}
-		restoreString(k, polMode, ps.Mode)
-		restoreString(k, polServer, ps.Server)
-		restoreString(k, polBypass, ps.Bypass)
-		_ = k.Close()
-	}
-}
-
-// bypassList converts the WinINET override string ("a;b;<local>") into the
-// comma-separated form Chromium policy expects ("a,b,<local>"). <local> is
-// kept as Chromium understands it too.
-func bypassList(override string) string {
-	parts := strings.Split(override, ";")
-	for i, p := range parts {
-		parts[i] = strings.TrimSpace(p)
-	}
-	return strings.Join(parts, ",")
-}
-
-// Restore reapplies the journaled original settings and removes the journal.
-func (m *Manager) Restore() error {
-	raw, err := os.ReadFile(m.snapPath())
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	var s snapshot
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return fmt.Errorf("netenv: corrupt snapshot: %w", err)
-	}
-	return m.applySnapshot(s)
-}
-
-// RestoreFrom restores the machine's proxy state from a backup file
-// (settings-backup next to the executable) — the recovery path when the
-// journal is gone or the state drifted. The journal is cleared too, so a
-// later start cannot re-apply stale state.
-func (m *Manager) RestoreFrom(path string) error {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("netenv: read backup: %w", err)
-	}
-	var s snapshot
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return fmt.Errorf("netenv: corrupt backup: %w", err)
-	}
-	return m.applySnapshot(s)
-}
-
-// applySnapshot writes a (possibly cleaned) snapshot back to the registry,
-// notifies running apps, and clears any journal so a later start cannot
-// re-apply stale state.
-func (m *Manager) applySnapshot(s snapshot) error {
-	// Contamination check by EXACT match: a crashed session can journal
-	// otu's own settings as the "original" (apply happens after the
-	// journal write). The journal records the address otu applied; only
-	// when the "original" equals it do we fall back to clean no-proxy.
-	// The old heuristic matched any 127.0.0.1:108x + "<local>;" config —
-	// standard Privoxy/Clash territory — and wiped real settings.
-	if s.OtuAppliedServer != "" && s.ProxyServer.Exists && s.ProxyServer.Data == s.OtuAppliedServer {
-		s.ProxyServer = stringVal{}
-		s.ProxyOverride = stringVal{}
-		s.ProxyEnable = 0
-	}
-	k, err := registry.OpenKey(registry.CURRENT_USER, regKeyPath, registry.SET_VALUE)
-	if err != nil {
-		return err
-	}
-	defer k.Close()
-	restoreString(k, "ProxyServer", s.ProxyServer)
-	restoreString(k, "ProxyOverride", s.ProxyOverride)
-	restoreString(k, "AutoConfigURL", s.AutoConfigURL)
-	if err := k.SetDWordValue("ProxyEnable", s.ProxyEnable); err != nil {
-		return err
-	}
-	if s.Policies != nil {
-		restorePolicies(s.Policies)
-	}
-	notifySystem()
-	_ = os.Remove(m.snapPath())
-	_ = os.Remove(m.lockPath())
-	return nil
-}
-
-func restoreString(k registry.Key, name string, v stringVal) {
-	if v.Exists {
-		_ = k.SetStringValue(name, v.Data)
-	} else {
-		_ = k.DeleteValue(name)
+	if err := user32.Load(); err == nil {
+		name, _ := windows.UTF16PtrFromString("Internet Settings")
+		_, _, _ = procSendMessageTimeout.Call(0xffff, 0x001a, 0, uintptr(unsafe.Pointer(name)), 0x0002, 1000, 0)
 	}
 }

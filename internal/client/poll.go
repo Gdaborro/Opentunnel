@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,39 +24,40 @@ import (
 // is a two-packet confession under TLS interception — so control traffic
 // rides the identical pin/parrot stack.
 func panelHTTP(cfg *config.ClientConf) (*http.Client, string, error) {
-	panelOnce.Do(func() {
-		// Rotation list: configured pins plus everything learned in-band,
-		// so the HTTPS fallback survives certificate renewal too.
-		fps := cfg.FingerprintSet()
-		fps = append(fps, LoadExtraPins()...)
-		cl, err := transport.NewPinnedHTTPClient(transport.PinnedHTTPOptions{
-			DialAddr:     cfg.DialHostPort(),
-			ServerName:   cfg.SNIHost(),
-			Fingerprint:  cfg.Fingerprint,
-			Fingerprints: fps,
-			Insecure:     cfg.Insecure,
-			Timeout:      20 * time.Second,
-			ChromeHello:  true,
-		})
-		panelClientBuildErr = err
-		if err == nil {
-			panelClient = cl
-			panelBase = "https://" + cfg.SNIHost()
-		}
-	})
-	if panelClientBuildErr != nil {
-		return nil, "", panelClientBuildErr
+	fps := append(cfg.FingerprintSet(), LoadExtraPins()...)
+	key := fmt.Sprintf("%s|%s|%t|%s", cfg.DialHostPort(), cfg.SNIHost(), cfg.Insecure, strings.Join(fps, ","))
+	panelMu.Lock()
+	defer panelMu.Unlock()
+	if panelClient != nil && panelKey == key {
+		return panelClient, panelBase, nil
 	}
+	cl, err := transport.NewPinnedHTTPClient(transport.PinnedHTTPOptions{
+		DialAddr:     cfg.DialHostPort(),
+		ServerName:   cfg.SNIHost(),
+		Fingerprint:  cfg.Fingerprint,
+		Fingerprints: fps,
+		Insecure:     cfg.Insecure,
+		Timeout:      20 * time.Second,
+		ChromeHello:  true,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if panelClient != nil {
+		panelClient.CloseIdleConnections()
+	}
+	panelClient, panelKey = cl, key
+	panelBase = "https://" + cfg.ServerAddr
 	return panelClient, panelBase, nil
 }
 
 var (
-	panelOnce           sync.Once
-	panelClient         *http.Client
-	panelBase           string
-	panelClientBuildErr error
-	plainOnce           sync.Once
-	plainClient         *http.Client
+	panelMu     sync.Mutex
+	panelKey    string
+	panelClient *http.Client
+	panelBase   string
+	plainOnce   sync.Once
+	plainClient *http.Client
 )
 
 // plainHTTPClient trusts the system roots. It exists ONLY as the bootstrap
@@ -98,34 +101,32 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 	body, _ := json.Marshal(map[string]string{
 		"token": device.Token, "fingerprint": device.Fingerprint, "device_name": device.DeviceName, "ssh_pubkey": pub,
 	})
-	// Pinned channel first; on intercepting networks it refuses the MITM
-	// cert by design. The system-trusted fallback exists ONLY for devices
-	// the panel has never approved (fresh bootstraps): for those the
-	// payload carries no live credential. An ever-approved device's token
-	// IS the live bearer credential, so its registration never crosses an
-	// interceptable channel (audit round three, N-1 Window A: the old
-	// unconditional fallback handed the token to the middlebox at every
-	// client start).
-	if ts, terr := NewTokenStore(); terr == nil && ts.EverApproved(device.Fingerprint) {
-		cl, base, err := panelHTTP(cfg)
+	// Bootstrap identity substitution remains possible through system-trusted
+	// intercepted TLS, even before the token is approved. Production defaults
+	// therefore require pinned TLS or an explicitly managed authenticated carrier.
+	if cl, base, err := panelHTTP(cfg); err == nil {
+		if resp, perr := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body)); perr == nil {
+			defer resp.Body.Close()
+			return registrationResponse(resp)
+		}
+	}
+	if cfg.CarrierSOCKS != "" {
+		cl, base, err := carrierHTTP(cfg)
 		if err != nil {
 			return err
 		}
-		resp, perr := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body))
-		if perr != nil {
-			return perr
+		defer cl.CloseIdleConnections()
+		resp, err := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return err
 		}
 		defer resp.Body.Close()
 		return registrationResponse(resp)
 	}
-	if cl, base, err := panelHTTP(cfg); err == nil {
-		if resp, perr := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body)); perr == nil {
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusTooManyRequests {
-				return registrationResponse(resp)
-			}
-		}
+	if !cfg.AllowUntrustedBootstrap || ts.EverApproved(device.Fingerprint) {
+		return errors.New("registration requires a verified channel; use pinned TLS, a managed authenticated carrier or administrator-assisted enrollment")
 	}
+	log.Printf("WARNING: untrusted bootstrap explicitly enabled; administrator must independently verify this device's public key")
 	resp, err := plainHTTPClient().Post("https://"+cfg.SNIHost()+"/api/token/request", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -195,6 +196,7 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 		everApproved = ts.EverApproved(device.Fingerprint)
 	}
 	bootstrap := !everApproved && (*last == "" || *last == "pending" || *last == "expired")
+	bootstrap = bootstrap && cfg.AllowUntrustedBootstrap
 	status, kickReason, banReason, kickExpires, trusted, err := checkTokenStatus(cfg, device.Token, bootstrap)
 	if err != nil {
 		return // transient network error — keep the last known state
@@ -294,6 +296,19 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 	} else {
 		pinnedErr = perr
 	}
+	if cfg.CarrierSOCKS != "" {
+		cl, base, cerr := carrierHTTP(cfg)
+		if cerr == nil {
+			defer cl.CloseIdleConnections()
+			st, kr, br, ke, err := fetchStatus(cl, base, token, false)
+			if err == nil {
+				return st, kr, br, ke, true, nil
+			}
+			pinnedErr = err
+		} else {
+			pinnedErr = cerr
+		}
+	}
 	if allowPlainFallback {
 		// Bootstrap fallback (see checkOnce): system-trusted TLS so a
 		// new device can register and learn its approval on intercepted
@@ -324,7 +339,20 @@ func fetchStatus(cl *http.Client, base, token string, allowLegacyGet bool) (stat
 		return "", "", "", "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", "", "", "", nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", "", fmt.Errorf("control status returned HTTP %d", resp.StatusCode)
+	}
 	var res map[string]string
-	json.NewDecoder(resp.Body).Decode(&res)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<10)).Decode(&res); err != nil {
+		return "", "", "", "", errors.New("control status response is invalid")
+	}
+	switch res["status"] {
+	case "approved", "pending", "expired", "banned", "kicked":
+	default:
+		return "", "", "", "", errors.New("control status response has an unknown verdict")
+	}
 	return res["status"], res["kick_reason"], res["ban_reason"], res["kick_expires"], nil
 }

@@ -20,7 +20,7 @@ StateDirectory=opentunnel
 WorkingDirectory=/var/lib/opentunnel
 LimitNOFILE=16384
 Environment=TMPDIR=/var/lib/opentunnel
-EnvironmentFile=/etc/opentunnel/panel.env
+EnvironmentFile=-/etc/opentunnel/panel.env
 # Control plane must stay responsive when the relay is saturated:
 # high CPU weight and a nice score keep admin requests snappy.
 CPUWeight=900

@@ -4,8 +4,13 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
+
+var updateReplacement atomic.Bool
+
+func IsUpdateReplacement() bool { return updateReplacement.Load() }
 
 // WaitForUpdateParent runs before the replacement performs single-instance
 // detection. Without this handshake it could detect the still-running old
@@ -32,5 +37,6 @@ func WaitForUpdateParent(timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 45 * time.Second
 	}
+	updateReplacement.Store(true)
 	return waitParentExit(pid, timeout)
 }

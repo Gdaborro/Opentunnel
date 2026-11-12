@@ -91,7 +91,7 @@ export function Security() {
           </CardTitle>
           <CardDescription>
             Identity-based admission: every device authenticates with its own
-            per-device credential; posture is checked before access is granted
+            per-device key; telemetry is self-reported, not hardware attestation
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
@@ -310,7 +310,7 @@ export function Security() {
                 </TableCell>
                 <TableCell>
                   <Badge variant="secondary" className="bg-primary/15 text-primary">
-                    up to date
+                    reported version
                   </Badge>
                 </TableCell>
               </TableRow>
@@ -327,7 +327,7 @@ export function Security() {
                     </TableCell>
                     <TableCell>
                       <Badge variant="secondary" className="bg-primary/15 text-primary">
-                        auto-update armed
+                        self-reported
                       </Badge>
                     </TableCell>
                   </TableRow>

@@ -35,6 +35,9 @@ const (
 
 // ServeSOCKS5 accepts connections on ln until it closes.
 func ServeSOCKS5(ctx context.Context, ln net.Listener, d Dialer, logErr *log.Logger) {
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stop()
+	active := make(chan struct{}, 256)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -43,12 +46,20 @@ func ServeSOCKS5(ctx context.Context, ln net.Listener, d Dialer, logErr *log.Log
 			}
 			return
 		}
-		go handleSocks(ctx, conn, d, logErr)
+		select {
+		case active <- struct{}{}:
+			go func() { defer func() { <-active }(); handleSocks(ctx, conn, d, logErr) }()
+		default:
+			_ = conn.Close()
+		}
 	}
 }
 
 func handleSocks(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logger) {
 	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}
@@ -80,25 +91,29 @@ func handleSocks(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logge
 		return
 	}
 	if req[0] != socksVer || req[2] != 0x00 {
-		_, _ = conn.Write([]byte{socksVer, 0x01, 0x00})
+		_, _ = conn.Write([]byte{socksVer, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
+	addr, err := protocol.ReadAddress(conn)
+	if err != nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
 	switch req[1] {
 	case socksCmdConn:
 	case socksCmdUDP:
 		ud, ok := d.(UDPDialer)
 		if !ok {
-			_, _ = conn.Write([]byte{socksVer, 0x07, 0x00}) // command not supported
+			_, _ = conn.Write([]byte{socksVer, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			return
 		}
-		handleUDPAssociate(ctx, conn, ud, logErr)
+		handleUDPAssociate(ctx, conn, ud, addr, logErr)
 		return
 	default:
-		_, _ = conn.Write([]byte{socksVer, 0x07, 0x00}) // command not supported
+		_, _ = conn.Write([]byte{socksVer, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	addr, err := protocol.ReadAddress(conn)
-	if err != nil {
+	if addr.Port == 0 {
 		return
 	}
 	// ISP-level: try to dial first, so blocked/banned can be signaled
@@ -126,20 +141,6 @@ func handleSocks(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logge
 	_, _ = conn.Write([]byte{socksVer, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	defer up.Close()
 	Pipe(ctx, conn, up)
-}
-
-// ServeHTTPProxy serves HTTP CONNECT plus absolute-form requests.
-func ServeHTTPProxy(ctx context.Context, ln net.Listener, d Dialer, logErr *log.Logger) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) && logErr != nil {
-				logErr.Printf("http-proxy: accept: %v", err)
-			}
-			return
-		}
-		go handleHTTPOne(ctx, conn, d, logErr)
-	}
 }
 
 func isBlockedErr(err error) bool {
@@ -304,58 +305,4 @@ func serveHTTPBlockPage(conn net.Conn, addr *protocol.Address, err error) {
 	// For CONNECT (HTTPS) we send 403 with block page directly - browser will display it instead of doing TLS
 	// This avoids PR_CONNECT_RESET_ERROR and shows reason. No SSL error because we never do TLS.
 	_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " + fmt.Sprintf("%d", len(page)) + "\r\n\r\n" + page))
-}
-
-func handleHTTPOne(ctx context.Context, conn net.Conn, d Dialer, logErr *log.Logger) {
-	defer conn.Close()
-	req, err := httpReadRequest(conn)
-	if err != nil {
-		return
-	}
-	var addr *protocol.Address
-	if req.method == httpMethodConnect {
-		addr, err = authorityToAddr(req.target)
-	} else {
-		addr, err = absoluteURLToAddr(req)
-	}
-	if err != nil {
-		httpRespondError(conn, 400, "bad request")
-		return
-	}
-	if req.method == httpMethodConnect {
-		up, err := d.DialTunnel(ctx, addr)
-		if err != nil {
-			if isBlockedErr(err) {
-				// For CONNECT (usually TLS), just close - browser will show connection reset, but also try to serve block page via HTTP
-				// For better UX, close and let browser retry as HTTP block page
-				serveHTTPBlockPage(conn, addr, err)
-				logThrottled(logErr, "blocked:"+addr.String(), 60*time.Second, "http: blocked %s: %v", addr, err)
-				return
-			}
-			logThrottled(logErr, "tunnel:"+addr.String(), 60*time.Second, "http: tunnel %s: %v", addr, err)
-			return
-		}
-		_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
-		defer up.Close()
-		Pipe(ctx, conn, up)
-		return
-	}
-	// Absolute-form request: rewrite to origin-form and relay raw bytes.
-	up, err := d.DialTunnel(ctx, addr)
-	if err != nil {
-		if isBlockedErr(err) {
-			serveHTTPBlockPage(conn, addr, err)
-			logThrottled(logErr, "blocked:"+addr.String(), 60*time.Second, "http: blocked %s: %v", addr, err)
-			return
-		}
-		httpRespondError(conn, 502, "tunnel unavailable")
-		logThrottled(logErr, "tunnel:"+addr.String(), 60*time.Second, "http: tunnel %s: %v", addr, err)
-		return
-	}
-	defer up.Close()
-	line := req.method + " " + req.pathOnly() + " " + req.proto + "\r\n"
-	if _, err := io.WriteString(up, line+req.restOfHeaders()); err != nil {
-		return
-	}
-	Pipe(ctx, conn, up)
 }

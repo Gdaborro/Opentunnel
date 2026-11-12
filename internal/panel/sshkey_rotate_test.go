@@ -116,6 +116,10 @@ func TestRegistrationKeyRotation(t *testing.T) {
 	if state != "pending" {
 		t.Fatal("admin rekey must require approval, even with auto-approve enabled")
 	}
+	db.SetAutoAccept(60)
+	if res := postRegister(t, srv.URL, tok, "fp", dev, keyB); res["status"] != "pending" {
+		t.Fatal("public registration auto-approved an administrator rekey during the window")
+	}
 	raw, _ = os.ReadFile(akPath)
 	if bytes.Contains(raw, []byte(keyA)) || bytes.Contains(raw, []byte(keyB)) {
 		t.Fatal("rekey must revoke the old key without authorizing the new one yet")

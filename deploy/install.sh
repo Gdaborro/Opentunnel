@@ -21,11 +21,13 @@ if [ ! -f /etc/opentunnel/server.toml ]; then
   TOKEN="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   cat > /etc/opentunnel/server.toml <<EOF
 listen = ":$PORT"
+static_token_only = true # server-only installer; panel deployment provides per-device admission
 token = "$TOKEN"
 host = "$(hostname -f 2>/dev/null || echo localhost)"
 ws_path = "/ws"
 EOF
   chmod 600 /etc/opentunnel/server.toml
+  chown otu:otu /etc/opentunnel/server.toml
   echo "generated config with random token at /etc/opentunnel/server.toml"
 fi
 

@@ -48,6 +48,19 @@ func (h *Handler) apiServerHealth(w http.ResponseWriter, r *http.Request) {
 		"active_sessions":  metrics.ActiveSessions(),
 		"kill_switch":      h.db.KillSwitch(),
 	}
+	out["panel_version"] = version.Version
+	out["relay_online"] = false
+	if sample, at, err := h.db.RelayMetrics(); err == nil && time.Since(at) >= 0 && time.Since(at) < 30*time.Second {
+		out["version"], out["process_uptime_s"], out["goroutines"], out["heap_mb"], out["active_sessions"] = sample.Version, sample.UptimeS, sample.Goroutines, sample.HeapMB, sample.ActiveSessions
+		out["relay_online"] = true
+		out["metrics_age_s"] = int64(time.Since(at).Seconds())
+	} else {
+		out["version"] = ""
+		out["process_uptime_s"] = 0
+		out["goroutines"] = 0
+		out["heap_mb"] = 0
+		out["active_sessions"] = 0
+	}
 
 	if vm, err := mem.VirtualMemory(); err == nil {
 		out["mem_total_mb"] = vm.Total / (1024 * 1024)

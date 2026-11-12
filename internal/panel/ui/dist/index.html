@@ -4,19 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="robots" content="noindex, nofollow" />
-    <style>html{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}</style>
-    <title>otu â€” network operations</title>
-    <script type="module" crossorigin src="/admin/assets/index-DPQ4zBQb.js"></script>
-    <link rel="stylesheet" crossorigin href="/admin/assets/index-DgeNROgi.css">
+    <!-- No third-party fonts: every request the login page makes must stay
+         on-origin. Google Fonts + Unsplash told third parties an admin was
+         opening the panel, from which network, and that it exists. -->
+    <title>otu — network operations</title>
+    <style>
+      html { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    </style>
+    <script type="module" crossorigin src="/admin/assets/index-B2Rvg7Uw.js"></script>
+    <link rel="stylesheet" crossorigin href="/admin/assets/index-BiZwB74S.css">
   </head>
   <body>
     <div id="root"></div>
-    <!-- Kill-switch reason + allowlist controls, injected under the
-         Global Kill Switch card (runtime enhancement; see the file). -->
-    <script src="/admin/assets/killswitch-ui.js" defer></script>
-    <!-- SSH-tier containment controls (cap + daily budget + trickle),
-         injected above the Relay Configuration card (runtime
-         enhancement; see the file). -->
-    <script src="/admin/assets/ssh-tier-ui.js" defer></script>
   </body>
 </html>

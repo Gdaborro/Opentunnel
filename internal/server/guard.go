@@ -28,7 +28,7 @@ type Guard struct {
 
 // maxSessionsPerToken caps concurrent authenticated sessions per device
 // (loopback arrivals). 4 covers the mux pool's dial churn with room.
-const maxSessionsPerToken = 4
+const maxSessionsPerToken = 8
 
 type failRecord struct {
 	count    int
@@ -71,14 +71,17 @@ func (g *Guard) AcquireTokenSession(token string) (release func()) {
 	}
 	g.tokenActive[token]++
 	g.mu.Unlock()
+	var once sync.Once
 	return func() {
-		g.mu.Lock()
-		if n := g.tokenActive[token]; n <= 1 {
-			delete(g.tokenActive, token)
-		} else {
-			g.tokenActive[token] = n - 1
-		}
-		g.mu.Unlock()
+		once.Do(func() {
+			g.mu.Lock()
+			if n := g.tokenActive[token]; n <= 1 {
+				delete(g.tokenActive, token)
+			} else {
+				g.tokenActive[token] = n - 1
+			}
+			g.mu.Unlock()
+		})
 	}
 }
 
@@ -107,7 +110,15 @@ func addrHost(v any) string {
 // release==nil means denied (serve the decoy page instead).
 func (g *Guard) Acquire(ip string) (release func()) {
 	if isLoopbackIP(ip) {
-		return func() {}
+		// Loopback cannot be rate-limited by source identity (all forwarded
+		// peers share it), but must still consume the global setup budget.
+		select {
+		case g.total <- struct{}{}:
+			var once sync.Once
+			return func() { once.Do(func() { <-g.total }) }
+		default:
+			return nil
+		}
 	}
 	g.mu.Lock()
 	if until, banned := g.bans[ip]; banned {

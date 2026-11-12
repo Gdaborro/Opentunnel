@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/subtle"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"opentunnel/internal/metrics"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/server/decoy"
+	"opentunnel/internal/streamio"
 )
 
 // deadlineRW is the read-write stream contract for target relaying.
@@ -36,8 +38,17 @@ type deadlineRW interface {
 // isWebSocketUpgrade mirrors RFC 6455 handshake detection without relying on
 // a library helper.
 func isWebSocketUpgrade(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Connection"), "upgrade") &&
-		strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type Options struct {
@@ -110,6 +121,22 @@ type Options struct {
 	// with the panel reporter and the session guard; Handler() lazily
 	// creates one when unset (tests, direct construction).
 	Sntl *Sentinel
+	// SetupTimeout bounds every setup read, including the first mux mode
+	// byte. Zero uses 15 seconds; it never applies to a live data stream.
+	SetupTimeout                        time.Duration
+	InnerTLSCertificate                 *tls.Certificate
+	RequireInnerTLS                     bool
+	state                               *relayState
+	sessionBound                        bool
+	sessionGeneration, sessionPublicKey string
+	innerGeneration, innerPublicKey     string
+}
+
+func (o Options) setupTimeout() time.Duration {
+	if o.SetupTimeout > 0 {
+		return o.SetupTimeout
+	}
+	return 15 * time.Second
 }
 
 func (o *Options) guard() *Guard {
@@ -146,6 +173,7 @@ func Handler(opt Options) http.Handler {
 	// this copy, and main.go pre-seeds opt.Sntl so the HTTP error log
 	// (tlserr.go) reports into the same instance.
 	opt.EnsureSentinel()
+	opt.ensureState()
 	mux := http.NewServeMux()
 	path := opt.wsPath()
 	if path[0] != '/' {
@@ -162,6 +190,10 @@ func Handler(opt Options) http.Handler {
 		// the protocol over a streaming request — no WebSocket upgrade
 		// exists on that path. Same guard, same session machinery.
 		if r.ProtoMajor == 3 {
+			if r.Method != http.MethodPost {
+				decoyHandler.ServeHTTP(w, r)
+				return
+			}
 			release := opt.guard().Acquire(peerIP)
 			if release == nil {
 				opt.sentinel().GuardDenied(peerIP)
@@ -180,8 +212,14 @@ func Handler(opt Options) http.Handler {
 			// only flow after the dial returns. Headers first, then the
 			// session machinery reads from the request body.
 			w.WriteHeader(http.StatusOK)
+			controller := http.NewResponseController(w)
+			if err := controller.SetWriteDeadline(time.Now().Add(opt.setupTimeout())); err != nil {
+				return
+			}
 			if flusher != nil {
-				flusher.Flush()
+				if err := controller.Flush(); err != nil {
+					return
+				}
 			}
 			handleSession(&h3ServerConn{Reader: r.Body, Writer: w, Flusher: flusher}, opt, peerIP, ingress)
 			return
@@ -249,7 +287,10 @@ func (o Options) verifyHandshakeToken(tok string) byte {
 		// pending flow without further strikes.
 		return protocol.StatusBadToken
 	}
-	status, _, _, _ := o.PanelDB.CheckToken(tok)
+	status, _, _, err := o.PanelDB.CheckToken(tok)
+	if err != nil {
+		return protocol.StatusPending
+	}
 	switch status {
 	case "approved", "kicked": // kicked: grace + block page handled in-channel
 		return protocol.StatusOK
@@ -289,10 +330,16 @@ func verifyHandshakeSig(pubkeyAuthorized string, hs *protocol.Handshake) bool {
 // is the WithIngress marker ("" = public; IngressSSH = ssh transport).
 func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 	defer stream.Close()
+	opt.ensureState()
 	metrics.SessionStarted()
 	defer metrics.SessionEnded()
 
-	_ = stream.SetDeadline(time.Now().Add(15 * time.Second))
+	_ = stream.SetDeadline(time.Now().Add(opt.setupTimeout()))
+	secured, innerToken, err := opt.innerTLS(stream)
+	if err != nil {
+		return
+	}
+	stream = secured
 	hs, err := protocol.ReadHandshake(stream)
 	if err != nil {
 		var st byte = protocol.StatusBadVersion
@@ -308,13 +355,30 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 		return
 	}
 	status := opt.verifyHandshakeToken(hs.Token)
+	if innerToken != "" && hs.Token != innerToken {
+		return
+	}
 	// v5 proof-of-possession (audit round three, N-1/N-2): a session
 	// presenting a valid token must also prove possession of the device
 	// key registered for it. Peers without a key on file (ancient
 	// registrations) pass with a log line — all panel-era registrations
 	// carry the key.
 	if status == protocol.StatusOK && opt.PanelDB != nil {
-		pub := opt.PanelDB.SSHPubKey(hs.Token)
+		p, perr := opt.readPolicy(hs.Token)
+		if perr != nil {
+			_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusPending)
+			return
+		}
+		if p.Status != "approved" && p.Status != "kicked" {
+			_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusPending)
+			return
+		}
+		pub := p.PublicKey
+		if innerToken != "" && (p.Generation != opt.innerGeneration || pub != opt.innerPublicKey) {
+			return
+		}
+		opt.sessionBound = true
+		opt.sessionGeneration, opt.sessionPublicKey = p.Generation, pub
 		if pub == "" && !opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After) {
 			// The migration deadline applies to keyless legacy rows too.
 			// A v5 version byte without a registered verification key is
@@ -344,7 +408,7 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 			// to survive by downgrading. Keyless and never-v5 peers stay
 			// admitted (migration window, auto-closing per identity).
 			enforce := pub != ""
-			if enforce && !opt.PanelDB.V5Seen(hs.Token) {
+			if enforce && !p.V5Seen {
 				// Not yet upgraded: only a passed enforcement date can
 				// demand v5 now.
 				enforce = !opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After)
@@ -372,15 +436,13 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 	}
 	authTok := hs.Token
 
-	// Loopback arrivals are the ssh tier's forward path, exempt from the
-	// per-IP caps — bound them per identity instead.
-	if isLoopbackIP(peerIP) {
-		releaseTok := opt.guard().AcquireTokenSession(authTok)
-		if releaseTok == nil {
-			return // over the per-identity session cap
-		}
-		defer releaseTok()
+	// Identity caps apply on EVERY carrier, not just loopback forwarding.
+	releaseTok := opt.guard().AcquireTokenSession(authTok)
+	if releaseTok == nil {
+		opt.logger().Printf("server: authenticated session cap reached for %s", shortToken(authTok))
+		return
 	}
+	defer releaseTok()
 
 	// v5 carries the salt inside the handshake; v4 sends it right after.
 	salt := hs.Salt
@@ -399,11 +461,6 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 		opt.logger().Printf("server: replayed session salt ??? dropped")
 		return
 	}
-
-	// Handshake phase over: lift the 15 s guard. Left armed, it would apply
-	// to the whole session lifetime and kill every tunnel (and every long
-	// download) 15 s after accept.
-	_ = stream.SetDeadline(time.Time{})
 
 	// AEAD keys derive from the handshake token: the per-device token in
 	// panel mode (per-device keys), the master token in legacy mode.
@@ -437,7 +494,11 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 	var peerStatus = "approved"
 	var peerReason string
 	if opt.PanelDB != nil {
-		status, reason, kickExpires, _ := opt.PanelDB.CheckToken(clientToken)
+		status, reason, kickExpires, checkErr := opt.PanelDB.CheckToken(clientToken)
+		if checkErr != nil {
+			_ = protocol.WriteToken(sec, "pending")
+			return
+		}
 		switch status {
 		case "banned":
 			_ = protocol.WriteToken(sec, "banned:"+reason)
@@ -453,9 +514,12 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 			if strings.HasPrefix(reason, "silent:") {
 				peerStatus = "kicked-silent"
 			}
-		default:
+		case "approved":
 			_ = protocol.WriteToken(sec, "ok")
 			peerStatus = "approved"
+		default:
+			_ = protocol.WriteToken(sec, "pending")
+			return
 		}
 		go opt.PanelDB.RecordTraffic(clientToken, 0, 0)
 	} else {
@@ -483,6 +547,16 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 	if _, err := io.ReadFull(sec, mode); err != nil {
 		return
 	}
+	// Only now is setup complete. Clearing this before the inner token or
+	// mode read let authenticated peers park a session indefinitely.
+	_ = stream.SetDeadline(time.Time{})
+	if mode[0] != protocol.MuxMarker {
+		release := opt.acquireStream(clientToken)
+		if release == nil {
+			return
+		}
+		defer release()
+	}
 	switch mode[0] {
 	case protocol.MuxMarker:
 		opt.serveMuxSession(sec, clientToken, peerStatus, peerReason, hs.Version, ingress)
@@ -500,48 +574,20 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 // stream and its bytes count against the device's daily ssh budget.
 func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerReason string, ver byte, ingress string) {
 	defer rw.Close()
+	opt.ensureState()
 	// Setup-phase deadline (1.0.1): target parsing + upstream dial must
 	// finish within 15s or the stream is abandoned — an authenticated peer
 	// could otherwise park streams forever holding mux stream slots and
 	// the per-session semaphore while sending nothing. Lifted once the
 	// relay is connected; no data-phase deadlines (long transfers must
 	// never be guillotined — TestRelaySurvivesSlowTransfer).
-	_ = rw.SetDeadline(time.Now().Add(15 * time.Second))
-	// Global kill switch: block every new stream while suspended — except
-	// the operator's allowlisted devices. The wire reason carries the
-	// "down:" prefix and the admin's text, so the client renders the
-	// traffic-down page with that exact message on every site.
-	if opt.PanelDB != nil && opt.PanelDB.KillSwitch() && !opt.PanelDB.KillSwitchAllow(token) {
-		_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
-		reason := strings.TrimSpace(opt.PanelDB.KillSwitchReason())
+	_ = rw.SetDeadline(time.Now().Add(opt.setupTimeout()))
+	if _, denied, reason := opt.freshDataPolicy(token, peerStatus); denied != "" {
 		if reason == "" {
-			reason = "shut down till further notice"
+			reason = peerReason
 		}
-		_ = protocol.WriteToken(rw, "blocked:down:"+reason)
+		writeBlocked(rw, ver, denied, reason)
 		return
-	}
-	// ISP-level ban/kick handling. With a panel, re-check the LIVE verdict
-	// (1s cache) instead of the session-start snapshot: a device banned or
-	// over quota mid-session used to keep opening streams indefinitely
-	// (1.0.1). Without a panel, the handshake verdict is all there is.
-	if status, reason, _, ok := opt.currentVerdict(token); ok {
-		if status == "banned" || status == "kicked" {
-			writeBlocked(rw, ver, status, reason)
-			return
-		}
-	} else {
-		switch peerStatus {
-		case "banned":
-			writeBlocked(rw, ver, "banned", peerReason)
-			return
-		case "kicked":
-			writeBlocked(rw, ver, "kicked", peerReason)
-			return
-		case "kicked-silent":
-			_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
-			_ = protocol.WriteToken(rw, "kicked-silent")
-			return
-		}
 	}
 
 	target, err := protocol.ReadAddressWithATYP(atyp, rw)
@@ -593,6 +639,10 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 		return
 	}
 	defer upstream.Close()
+	if _, denied, reason := opt.freshDataPolicy(token, peerStatus); denied != "" {
+		writeBlocked(rw, ver, denied, reason)
+		return
+	}
 
 	if err := protocol.WriteTargetResponse(rw, ver, protocol.StatusOK); err != nil {
 		return
@@ -603,53 +653,13 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	_ = rw.SetDeadline(time.Time{})
 	_ = upstream.(*net.TCPConn).SetNoDelay(true)
 
-	// 256 KiB copy buffers keep syscalls (and per-frame overhead) low on
-	// high-BDP paths; both directions must finish before teardown.
-	buf1 := make([]byte, 256*1024)
-	buf2 := make([]byte, 256*1024)
-
-	// Per-device bandwidth cap (QoS) + ssh-tier containment: one shared
-	// token bucket paces both directions of this stream. 0 = unlimited.
-	// On ssh ingress the policy adds the sustained ceiling and, once the
-	// device's daily ssh budget is spent, the post-budget trickle rate —
-	// bulk stops reading as a media feed without bricking browsing.
-	pol := resolveStreamPolicy(opt, token, ingress)
-	var dst1, dst2 io.Writer = upstream, rw
-	if pol.limitBps > 0 {
-		burst := int(pol.limitBps)
-		if burst < len(buf1) {
-			burst = len(buf1)
-		}
-		lim := rate.NewLimiter(rate.Limit(pol.limitBps), burst)
-		dst1 = &limitedWriter{w: upstream, lim: lim}
-		dst2 = &limitedWriter{w: rw, lim: lim}
-		if ingress == IngressSSH {
-			// Shape mimicry (segment.go): bulk on the ssh tier drains in
-			// segment-sized bursts with jittered gaps — a streaming
-			// player's fetch cadence, not a flat line-rate feed.
-			sp := defaultSegmentParams()
-			dst1 = newSegmentShaper(dst1, pol.limitBps, sp)
-			dst2 = newSegmentShaper(dst2, pol.limitBps, sp)
-		}
-	}
-
-	var n1, n2 int64
-	done := make(chan struct{}, 2)
-	go func() {
-		n1, _ = io.CopyBuffer(dst1, rw, buf1)
-		done <- struct{}{}
-	}()
-	go func() {
-		n2, _ = io.CopyBuffer(dst2, upstream, buf2)
-		done <- struct{}{}
-	}()
-	<-done
-	<-done
-	if opt.PanelDB != nil && token != "" {
+	ctx, stopWatch := opt.watchData(token, peerStatus, func() { _ = rw.Close(); _ = upstream.Close() })
+	defer stopWatch()
+	up := &trafficConn{ReadWriteCloser: upstream, o: opt, ctx: ctx, token: token, status: peerStatus, ingress: ingress}
+	down := &trafficConn{ReadWriteCloser: rw, o: opt, ctx: ctx, token: token, status: peerStatus, ingress: ingress, down: true}
+	n1, n2, _ := streamio.Pipe(ctx, down, up)
+	if _, durable := opt.PanelDB.(trafficStore); !durable && opt.PanelDB != nil && token != "" {
 		opt.PanelDB.RecordTraffic(token, n1, n2)
-	}
-	if pol.budgetBytes > 0 {
-		sshBudgetAdd(token, n1+n2)
 	}
 }
 
@@ -707,6 +717,12 @@ func (o Options) serveMuxSession(sec io.ReadWriteCloser, token, peerStatus, peer
 		}
 		go func(s *smux.Stream) {
 			defer func() { <-sem; s.Close() }()
+			release := o.acquireStream(token)
+			if release == nil {
+				return
+			}
+			defer release()
+			_ = s.SetDeadline(time.Now().Add(o.setupTimeout()))
 			atyp := make([]byte, 1)
 			if _, err := io.ReadFull(s, atyp); err != nil {
 				return

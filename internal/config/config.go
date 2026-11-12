@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -10,19 +11,27 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"opentunnel/internal/netutil"
 )
 
 type Server struct {
-	Listen         string `toml:"listen"`          // e.g. ":443"
-	ListenAlt      string `toml:"listen_alt"`      // optional extra TLS port sharing cert/handler
-	ListenInternal string `toml:"listen_internal"` // optional PLAIN ws listener bound to loopback (for the ssh transport)
-	Token          string `toml:"token"`           // shared secret; generate with a password manager
-	CertFile       string `toml:"cert_file"`
-	KeyFile        string `toml:"key_file"`
-	AcmeDomain     string `toml:"acme_domain"`  // optional: obtain/renew a public LE cert (TLS-ALPN)
-	WSPath         string `toml:"ws_path"`      // default "/ws"
-	Host           string `toml:"host"`         // public hostname, used for self-signed CN
-	AutoApprove    bool   `toml:"auto_approve"` // new device registrations start approved (no manual gate)
+	Listen                string `toml:"listen"`                  // e.g. ":443"
+	ListenAlt             string `toml:"listen_alt"`              // optional extra TLS port sharing cert/handler
+	ListenInternal        string `toml:"listen_internal"`         // optional PLAIN ws listener bound to loopback (for the ssh transport)
+	ListenCarrierInternal string `toml:"listen_carrier_internal"` // opt-in managed-carrier ingress; loopback only
+	StaticTokenOnly       bool   `toml:"static_token_only"`       // explicit legacy/lab mode, never a DB-failure fallback
+	H3                    *bool  `toml:"h3"`                      // default true; bound to the configured TCP listener's host
+	InnerTLSCertFile      string `toml:"inner_tls_cert"`
+	InnerTLSKeyFile       string `toml:"inner_tls_key"`
+	RequireInnerTLS       bool   `toml:"require_inner_tls"`
+	Token                 string `toml:"token"` // shared secret; generate with a password manager
+	CertFile              string `toml:"cert_file"`
+	KeyFile               string `toml:"key_file"`
+	AcmeDomain            string `toml:"acme_domain"`  // optional: obtain/renew a public LE cert (TLS-ALPN)
+	WSPath                string `toml:"ws_path"`      // default "/ws"
+	Host                  string `toml:"host"`         // public hostname, used for self-signed CN
+	AutoApprove           bool   `toml:"auto_approve"` // new device registrations start approved (no manual gate)
 	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
 	// private, link-local/metadata, CGNAT). Default false.
 	AllowRestrictedTargets bool `toml:"allow_restricted_targets"`
@@ -82,15 +91,21 @@ type ClientConf struct {
 	// Fingerprints are additional accepted SHA-256 pins: the leaf changes
 	// at every Let's Encrypt renewal, and pins learned in-band from the
 	// relay rejoin here after restarts.
-	Fingerprints []string `toml:"fingerprints"`
-	Insecure     bool     `toml:"insecure"` // dev only
-	WSPath       string   `toml:"ws_path"`
-	Transport    string   `toml:"transport"`     // wstls (default) | ssh
-	SSHUser      string   `toml:"ssh_user"`      // for transport="ssh"
-	SSHKey       string   `toml:"ssh_key"`       // path to private key
-	SSHPort      string   `toml:"ssh_port"`      // default "22"
-	SSHInternal  string   `toml:"ssh_internal"`  // loopback ws target on VPS, e.g. 127.0.0.1:8081
-	SSHHostKeys  string   `toml:"ssh_host_keys"` // comma-separated SHA256:<b64> host-key pins for the ssh tier
+	Fingerprints            []string       `toml:"fingerprints"`
+	Insecure                bool           `toml:"insecure"` // dev only
+	WSPath                  string         `toml:"ws_path"`
+	Transport               string         `toml:"transport"`      // wstls (default) | ssh
+	CarrierSOCKS            string         `toml:"carrier_socks"`  // external managed companion, loopback only
+	CarrierTarget           string         `toml:"carrier_target"` // fixed remote loopback ingress
+	Reality                 *RealityClient `toml:"reality"`
+	InnerTLSPins            []string       `toml:"inner_tls_pins"`            // opt-in independent relay SPKI SHA-256 pins
+	AllowUntrustedBootstrap bool           `toml:"allow_untrusted_bootstrap"` // recovery-only; verify enrollment independently
+	AllowNonLoopbackProxy   bool           `toml:"allow_non_loopback_proxy"`  // opt-in to exposing unauthenticated listeners
+	SSHUser                 string         `toml:"ssh_user"`                  // for transport="ssh"
+	SSHKey                  string         `toml:"ssh_key"`                   // path to private key
+	SSHPort                 string         `toml:"ssh_port"`                  // default "22"
+	SSHInternal             string         `toml:"ssh_internal"`              // loopback ws target on VPS, e.g. 127.0.0.1:8081
+	SSHHostKeys             string         `toml:"ssh_host_keys"`             // comma-separated SHA256:<b64> host-key pins for the ssh tier
 	// SSHDialHostOverride is a direct hostname for the ssh tier to dial
 	// (empty = derive from server_addr). Needed once the tunnel domain is
 	// CDN-fronted — CDNs do not proxy port 22, so the ssh tier must dial a
@@ -126,6 +141,16 @@ type ClientConf struct {
 	BypassList []string `toml:"bypass_list"` // extra ProxyOverride entries
 	AutoUpdate *bool    `toml:"auto_update"` // default true: self-update from GitHub Releases
 	HostileSSH *bool    `toml:"hostile_ssh"` // default true: allow the SSH last-resort tier on TLS-intercepting networks
+}
+
+// RealityClient explicitly opts into managing a separately provisioned Xray
+// executable. ProfilePath contains carrier credentials and stays private.
+type RealityClient struct {
+	Enabled     bool   `toml:"enabled"`
+	Executable  string `toml:"executable"`
+	SHA256      string `toml:"sha256"`
+	ProfilePath string `toml:"profile"`
+	SOCKSListen string `toml:"socks_listen"`
 }
 
 // SSHHostKeyPins splits ssh_host_keys into individual pins.
@@ -175,6 +200,9 @@ func (c *ClientConf) SSHHostOnly() string {
 
 // TransportKind returns "wstls" unless explicitly set to "ssh".
 func (c *ClientConf) TransportKind() string {
+	if c.Transport == "carrier" {
+		return "carrier"
+	}
 	if c.Transport == "ssh" {
 		return "ssh"
 	}
@@ -259,8 +287,29 @@ func LoadServer(path string) (*Server, error) {
 	if s.Listen == "" {
 		s.Listen = ":443"
 	}
-	if s.Token == "" {
+	if (s.StaticTokenOnly || s.AllowLegacyMaster) && (len(s.Token) < 16 || strings.HasPrefix(s.Token, "CHANGE_ME")) {
 		return nil, fmt.Errorf("config: server token is required")
+	}
+	for _, addr := range []string{s.ListenInternal, s.ListenCarrierInternal} {
+		if addr != "" {
+			if err := netutil.LoopbackEndpoint(addr); err != nil {
+				return nil, fmt.Errorf("config: internal listener: %w", err)
+			}
+		}
+	}
+	if s.ListenInternal != "" && s.ListenInternal == s.ListenCarrierInternal {
+		return nil, fmt.Errorf("config: internal listeners must use different ports")
+	}
+	if strings.TrimSpace(s.RequireV5After) != "" && s.RequireV5Time().IsZero() {
+		return nil, fmt.Errorf("config: invalid require_v5_after; enforcement date was not applied")
+	}
+	if (s.InnerTLSCertFile == "") != (s.InnerTLSKeyFile == "") || (s.RequireInnerTLS && s.InnerTLSCertFile == "") {
+		return nil, fmt.Errorf("config: inner TLS requires both certificate and private key")
+	}
+	for _, field := range []*string{&s.InnerTLSCertFile, &s.InnerTLSKeyFile} {
+		if *field != "" && !filepath.IsAbs(*field) {
+			*field = filepath.Join(filepath.Dir(path), *field)
+		}
 	}
 	return &s, nil
 }
@@ -286,12 +335,81 @@ func LoadClient(path string) (*ClientConf, error) {
 	if c.SOCKSAddr == "" && c.HTTPAddr == "" {
 		c.SOCKSAddr = "127.0.0.1:1080"
 	}
+	for _, addr := range []string{c.SOCKSAddr, c.HTTPAddr} {
+		if addr != "" && !c.AllowNonLoopbackProxy {
+			if err := netutil.LoopbackEndpoint(addr); err != nil {
+				return nil, fmt.Errorf("config: local proxy: %w", err)
+			}
+		}
+	}
+	if c.SOCKSAddr != "" && c.SOCKSAddr == c.HTTPAddr {
+		return nil, fmt.Errorf("config: SOCKS and HTTP listeners must use different ports")
+	}
+	switch c.Transport {
+	case "", "wstls", "ssh", "carrier":
+	default:
+		return nil, fmt.Errorf("config: unknown transport %q", c.Transport)
+	}
+	if c.CarrierSOCKS != "" {
+		if err := netutil.LoopbackEndpoint(c.CarrierSOCKS); err != nil {
+			return nil, fmt.Errorf("config: carrier_socks: %w", err)
+		}
+		if c.CarrierTarget == "" {
+			c.CarrierTarget = "127.0.0.1:8082"
+		}
+		if err := netutil.LoopbackEndpoint(c.CarrierTarget); err != nil {
+			return nil, fmt.Errorf("config: carrier_target: %w", err)
+		}
+		if c.CarrierSOCKS == c.SOCKSAddr || c.CarrierSOCKS == c.HTTPAddr {
+			return nil, fmt.Errorf("config: external carrier must not loop through this client's own proxy")
+		}
+	}
+	if c.Reality != nil && c.Reality.Enabled {
+		if c.CarrierSOCKS != "" {
+			return nil, fmt.Errorf("config: choose managed REALITY or external carrier_socks, not both")
+		}
+		if c.Reality.Executable == "" || c.Reality.ProfilePath == "" || len(c.Reality.SHA256) != 64 {
+			return nil, fmt.Errorf("config: managed REALITY needs executable, SHA-256 and private profile")
+		}
+		if c.Reality.SOCKSListen == "" {
+			c.Reality.SOCKSListen = "127.0.0.1:19090"
+		}
+		if err := netutil.LoopbackEndpoint(c.Reality.SOCKSListen); err != nil {
+			return nil, fmt.Errorf("config: reality.socks_listen: %w", err)
+		}
+		if c.Reality.SOCKSListen == c.SOCKSAddr || c.Reality.SOCKSListen == c.HTTPAddr {
+			return nil, fmt.Errorf("config: REALITY listener cannot share the client proxy port")
+		}
+		if digest, err := hex.DecodeString(c.Reality.SHA256); err != nil || len(digest) != 32 {
+			return nil, fmt.Errorf("config: reality.sha256 must be a valid digest")
+		}
+		for _, field := range []*string{&c.Reality.Executable, &c.Reality.ProfilePath} {
+			if !filepath.IsAbs(*field) {
+				*field = filepath.Join(filepath.Dir(path), *field)
+			}
+		}
+	}
+	if c.Transport == "carrier" && c.CarrierSOCKS == "" && (c.Reality == nil || !c.Reality.Enabled) {
+		return nil, fmt.Errorf("config: carrier transport requires carrier_socks")
+	}
+	for _, value := range c.InnerTLSPins {
+		if pin, err := hex.DecodeString(value); err != nil || len(pin) != 32 {
+			return nil, fmt.Errorf("config: invalid inner TLS public-key pin")
+		}
+	}
+	if len(c.InnerTLSPins) > 8 {
+		return nil, fmt.Errorf("config: inner TLS pin set too large")
+	}
 	return &c, nil
 }
 
 func WriteServerTemplate(path string) error {
 	t := `# opentunnel server configuration
 listen = ":443"
+# static_token_only = false # explicit legacy mode, not recommended for a device fleet
+# listen_internal = "127.0.0.1:8081"
+# listen_carrier_internal = "127.0.0.1:8082" # disabled unless explicitly configured
+# h3 = true
 # Generate a long random secret and use the SAME value in the client config:
 token = "CHANGE_ME_LONG_RANDOM_SECRET"
 # Leave empty to auto-generate a self-signed certificate (printed at startup).
@@ -382,6 +500,12 @@ http_addr = "127.0.0.1:18080"
 # WinINET ProxyOverride (loop protection is built into the client itself:
 # targets matching a configured entry dial direct instead of tunneling).
 bypass_list = []
+# Optional externally managed authenticated carrier. No process is downloaded
+# or launched automatically; configure and verify the companion independently.
+# carrier_socks = "127.0.0.1:19090"
+# carrier_target = "127.0.0.1:8082"
+# allow_untrusted_bootstrap = false
+# allow_non_loopback_proxy = false
 `
 
 // WriteDefaultClientConfig writes DefaultClientTOML to path (0600).
@@ -422,6 +546,10 @@ ech = true
 socks_addr = "127.0.0.1:1080"
 http_addr = "127.0.0.1:8118"
 bypass_list = ["*.internal.example.com"]
+# carrier_socks = "127.0.0.1:19090"
+# carrier_target = "127.0.0.1:8082"
+# allow_untrusted_bootstrap = false
+# allow_non_loopback_proxy = false
 `
 	return writeFile(path, t)
 }

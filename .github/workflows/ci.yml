@@ -1,11 +1,46 @@
 name: ci
 
+permissions:
+  contents: read
+
 on:
   push:
-    branches: [main]
+    branches: [main, "review/hardening-reality-*"]
   pull_request:
 
 jobs:
+  companion:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: companions/xray/go.mod
+          cache-dependency-path: companions/xray/go.sum
+      - run: go mod verify
+        working-directory: companions/xray
+      - run: go vet ./...
+        working-directory: companions/xray
+      - run: go test -race -timeout 180s ./...
+        working-directory: companions/xray
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        working-directory: companions/xray
+      - name: build isolated REALITY test companion
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'otu-xray-lab'
+          if ($IsWindows) { $target += '.exe' }
+          Push-Location companions/xray
+          try { go build -buildvcs=false -trimpath -o $target . } finally { Pop-Location }
+          if ($LASTEXITCODE -ne 0) { throw 'Companion build failed' }
+          "OTU_TEST_XRAY=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: authenticated REALITY confinement and supervision
+        run: go test -race -count=1 -timeout 180s ./internal/reality
+
   test:
     strategy:
       fail-fast: false
@@ -13,12 +48,14 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: "go.mod"
       - name: vet
         run: go vet ./...
+      - name: module integrity
+        run: go mod verify
       - name: gofmt check
         run: |
           OUT=$(gofmt -l .)
@@ -28,15 +65,34 @@ jobs:
         run: go test -race -timeout 300s ./...
       - name: govulncheck
         run: |
-          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
         if: runner.os == 'Linux'
 
-  build:
-    needs: test
+  frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: panel-ui/package-lock.json
+      - run: npm ci --ignore-scripts --no-fund
+        working-directory: panel-ui
+      - run: npm audit --audit-level=low
+        working-directory: panel-ui
+      - run: pwsh -File scripts/build-panel.ps1 -SkipInstall -NoBackup
+      - name: embedded SPA matches source build
+        run: |
+          git diff --exit-code -- internal/panel/ui/dist
+          test -z "$(git ls-files --others --exclude-standard internal/panel/ui/dist)"
+
+  build:
+    needs: [test, frontend, companion]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: "go.mod"
       - name: repro metadata
@@ -50,11 +106,28 @@ jobs:
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-server-linux-amd64 ./cmd/otu-server
           CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-server-linux-arm64 ./cmd/otu-server
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-panel-linux-amd64 ./cmd/otu-panel
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-windows-amd64.exe ./cmd/otu-reality
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-linux-amd64 ./cmd/otu-reality
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-linux-arm64 ./cmd/otu-reality
+      - name: reproducible restricted companion cross-builds
+        working-directory: companions/xray
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o ../../dist/otu-xray-windows-amd64.exe .
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o ../../dist/otu-xray-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o ../../dist/otu-xray-linux-arm64 .
+          cp README.md ../../dist/SOURCE-AND-LICENSE-NOTICE-XRAY.md
+      - name: companion artifact vulnerability gate
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary dist/otu-xray-linux-amd64
+      - name: host artifact vulnerability gate
+        run: |
+          for asset in dist/otu-client-windows-amd64.exe dist/otu-server-linux-amd64 dist/otu-panel-linux-amd64; do
+            go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "$asset"
+          done
       - name: SBOM (module inventory)
         run: |
           go version -m dist/otu-client-windows-amd64.exe | sed 's/\t/ /g' > dist/SBOM-otu-client.txt
           go version -m dist/otu-server-linux-amd64 | sed 's/\t/ /g' > dist/SBOM-otu-server.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: opentunnel-binaries
           path: dist/

@@ -30,12 +30,15 @@ sudo systemctl restart otu-panel.service
 
 Panel DB backups live at `/var/lib/opentunnel/panel.db.bak-<timestamp>`
 (consistent sqlite backups; verify with `PRAGMA quick_check` before use).
-Restore (stops panel, swaps DB, restarts):
+Restore only after stopping **both** database writers (panel and relay). Use a
+consistent SQLite backup, preserve the current DB/WAL/SHM files, and do not copy
+an old DB over active WAL state. The commands below are illustrative; verify
+the exact backup and stop every writer before carrying out a restore.
 
 ```sh
-sudo systemctl stop otu-panel.service
+sudo systemctl stop opentunnel.service otu-panel.service
 sudo cp /var/lib/opentunnel/panel.db.bak-<ts> /var/lib/opentunnel/panel.db
-sudo systemctl start otu-panel.service
+sudo systemctl start opentunnel.service otu-panel.service
 ```
 
 ## Server config
@@ -54,9 +57,11 @@ regardless, so config rollback alone never breaks new clients.
 
 ## Client binary (field devices)
 
-- Auto-update is self-rolling-back: SHA-256 mismatch or install failure
-  restores the previous exe in place (rename-swap with rollback in
-  `internal/client/update.go`).
+- Signature/hash/version-preflight failures leave the current executable
+  untouched. The unreleased helper checks replacement readiness/stability and
+  verifies rollback to the previous executable, with next-start recovery after
+  interruption. Keep the recovery journal/backups when automatic restoration
+  fails. See `docs/UPDATE-TRANSACTION.md`; real-device acceptance remains required.
 - Manual rollback: run `stop-otu.bat`, then put the previous exe back next
   to the config (keep `otu-client-pre-stealth.exe` or a versioned copy).
   The updater only replaces the binary it runs from, so an old exe stays on
@@ -80,5 +85,8 @@ revert commits.
   `%LOCALAPPDATA%\opentunnel\settings-snapshots\<date>\`
 - User restore kit (device identity, keys, config):
   `Downloads\opentunnel\settings-backup\` + `restore-settings.bat`
-- System proxy is restored on every client exit path (signal, crash,
-  panic shield, `--restore`, terminal-handler).
+- Normal exit/terminal handlers restore journaled settings; failed writes keep
+  their journal. A separate recovery helper and next-start recovery cover
+  crashes where the OS allows them to run. `--restore-from` is an explicit
+  force-restore path after reviewing conflicts, not automatic permission to
+  overwrite another application's active settings.

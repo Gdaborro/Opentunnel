@@ -24,6 +24,22 @@ func deviceFingerprint() string {
 }
 
 func isRegistryBanned() bool {
+	return banState.Banned()
+}
+func writeRegistryBan(reason, duration string) { banState.Write(reason, duration) }
+func clearRegistryBan()                        { banState.Clear() }
+
+type banBackend interface {
+	Banned() bool
+	Write(string, string)
+	Clear()
+}
+
+var banState banBackend = windowsBanBackend{}
+
+type windowsBanBackend struct{}
+
+func (windowsBanBackend) Banned() bool {
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\OpenTunnel`, registry.QUERY_VALUE)
 	if err != nil {
 		return false
@@ -33,7 +49,7 @@ func isRegistryBanned() bool {
 	return err == nil
 }
 
-func writeRegistryBan(reason, duration string) {
+func (windowsBanBackend) Write(reason, duration string) {
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\OpenTunnel`, registry.SET_VALUE)
 	if err != nil {
 		return
@@ -44,7 +60,7 @@ func writeRegistryBan(reason, duration string) {
 }
 
 // clearRegistryBan removes the registry half of a hard ban (best effort).
-func clearRegistryBan() {
+func (windowsBanBackend) Clear() {
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\OpenTunnel`, registry.SET_VALUE)
 	if err != nil {
 		return

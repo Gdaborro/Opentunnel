@@ -161,7 +161,7 @@ func TestDetectRegBurst(t *testing.T) {
 
 // TestSentinelTickTravelKicks: a travel hit alerts and (respond mode)
 // auto-kicks; a second tick inside the throttle window does nothing.
-func TestSentinelTickTravelKicks(t *testing.T) {
+func TestCountryChangeAlertsWithoutAutomaticKick(t *testing.T) {
 	db := sentinelTestDB(t)
 	seedPeer(t, db, "tick-token-123456789", "approved")
 	db.Exec(`INSERT INTO peer_ips(token,ip,at) VALUES('tick-token-123456789','203.0.113.5',datetime('now','-20 minutes'))`)
@@ -171,17 +171,17 @@ func TestSentinelTickTravelKicks(t *testing.T) {
 
 	var status string
 	db.QueryRow(`SELECT status FROM peers WHERE token='tick-token-123456789'`).Scan(&status)
-	if status != "kicked" {
-		t.Fatalf("respond mode must auto-kick the traveling device, status=%q", status)
+	if status != "approved" {
+		t.Fatalf("country-only inference must not kick a device, status=%q", status)
 	}
 	var alerts int
-	db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE kind='sentinel' AND severity='critical'`).Scan(&alerts)
+	db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE kind='sentinel' AND severity='warning'`).Scan(&alerts)
 	if alerts != 1 {
 		t.Fatalf("want 1 travel alert, got %d", alerts)
 	}
 	// Throttled: another tick must not duplicate anything.
 	db.SentinelTick(fakeCountry)
-	db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE kind='sentinel' AND severity='critical'`).Scan(&alerts)
+	db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE kind='sentinel' AND severity='warning'`).Scan(&alerts)
 	if alerts != 1 {
 		t.Fatalf("second tick must be throttled, got %d alerts", alerts)
 	}

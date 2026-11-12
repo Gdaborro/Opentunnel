@@ -1,0 +1,10 @@
+*.go text eol=lf
+*.sh text eol=lf
+*.service text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+*.md text eol=lf
+# Preserve byte-for-byte Vite output. Some generated template strings contain
+# whitespace-only lines; source whitespace checks remain enabled everywhere else.
+internal/panel/ui/dist/assets/*.js whitespace=-blank-at-eol

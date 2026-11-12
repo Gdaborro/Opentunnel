@@ -251,8 +251,19 @@ type wsConn struct {
 }
 
 func (c *wsConn) Close() error {
+	// websocket.NetConn.Close cancels its active readers/writers before
+	// starting the close handshake. A cancellation race can tear down a
+	// forwarded socket without delivering the peer close frame. Start the
+	// WebSocket handshake first while those contexts are alive.
+	if c.wsc != nil {
+		err := c.wsc.Close(websocket.StatusNormalClosure, "")
+		_ = c.Conn.Close()
+		return err
+	}
 	err := c.Conn.Close()
-	c.close()
+	if c.close != nil {
+		c.close()
+	}
 	return err
 }
 

@@ -269,6 +269,9 @@ func (h *HealthReporter) reportWithContext(parent context.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := SignHTTPRequest(req, body); err != nil {
+		return
+	}
 	resp, err := cl.Do(req)
 	if err != nil {
 		if !h.lastFail {

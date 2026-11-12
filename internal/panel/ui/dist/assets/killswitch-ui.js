@@ -35,7 +35,7 @@
     fetch("/admin/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kill_switch: state.kill, kill_switch_reason: reason, kill_switch_allow: allow }),
+      body: JSON.stringify({ kill_switch_reason: reason, kill_switch_allow: allow }),
     }).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       if (msgEl) { msgEl.textContent = "saved"; setTimeout(function () { msgEl.textContent = ""; }, 3000); }

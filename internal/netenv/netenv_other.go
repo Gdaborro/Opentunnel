@@ -2,16 +2,6 @@
 
 package netenv
 
-import "errors"
-
-// Manager is a no-op outside Windows; per-user system proxy management is a
-// Windows-specific feature. Other platforms configure browsers manually.
-type Manager struct{}
-
+// Other platforms configure application proxies manually. The common journal
+// engine remains testable with an isolated in-memory settings store.
 func NewManager() (*Manager, error) { return &Manager{}, nil }
-func (m *Manager) Recover() error   { return nil }
-func (m *Manager) Begin(addr string, bypass []string) error {
-	return errors.New("netenv: --auto-proxy is only supported on Windows")
-}
-func (m *Manager) Restore() error             { return nil }
-func (m *Manager) RestoreFrom(p string) error { return nil }

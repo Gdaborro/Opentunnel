@@ -207,11 +207,10 @@ func (db *DB) SentinelTick(countryOf func(string) string) {
 		if !db.throttleKV("travel|"+h.Token, 30*time.Minute) {
 			continue
 		}
-		msg := "impossible travel for device " + shortPK(h.Token) + ": " + h.A + " → " + h.B + " within 30m"
-		if mode == "respond" && db.AutoKick(h.Token, "auto: impossible travel ("+h.B+")", time.Now().Add(30*time.Minute)) {
-			msg += " — device auto-kicked 30m"
-		}
-		db.RecordAlert("critical", "sentinel", msg)
+		// Country changes are not a distance/speed estimate: VPN egress,
+		// mobile handoffs and GeoIP errors can cause legitimate transitions.
+		msg := "source-country change for device " + shortPK(h.Token) + ": " + h.A + " → " + h.B + " within 30m — review required, not proof of impossible travel"
+		db.RecordAlert("warning", "sentinel", msg)
 	}
 	for _, h := range db.DetectSpread(10, 24*time.Hour) {
 		if !db.throttleKV("spread|"+h.Token, 6*time.Hour) {

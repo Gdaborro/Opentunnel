@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,17 +55,15 @@ type blockCache struct {
 	loaded   time.Time
 }
 
-var blockCacheV blockCache
-
 const blockCacheTTL = 3 * time.Second
 
 // blockedSuffixes returns all blocked suffixes: explicit blocklist entries
 // plus domains from enabled categories.
 func (db *DB) blockedSuffixes() []string {
-	blockCacheV.mu.Lock()
-	defer blockCacheV.mu.Unlock()
-	if time.Since(blockCacheV.loaded) < blockCacheTTL && blockCacheV.suffixes != nil {
-		return blockCacheV.suffixes
+	db.block.mu.Lock()
+	defer db.block.mu.Unlock()
+	if time.Since(db.block.loaded) < blockCacheTTL && db.block.suffixes != nil {
+		return db.block.suffixes
 	}
 	out := []string{}
 	rows, err := db.Query(`SELECT domain FROM blocklist`)
@@ -95,17 +94,17 @@ func (db *DB) blockedSuffixes() []string {
 			out = append(out, list...)
 		}
 	}
-	blockCacheV.suffixes = out
-	blockCacheV.loaded = time.Now()
+	db.block.suffixes = out
+	db.block.loaded = time.Now()
 	return out
 }
 
 // invalidateBlockCache forces a reload on the next IsBlocked call (used
 // after blocklist/category changes).
-func invalidateBlockCache() {
-	blockCacheV.mu.Lock()
-	blockCacheV.loaded = time.Time{}
-	blockCacheV.mu.Unlock()
+func (db *DB) invalidateBlockCache() {
+	db.block.mu.Lock()
+	db.block.loaded = time.Time{}
+	db.block.mu.Unlock()
 }
 
 // BlockWhy names the rule that blocks a domain: the entry's own reason
@@ -198,8 +197,10 @@ func (db *DB) SetCategoryEnabled(category string, enabled bool) bool {
 	if enabled {
 		v = 1
 	}
-	db.Exec(`INSERT INTO blocked_categories(category,enabled) VALUES(?,?) ON CONFLICT(category) DO UPDATE SET enabled=excluded.enabled`, category, v)
-	invalidateBlockCache()
+	if _, err := db.Exec(`INSERT INTO blocked_categories(category,enabled) VALUES(?,?) ON CONFLICT(category) DO UPDATE SET enabled=excluded.enabled`, category, v); err != nil {
+		return false
+	}
+	db.invalidateBlockCache()
 	return true
 }
 
@@ -219,30 +220,32 @@ func (db *DB) Setting(key string) string {
 func (db *DB) SetSetting(key, value string) {
 	db.Exec(`INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
 	if strings.HasPrefix(key, "ssh_tier_") {
-		invalidateSSHTierCache()
+		db.invalidateSSHTierCache()
+	}
+	if strings.HasPrefix(key, "kill_switch") {
+		db.policyMu.Lock()
+		db.killAt, db.killDetailAt = time.Time{}, time.Time{}
+		db.policyMu.Unlock()
 	}
 }
-
-// killCache caches the kill switch (checked per connection and per stream).
-var (
-	killMu     sync.Mutex
-	killOn     bool
-	killLoaded time.Time
-)
 
 // KillSwitch reports whether all tunnel traffic is suspended.
 func (db *DB) KillSwitch() bool {
 	if db == nil {
 		return false
 	}
-	killMu.Lock()
-	defer killMu.Unlock()
-	if time.Since(killLoaded) < time.Second {
-		return killOn
+	db.policyMu.Lock()
+	defer db.policyMu.Unlock()
+	if time.Since(db.killAt) < time.Second {
+		return db.killOn
 	}
-	killOn = db.Setting("kill_switch") == "1"
-	killLoaded = time.Now()
-	return killOn
+	var value string
+	err := db.QueryRow(`SELECT COALESCE((SELECT value FROM settings WHERE key='kill_switch'),'0')`).Scan(&value)
+	// Boolean-only legacy consumers also fail closed on a read failure.
+	// Relay consumers use AccessPolicy, which reports the error explicitly.
+	db.killOn = err != nil || (value != "" && value != "0")
+	db.killAt = time.Now()
+	return db.killOn
 }
 
 // SetKillSwitch toggles the global kill switch.
@@ -252,29 +255,16 @@ func (db *DB) SetKillSwitch(on bool) {
 		v = "1"
 	}
 	db.SetSetting("kill_switch", v)
-	killMu.Lock()
-	killOn = on
-	killLoaded = time.Now()
-	killMu.Unlock()
 }
-
-// kill-detail cache: the admin's reason string and the token allowlist
-// that keeps the operator's own devices connected while the switch is
-// engaged. Same 1s cache shape as the switch itself.
-var (
-	killReasonCache  string
-	killAllowCache   map[string]bool
-	killDetailLoaded time.Time
-)
 
 func (db *DB) killDetail() (string, map[string]bool) {
 	if db == nil {
 		return "", nil
 	}
-	killMu.Lock()
-	defer killMu.Unlock()
-	if time.Since(killDetailLoaded) < time.Second && killAllowCache != nil {
-		return killReasonCache, killAllowCache
+	db.policyMu.Lock()
+	defer db.policyMu.Unlock()
+	if time.Since(db.killDetailAt) < time.Second && db.killAllow != nil {
+		return db.killReason, db.killAllow
 	}
 	reason := db.Setting("kill_switch_reason")
 	allow := map[string]bool{}
@@ -283,7 +273,7 @@ func (db *DB) killDetail() (string, map[string]bool) {
 			allow[t] = true
 		}
 	}
-	killReasonCache, killAllowCache, killDetailLoaded = reason, allow, time.Now()
+	db.killReason, db.killAllow, db.killDetailAt = reason, allow, time.Now()
 	return reason, allow
 }
 
@@ -312,14 +302,6 @@ func (db *DB) KillSwitchAllowList() []string {
 // sustained bytes/sec cap and a per-device daily byte budget for ssh
 // ingress, plus the post-budget trickle rate. Same 1s cache shape as the
 // kill switch — the relay reads it per stream start.
-var (
-	sshPolMu      sync.Mutex
-	sshPolMaxBps  int64
-	sshPolDaily   int64
-	sshPolTrickle int64
-	sshPolLoaded  time.Time
-)
-
 // defaultSSHTrickleBps ≈ 200 kbps: once the daily ssh budget is spent,
 // pages keep loading and video cannot hold a buffer.
 const defaultSSHTrickleBps = 25_000
@@ -333,10 +315,10 @@ func (db *DB) SSHTierLimits() (maxBps, dailyBytes, trickleBps int64) {
 	if db == nil {
 		return 0, 0, 0
 	}
-	sshPolMu.Lock()
-	defer sshPolMu.Unlock()
-	if time.Since(sshPolLoaded) < time.Second {
-		return sshPolMaxBps, sshPolDaily, sshPolTrickle
+	db.policyMu.Lock()
+	defer db.policyMu.Unlock()
+	if time.Since(db.sshAt) < time.Second {
+		return db.sshMax, db.sshDaily, db.sshTrickle
 	}
 	maxBps = positiveSetting(db.Setting("ssh_tier_max_bps"))
 	mb := positiveSetting(db.Setting("ssh_tier_daily_mb"))
@@ -348,15 +330,15 @@ func (db *DB) SSHTierLimits() (maxBps, dailyBytes, trickleBps int64) {
 	if dailyBytes > 0 && trickleBps <= 0 {
 		trickleBps = defaultSSHTrickleBps
 	}
-	sshPolMaxBps, sshPolDaily, sshPolTrickle, sshPolLoaded = maxBps, dailyBytes, trickleBps, time.Now()
+	db.sshMax, db.sshDaily, db.sshTrickle, db.sshAt = maxBps, dailyBytes, trickleBps, time.Now()
 	return maxBps, dailyBytes, trickleBps
 }
 
 // invalidateSSHTierCache forces the next SSHTierLimits call to reload.
-func invalidateSSHTierCache() {
-	sshPolMu.Lock()
-	sshPolLoaded = time.Time{}
-	sshPolMu.Unlock()
+func (db *DB) invalidateSSHTierCache() {
+	db.policyMu.Lock()
+	db.sshAt = time.Time{}
+	db.policyMu.Unlock()
 }
 
 // positiveSetting parses a non-negative integer setting ("" or invalid → 0).
@@ -419,6 +401,11 @@ func (db *DB) SetPeerLimits(token, schedule string, maxBps, quotaBytes int64) {
 // days by the reaper.
 func (db *DB) SetPeerIP(token, ip string) {
 	if db == nil || token == "" || ip == "" {
+		return
+	}
+	// A forwarded loopback source is not a device location. Do not replace
+	// usable attribution with the relay's own forwarding socket.
+	if addr := net.ParseIP(ip); addr == nil || addr.IsLoopback() {
 		return
 	}
 	db.Exec(`UPDATE peers SET last_ip=? WHERE token=?`, ip, token)

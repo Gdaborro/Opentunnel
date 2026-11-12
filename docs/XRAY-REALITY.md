@@ -2,6 +2,11 @@
 
 Reviewed against upstream documentation on 2026-11-11.
 
+**Implementation update (2026-11-12):** the opt-in managed source and loopback
+authentication/confinement/lifecycle tests are now implemented; see
+[REALITY-MANAGED.md](REALITY-MANAGED.md). The intended-network pilot and fleet
+rollout remain unperformed. The assessed network tradeoffs below are unchanged.
+
 ## Would it help?
 
 **Potentially, yes: as an additional TCP carrier on a network whose TLS
@@ -33,7 +38,8 @@ network-dependent assumption, not a permanent guarantee.
 - Current upstream REALITY transport combinations are RAW, XHTTP and gRPC,
   not Xray's WebSocket transport. An *inner* WS stream through a local SOCKS
   carrier is a different layering choice and can still be viable.
-- The Xray endpoint is inside the trust boundary. Do not assume the inner
+- Without the optional independent pinned mutual-TLS channel, the Xray endpoint
+  is inside the trust boundary. Do not assume the inner
   token-derived AEAD hides data or credentials from its carrier terminator.
 
 ## Recommended additive pilot

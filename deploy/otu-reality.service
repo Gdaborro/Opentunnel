@@ -1,0 +1,26 @@
+[Unit]
+Description=opentunnel verified fixed-target REALITY companion (opt-in pilot)
+After=network-online.target opentunnel.service
+Wants=network-online.target
+
+[Service]
+User=otu
+UMask=0077
+# Install explicitly. EnvironmentFile must provide the reviewed binary digest
+# and bind endpoint. No default port-443 takeover or firewall/DNS mutation.
+EnvironmentFile=/etc/opentunnel/reality.env
+ExecStart=/usr/local/bin/otu-reality serve -executable /usr/local/lib/opentunnel/otu-xray -sha256 ${OTU_XRAY_SHA256} -config /etc/opentunnel/reality-server.json -listen ${OTU_REALITY_LISTEN} -target 127.0.0.1:8082 -state-dir /var/lib/opentunnel/reality
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/opentunnel/reality
+StateDirectory=opentunnel/reality
+MemoryMax=384M
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

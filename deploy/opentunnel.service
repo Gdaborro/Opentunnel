@@ -4,12 +4,15 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+UMask=0077
 User=otu
 ExecStart=/usr/local/bin/otu-server -c /etc/opentunnel/server.toml
 Restart=on-failure
 RestartSec=5
 # Hardening
 NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ProtectSystem=strict
 ProtectHome=tmpfs
 ReadWritePaths=/var/lib/opentunnel
@@ -17,9 +20,9 @@ StateDirectory=opentunnel
 WorkingDirectory=/var/lib/opentunnel
 LimitNOFILE=65535
 Environment=TMPDIR=/var/lib/opentunnel
-EnvironmentFile=/etc/opentunnel/panel.env
+EnvironmentFile=-/etc/opentunnel/panel.env
 # Data plane: deliberately lower priority than otu-panel so tunnel load
-# can never starve admin requests (control plane).
+# has less scheduling priority than admin requests (not a hard isolation SLA).
 CPUWeight=100
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6

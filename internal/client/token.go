@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"opentunnel/internal/privatefile"
 	"opentunnel/internal/version"
 )
 
@@ -37,7 +38,7 @@ func NewTokenStore() (*TokenStore, error) {
 		base = os.TempDir()
 	}
 	dir := filepath.Join(base, version.ProductName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := privatefile.EnsureDir(dir); err != nil {
 		return nil, err
 	}
 	return &TokenStore{Dir: dir}, nil
@@ -121,21 +122,7 @@ func (s *TokenStore) LoadOrCreate() (*deviceFile, error) {
 }
 
 func writeNewIdentityFile(path string, data []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(data)
-	if err == nil {
-		err = f.Sync()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		_ = os.Remove(path) // only the new file this call created
-	}
-	return err
+	return privatefile.WriteNew(path, data)
 }
 
 func (s *TokenStore) IsHardBanned() bool {
@@ -170,6 +157,11 @@ func (s *TokenStore) EnsureSSHKey() (string, error) {
 	privPath := s.SSHPrivatePath()
 	pubPath := s.SSHPublicPath()
 	keyRaw, err := os.ReadFile(privPath)
+	if err == nil {
+		if err := privatefile.Protect(privPath); err != nil {
+			return "", err
+		}
+	}
 	if os.IsNotExist(err) {
 		// A surviving public key means a private key was lost, not that a
 		// fresh identity should be minted under an already-approved token.

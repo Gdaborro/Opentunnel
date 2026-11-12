@@ -33,6 +33,7 @@ import (
 // listener — the ssh transport's forward path (sshd permitopen ->
 // listen_internal). Public TLS and h3 arrivals carry no marker.
 const IngressSSH = "ssh"
+const IngressCarrier = "carrier"
 
 type ingressKey struct{}
 

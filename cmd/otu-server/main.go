@@ -1,7 +1,7 @@
 // otu-server is the opentunnel relay. Run it on a VPS; clients connect over
 // TLS+WebSocket and it dials their requested targets. The management plane
 // (panel) runs separately as otu-panel; this relay reverse-proxies /admin and
-// /api/token to it so heavy tunnel traffic can never starve admin requests.
+// /api/token to it to reduce control-plane coupling under tunnel load.
 package main
 
 import (
@@ -31,7 +31,10 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 
 	"opentunnel/internal/config"
+	"opentunnel/internal/metrics"
 	"opentunnel/internal/panel"
+	"opentunnel/internal/privatefile"
+	"opentunnel/internal/protocol"
 	"opentunnel/internal/server"
 	"opentunnel/internal/transport"
 	"opentunnel/internal/version"
@@ -75,6 +78,27 @@ func main() {
 	cert, fingerprint, err := transport.LoadOrCreateCert(cfg.CertFile, cfg.KeyFile, cfg.Host)
 	if err != nil {
 		log.Fatalf("certificate: %v", err)
+	}
+	var innerCertificate *tls.Certificate
+	if cfg.InnerTLSCertFile != "" {
+		certData, err := os.ReadFile(cfg.InnerTLSCertFile)
+		if err != nil {
+			log.Fatal("inner TLS certificate unavailable")
+		}
+		keyData, err := privatefile.Read(cfg.InnerTLSKeyFile, 16<<10)
+		if err != nil {
+			log.Fatal("inner TLS private key unavailable")
+		}
+		pair, err := tls.X509KeyPair(certData, keyData)
+		if err != nil {
+			log.Fatal("inner TLS keypair invalid")
+		}
+		innerCertificate = &pair
+		leaf, err := x509.ParseCertificate(pair.Certificate[0])
+		if err != nil {
+			log.Fatal("inner TLS leaf invalid")
+		}
+		log.Printf("inner TLS identity public-key pin: %s", protocol.PublicKeyPin(leaf))
 	}
 
 	// leafFP tracks the CURRENT leaf certificate fingerprint so the
@@ -184,13 +208,35 @@ func main() {
 	if stateDirForPanel == "" {
 		stateDirForPanel = "/var/lib/opentunnel"
 	}
-	panelDB, err := panel.Open(filepath.Join(stateDirForPanel, "panel.db"), cfg.PurgeAfterDays)
-	if err != nil {
-		log.Printf("panel db: %v (panel enforcement disabled)", err)
-		panelDB = nil
+	var panelDB *panel.DB
+	if !cfg.StaticTokenOnly {
+		panelDB, err = panel.Open(filepath.Join(stateDirForPanel, "panel.db"), cfg.PurgeAfterDays)
+		if err != nil {
+			log.Fatalf("panel policy database unavailable; refusing to disable enforcement: %v", err)
+		}
+		defer panelDB.Close()
+	}
+	metricsCtx, stopMetrics := context.WithCancel(context.Background())
+	defer stopMetrics()
+	if panelDB != nil {
+		_ = panelDB.RecordRelayMetrics(metrics.Capture(version.Version))
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-metricsCtx.Done():
+					return
+				case <-ticker.C:
+					_ = panelDB.RecordRelayMetrics(metrics.Capture(version.Version))
+				}
+			}
+		}()
 	}
 
 	baseOpts := server.Options{
+		InnerTLSCertificate:    innerCertificate,
+		RequireInnerTLS:        cfg.RequireInnerTLS,
 		Token:                  cfg.Token,
 		WSPath:                 cfg.WSPath,
 		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
@@ -323,6 +369,30 @@ func main() {
 		}()
 		log.Printf("internal (plain) listener on %s", cfg.ListenInternal)
 	}
+	var carrierSrv *http.Server
+	if cfg.ListenCarrierInternal != "" {
+		ln, err := net.Listen("tcp", cfg.ListenCarrierInternal)
+		if err != nil {
+			log.Fatalf("carrier internal listen: %v", err)
+		}
+		// No administrative routes on this opt-in fixed-target ingress.
+		// The external carrier must independently confine its traffic to
+		// this target; Go cannot validate another process's routing rules.
+		carrierHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api/token/") {
+				handler.ServeHTTP(w, r)
+			} else {
+				baseHandler.ServeHTTP(w, r)
+			}
+		})
+		carrierSrv = &http.Server{Handler: server.WithIngress(carrierHandler, server.IngressCarrier), ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 60 * time.Second}
+		go func() {
+			if err := carrierSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+				log.Printf("carrier ingress: %v", err)
+			}
+		}()
+		log.Printf("managed carrier (loopback-only) ingress on %s", cfg.ListenCarrierInternal)
+	}
 
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -333,6 +403,9 @@ func main() {
 		if intSrv != nil {
 			_ = intSrv.Close()
 		}
+		if carrierSrv != nil {
+			_ = carrierSrv.Close()
+		}
 	}()
 
 	// HTTP/3 listener (v0.9.26): same handler mux over QUIC on the UDP
@@ -341,8 +414,8 @@ func main() {
 	// picks its RSA cert for some hellos (quic-go's included), and QUIC
 	// clients pin the chain the TCP listener serves — serving the RSA
 	// twin breaks their pins. Refreshed alongside the pin probe.
-	if _, port, perr := net.SplitHostPort(cfg.Listen); perr == nil {
-		if udpAddr, uerr := net.ResolveUDPAddr("udp", net.JoinHostPort("", port)); uerr == nil {
+	if host, port, perr := net.SplitHostPort(cfg.Listen); perr == nil && (cfg.H3 == nil || *cfg.H3) {
+		if udpAddr, uerr := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port)); uerr == nil {
 			if udpConn, ulerr := net.ListenUDP("udp", udpAddr); ulerr == nil {
 				var h3Cert atomic.Pointer[tls.Certificate]
 				loadH3Cert := func() {
@@ -407,7 +480,8 @@ func main() {
 // only on verified results: an unverified probe would let an on-path
 // attacker poison the fleet's trust set (audit round four).
 func probeVerifiedLeaf(addr, serverName string, roots *x509.CertPool) (string, error) {
-	conn, err := tls.Dial("tcp", addr, &tls.Config{
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
 		ServerName: serverName,
 		MinVersion: tls.VersionTLS12,
 		RootCAs:    roots,

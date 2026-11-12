@@ -4,3 +4,11 @@ bin/
 srv*.log
 srv*.out
 fetch*.html
+
+# Local-only operator material and generated credentials never belong in source.
+/AGENTS.md
+/keys/
+/device-identity/
+/client-runtime/
+/otk/
+/client-profile.json

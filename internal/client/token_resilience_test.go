@@ -76,7 +76,11 @@ func TestCorruptIdentityIsNotSilentlyReplaced(t *testing.T) {
 	if _, err := s.LoadOrCreate(); err == nil {
 		t.Fatal("invalid stored identity was silently replaced")
 	}
-	s = &TokenStore{Dir: filepath.Join(t.TempDir(), "absent-directory")}
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s = &TokenStore{Dir: filepath.Join(blocked, "state")}
 	if identity, err := s.LoadOrCreate(); err == nil || identity != nil {
 		t.Fatal("unpersisted identity returned as success")
 	}

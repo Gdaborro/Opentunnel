@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -24,6 +25,8 @@ import (
 
 	"golang.org/x/net/proxy"
 
+	"opentunnel/internal/privatefile"
+	"opentunnel/internal/protocol"
 	"opentunnel/internal/transport"
 	"opentunnel/internal/version"
 )
@@ -58,7 +61,9 @@ func LatestRelease(ctx context.Context, socksAddr string) (*Release, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", transport.BrowserUA)
-	resp, err := updateClient(socksAddr).Do(req)
+	cl := updateClient(socksAddr)
+	defer cl.CloseIdleConnections()
+	resp, err := cl.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -139,11 +144,19 @@ func CheckUpdate(ctx context.Context, socksAddr string) (*Release, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !isNewer(version.Version, rel.TagName) {
-		return nil, nil
+	if _, _, _, ok := parseVersion(rel.TagName); !ok || !strings.HasPrefix(rel.TagName, "v") {
+		return nil, errors.New("auto-update: release feed returned an invalid tag")
 	}
 	if belowMinTag(rel.TagName) {
 		return nil, fmt.Errorf("auto-update: release %s is below the minimum supported version %s — refusing", rel.TagName, MinUpdateTag)
+	}
+	cl := updateClient(socksAddr)
+	defer cl.CloseIdleConnections()
+	if err := checkReleaseFreshness(ctx, cl, rel, version.Version); err != nil {
+		return nil, err
+	}
+	if !isNewer(version.Version, rel.TagName) {
+		return nil, nil
 	}
 	return rel, nil
 }
@@ -170,51 +183,74 @@ func belowMinTag(tag string) bool {
 // first (fast path), falling back to the tunnel's SOCKS proxy when direct
 // is blocked (school/corporate firewalls that filter github.com). TLS stays
 // end-to-end in both cases, so the fallback changes only the TCP path —
-// integrity still rests on the SHA-256 check in SelfUpdate.
+// integrity rests on the offline signatures, not the interceptable hash note.
 func updateClient(socksAddr string) *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				dd := &net.Dialer{Timeout: 8 * time.Second}
-				if conn, err := dd.DialContext(ctx, network, addr); err == nil {
-					return conn, nil
-				} else if socksAddr == "" {
-					return nil, err
-				}
-				return socksDialContext(ctx, socksAddr, network, addr)
-			},
-			TLSHandshakeTimeout: 15 * time.Second,
-		},
+	direct := &http.Transport{DialContext: (&net.Dialer{Timeout: 8 * time.Second}).DialContext, TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 20 * time.Second}
+	if socksAddr == "" {
+		return &http.Client{Transport: direct}
+	}
+	via := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return socksDialContext(ctx, socksAddr, network, addr)
+	}, TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 20 * time.Second}
+	return &http.Client{Transport: &updateFallback{direct: direct, via: via}}
+}
+
+type updateFallback struct{ direct, via http.RoundTripper }
+
+func (t *updateFallback) RoundTrip(req *http.Request) (*http.Response, error) {
+	if HostileMode() {
+		return t.via.RoundTrip(req)
+	}
+	ctx, cancel := context.WithCancel(req.Context())
+	setupTimer := time.AfterFunc(45*time.Second, cancel)
+	resp, err := t.direct.RoundTrip(req.Clone(ctx))
+	setupTimer.Stop()
+	// Keep the direct response context alive until its body is consumed.
+	if err == nil && resp.StatusCode != 403 && resp.StatusCode != 451 && resp.StatusCode != 502 && resp.StatusCode != 503 && resp.StatusCode != 504 {
+		resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+		return resp, nil
+	}
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	cancel()
+	if req.Context().Err() != nil {
+		return nil, req.Context().Err()
+	}
+	// Update requests are bodyless GETs. Do not replay arbitrary POSTs.
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		return nil, fmt.Errorf("update fallback only supports GET/HEAD")
+	}
+	return t.via.RoundTrip(req)
+}
+func (t *updateFallback) CloseIdleConnections() {
+	for _, tr := range []http.RoundTripper{t.direct, t.via} {
+		if c, ok := tr.(interface{ CloseIdleConnections() }); ok {
+			c.CloseIdleConnections()
+		}
 	}
 }
 
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelBody) Close() error { defer b.cancel(); return b.ReadCloser.Close() }
+
 // socksDialContext dials through a SOCKS5 proxy with ctx awareness.
 func socksDialContext(ctx context.Context, socksAddr, network, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	sd, err := proxy.SOCKS5("tcp", socksAddr, nil, &net.Dialer{Timeout: 15 * time.Second})
 	if err != nil {
 		return nil, err
 	}
-	type res struct {
-		c   net.Conn
-		err error
+	cd, ok := sd.(proxy.ContextDialer)
+	if !ok {
+		return nil, errors.New("auto-update: SOCKS dialer lacks cancellable setup")
 	}
-	ch := make(chan res, 1)
-	go func() {
-		c, err := sd.Dial(network, addr)
-		ch <- res{c, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.c, r.err
-	case <-ctx.Done():
-		// Don't leak the late conn: close it if it lands after cancel.
-		go func() {
-			if r := <-ch; r.err == nil {
-				r.c.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	}
+	return cd.DialContext(ctx, network, addr)
 }
 
 // SelfUpdate downloads the release asset for this platform, verifies it
@@ -232,6 +268,9 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	// and must be exercisable by tests on every OS.
 	if belowMinTag(rel.TagName) {
 		return fmt.Errorf("auto-update: release %s is below the minimum supported version %s — refusing", rel.TagName, MinUpdateTag)
+	}
+	if !isNewer(version.Version, rel.TagName) {
+		return errors.New("auto-update: release is not newer than the running version")
 	}
 	assetName := updateAssetWin
 	var url, sigURL string
@@ -272,7 +311,33 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	if err != nil {
 		return err
 	}
-	tmp := exe + ".new"
+	temp, err := os.CreateTemp(filepath.Dir(exe), filepath.Base(exe)+".new-*.exe")
+	if err != nil {
+		return err
+	}
+	tmp := temp.Name()
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(temp.Name())
+		return err
+	}
+	keepStaged := false
+	defer func() {
+		if !keepStaged {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := privatefile.Protect(tmp); err != nil {
+		return err
+	}
+	cl := updateClient(socksAddr)
+	defer cl.CloseIdleConnections()
+	var fresh *protocol.ReleaseManifest
+	if requiresFreshManifest(rel.TagName) {
+		fresh, err = freshTarget(ctx, cl, rel)
+		if err != nil {
+			return err
+		}
+	}
 
 	fetch := func(u string) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -280,7 +345,7 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 			return nil, err
 		}
 		req.Header.Set("User-Agent", transport.BrowserUA)
-		return updateClient(socksAddr).Do(req)
+		return cl.Do(req)
 	}
 
 	// Signature first: tiny, and refusing early avoids a wasted download.
@@ -327,6 +392,9 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	// ceiling aborts the install before the swap.
 	const maxAsset = 64 << 20
 	n, err := io.Copy(io.MultiWriter(out, hasher), io.LimitReader(resp.Body, maxAsset+1))
+	if err == nil {
+		err = out.Sync()
+	}
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
@@ -339,6 +407,9 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 		return fmt.Errorf("auto-update: asset exceeds %d bytes — refusing", maxAsset)
 	}
 	got := hex.EncodeToString(hasher.Sum(nil))
+	if fresh != nil && (fresh.Bytes != n || !strings.EqualFold(fresh.SHA256, got)) {
+		return errors.New("binary differs from its signed freshness target")
+	}
 	if want := expectedSHA256(rel.Body); want != "" && got != want {
 		os.Remove(tmp)
 		return fmt.Errorf("auto-update: sha256 mismatch (got %s)", got[:12])
@@ -352,27 +423,41 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 		return errors.New("auto-update: release manifest signature verification failed — refusing install")
 	}
 
-	// Windows allows renaming a running exe: current -> .old, new -> current.
-	old := exe + ".old"
-	os.Remove(old)
-	if err := os.Rename(exe, old); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("auto-update: rename current: %w", err)
+	// Verify that this signed binary can execute and reports the signed tag
+	// before replacing anything. Full post-start readiness remains a release
+	// acceptance gate; process creation alone is not a health check.
+	pctx, pcancel := context.WithTimeout(ctx, 30*time.Second)
+	cmd := exec.CommandContext(pctx, tmp, "--version")
+	cmd.Env = withoutUpdateEnvironment(os.Environ())
+	prepareUpdateHelper(cmd)
+	var output boundedUpdateOutput
+	cmd.Stdout, cmd.Stderr = &output, io.Discard
+	perr := cmd.Run()
+	pcancel()
+	if perr != nil || output.overflow || strings.TrimSpace(string(output.data)) != "opentunnel client "+rel.TagName {
+		return errors.New("auto-update: signed binary failed version preflight")
 	}
-	if err := os.Rename(tmp, exe); err != nil {
-		// Roll back so the device is never left without a binary.
-		_ = os.Rename(old, exe)
-		return fmt.Errorf("auto-update: install: %w", err)
+	if err := armReplacement(ctx, exe, tmp, got); err != nil {
+		return err
 	}
-
-	cmd := exec.Command(exe, os.Args[1:]...)
-	cmd.Dir = ""
-	cmd.Env = append(os.Environ(), "OTU_UPDATE_PARENT_PID="+strconv.Itoa(os.Getpid()))
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("auto-update: re-exec failed (new binary in place): %w", err)
-	}
-	log.Printf("auto-update: updated to %s (signature verified) — restarting", rel.TagName)
+	keepStaged = true
+	log.Printf("auto-update: signed %s transaction armed — awaiting graceful shutdown and replacement readiness", rel.TagName)
 	return nil
+}
+
+type boundedUpdateOutput struct {
+	data     []byte
+	overflow bool
+}
+
+func (w *boundedUpdateOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	room := 1024 - len(w.data)
+	if len(p) > room {
+		w.overflow = true
+	}
+	w.data = append(w.data, p[:min(room, n)]...)
+	return n, nil
 }
 
 func validReleaseAssetURL(raw, tag, name string) bool {
@@ -388,30 +473,88 @@ func validReleaseAssetURL(raw, tag, name string) bool {
 // socksAddr wires update traffic through the tunnel when direct access to
 // github.com is filtered; empty means direct-only.
 func UpdateLoop(socksAddr string) {
+	RunUpdateLoop(context.Background(), socksAddr, func() { os.Exit(0) })
+}
+
+// RunUpdateLoop supports graceful caller shutdown and bounds bulk deferral.
+// Even in thin mode metadata is checked; a pending signed update cannot be
+// deferred forever merely because the network remains slow.
+func RunUpdateLoop(ctx context.Context, socksAddr string, onUpdated func()) {
+	var deferredSince time.Time
+	if !updateWait(ctx, 30*time.Second) {
+		return
+	}
 	for {
-		if ThinMode() {
-			// Shaped uplink: update payloads are bulk — stand down and
-			// retry later instead of fighting interactive traffic.
-			time.Sleep(15 * time.Minute)
-			continue
-		}
-		time.Sleep(30 * time.Second)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		rel, err := CheckUpdate(ctx, socksAddr)
+		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		rel, err := CheckUpdate(checkCtx, socksAddr)
 		cancel()
 		if err != nil {
 			log.Printf("auto-update: check failed: %v", err)
 		} else if rel != nil {
+			if ThinMode() {
+				if deferredSince.IsZero() {
+					deferredSince = time.Now()
+				}
+				if time.Since(deferredSince) < time.Hour {
+					if !updateWait(ctx, 15*time.Minute) {
+						return
+					}
+					continue
+				}
+			}
 			log.Printf("auto-update: %s available (running %s) — downloading", rel.TagName, version.Version)
-			dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			dctx, dcancel := context.WithTimeout(ctx, 30*time.Minute)
 			err := SelfUpdate(dctx, rel, socksAddr)
 			dcancel()
 			if err != nil {
 				log.Printf("auto-update: %v", err)
 			} else {
-				os.Exit(0)
+				if onUpdated != nil {
+					onUpdated()
+				}
+				return
 			}
 		}
-		time.Sleep(updateCheckGap)
+		if !updateWait(ctx, updateCheckGap) {
+			return
+		}
 	}
+}
+
+func updateWait(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// replaceExecutable never deletes an existing backup. Failed install or
+// process creation restores the original path and checks rollback errors.
+func replaceExecutable(exe, staged, backup string, start func() error) error {
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("auto-update: backup path already exists")
+	}
+	if err := os.Rename(exe, backup); err != nil {
+		return fmt.Errorf("auto-update: backup: %w", err)
+	}
+	if err := os.Rename(staged, exe); err != nil {
+		return errors.Join(fmt.Errorf("auto-update: install: %w", err), os.Rename(backup, exe))
+	}
+	if err := start(); err != nil {
+		if errors.Is(err, errReplacementStillRunning) {
+			// Never swap paths underneath a failed child whose termination
+			// could not be confirmed. Keep both files and the recovery journal.
+			return fmt.Errorf("auto-update: rollback deferred: %w", err)
+		}
+		moveErr := os.Rename(exe, staged)
+		if moveErr != nil {
+			return errors.Join(fmt.Errorf("auto-update: launch failed: %w", err), moveErr)
+		}
+		return errors.Join(fmt.Errorf("auto-update: launch failed; original restored: %w", err), os.Rename(backup, exe))
+	}
+	return nil
 }

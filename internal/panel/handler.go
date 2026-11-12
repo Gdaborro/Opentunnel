@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"opentunnel/internal/panel/ui"
+	"opentunnel/internal/protocol"
 )
 
 var _ = time.Second // peers carry time.Time fields
@@ -24,10 +26,12 @@ type Handler struct {
 	autoApprove bool
 	geo         *GeoIP // optional; nil = no country resolution
 
-	rlMu    sync.Mutex
-	rlMap   map[string]*regLimit // per-IP rate-limit buckets (bucket|ip)
-	rlSwept time.Time            // last opportunistic expiry sweep
-	keyMu   sync.Mutex           // serialize registration and admin key lifecycle hooks
+	rlMu        sync.Mutex
+	rlMap       map[string]*regLimit // per-IP rate-limit buckets (bucket|ip)
+	rlSwept     time.Time            // last opportunistic expiry sweep
+	keyMu       sync.Mutex           // serialize registration and admin key lifecycle hooks
+	proofMu     sync.Mutex
+	proofReplay *protocol.ReplayCache
 
 	// OnApprove installs a device's SSH public key into the ssh tier's
 	// authorized_keys when an admin approves it (nil = not configured).
@@ -267,12 +271,19 @@ func (h *Handler) apiSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sid := h.auth.CreateSession(creds.Username)
+	if sid == "" {
+		http.Error(w, "session service unavailable", 503)
+		return
+	}
 	h.auth.SetSessionCookie(w, sid)
 	h.db.RecordEvent("setup", "first admin created ("+creds.Username+")")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (h *Handler) apiLogin(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) {
+		return
+	}
 	ip := clientIP(r)
 	if h.auth.LoginLocked(ip) {
 		http.Error(w, "too many failed attempts — try again later", http.StatusTooManyRequests)
@@ -286,8 +297,15 @@ func (h *Handler) apiLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	json.NewDecoder(r.Body).Decode(&creds)
-	ok, _ := h.auth.Login(creds.Username, creds.Password)
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil || len(creds.Username) > 64 || len(creds.Password) > 72 {
+		http.Error(w, "invalid login request", 400)
+		return
+	}
+	ok, err := h.auth.Login(creds.Username, creds.Password)
+	if err != nil {
+		http.Error(w, "authentication temporarily unavailable", 503)
+		return
+	}
 	if !ok {
 		h.auth.RecordLoginFail(ip)
 		if h.auth.LoginLocked(ip) {
@@ -300,6 +318,10 @@ func (h *Handler) apiLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	h.auth.ClearLoginFail(ip)
 	sid := h.auth.CreateSession(creds.Username)
+	if sid == "" {
+		http.Error(w, "session service unavailable", 503)
+		return
+	}
 	h.auth.SetSessionCookie(w, sid)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -472,7 +494,7 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 			if old != "" && h.OnRevoke != nil {
 				h.OnRevoke(token) // hook still sees the old key
 			}
-			if _, err := h.db.Exec(`UPDATE peers SET ssh_pubkey=?, status='pending' WHERE token=?`, pub, token); err != nil {
+			if _, err := h.db.Exec(`UPDATE peers SET ssh_pubkey=?, status='pending', approval_required=1, auth_epoch=hex(randomblob(16)) WHERE token=?`, pub, token); err != nil {
 				http.Error(w, "key replacement failed", http.StatusInternalServerError)
 				return
 			}
@@ -480,7 +502,10 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		}
 		// Never auto-approve a rekey, including during auto-accept windows.
 	case "approve":
-		h.db.Exec(`UPDATE peers SET status='approved', last_seen=datetime('now') WHERE token=?`, token)
+		if err := h.db.PeerStateAction(token, "approve", "", ""); err != nil {
+			http.Error(w, "approval unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		h.db.RecordEvent("approve", short+" approved")
 		h.db.RecordAlert("info", "nac", "device "+short+" approved for network access")
 		if h.OnApprove != nil {
@@ -490,8 +515,18 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Reason string `json:"reason"`
 		}
-		json.NewDecoder(r.Body).Decode(&req)
-		h.db.Exec(`UPDATE peers SET status='kicked', kick_reason=?, kick_expires=datetime('now','+10 minutes') WHERE token=?`, req.Reason, token)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			http.Error(w, "invalid kick request", 400)
+			return
+		}
+		if len(req.Reason) > 500 {
+			http.Error(w, "reason too long", 400)
+			return
+		}
+		if err := h.db.PeerStateAction(token, "kick", req.Reason, ""); err != nil {
+			http.Error(w, "kick unavailable or identity not approved", 409)
+			return
+		}
 		h.db.RecordEvent("kick", short+" kicked: "+req.Reason)
 		h.db.RecordAlert("warning", "nac", "device "+short+" kicked: "+trimReason(req.Reason))
 	case "ban":
@@ -499,33 +534,49 @@ func (h *Handler) apiPeerAction(w http.ResponseWriter, r *http.Request) {
 			Reason   string `json:"reason"`
 			Duration string `json:"duration"`
 		}
-		json.NewDecoder(r.Body).Decode(&req)
-		h.db.Exec(`UPDATE peers SET status='banned', ban_reason=?, ban_duration=? WHERE token=?`, req.Reason, req.Duration, token)
-		h.db.BanIdentity(token, req.Reason)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			http.Error(w, "invalid ban request", 400)
+			return
+		}
+		if len(req.Reason) > 500 || len(req.Duration) > 64 {
+			http.Error(w, "ban fields too long", 400)
+			return
+		}
+		if err := h.db.PeerStateAction(token, "ban", req.Reason, req.Duration); err != nil {
+			http.Error(w, "ban unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		if h.OnRevoke != nil {
 			h.OnRevoke(token) // N-12: remove the ssh-tier key while the row still exists
 		}
 		h.db.RecordEvent("ban", short+" banned: "+req.Reason)
 		h.db.RecordAlert("critical", "security", "device "+short+" BANNED (fingerprint + key): "+trimReason(req.Reason))
 	case "unban":
-		h.db.UnbanIdentity(token)
-		h.db.Exec(`UPDATE peers SET status='pending', ban_reason=NULL, ban_duration=NULL WHERE token=?`, token)
+		if err := h.db.PeerStateAction(token, "unban", "", ""); err != nil {
+			http.Error(w, "unban unavailable", 503)
+			return
+		}
 		h.db.RecordEvent("unban", short+" unbanned (needs re-approval)")
 		h.db.RecordAlert("info", "security", "device "+short+" unbanned — pending re-approval")
 	case "delete":
 		if h.OnRevoke != nil {
 			h.OnRevoke(token) // N-12: revoke before the row (and its pubkey) is gone
 		}
-		h.db.UnbanIdentity(token)
-		h.db.Exec(`DELETE FROM peers WHERE token=?`, token)
-		h.db.Exec(`DELETE FROM daily_usage WHERE token=?`, token)
-		h.db.Exec(`DELETE FROM visits WHERE token=?`, token)
+		if err := h.db.PeerStateAction(token, "delete", "", ""); err != nil {
+			http.Error(w, "delete unavailable", 503)
+			return
+		}
 		h.db.RecordEvent("delete", short+" deleted")
 	case "reset":
-		h.db.Exec(`UPDATE peers SET bytes_up=0, bytes_down=0 WHERE token=?`, token)
-		h.db.Exec(`DELETE FROM daily_usage WHERE token=?`, token)
+		if err := h.db.PeerStateAction(token, "reset", "", ""); err != nil {
+			http.Error(w, "usage reset unavailable", 503)
+			return
+		}
 	case "expire":
-		h.db.Exec(`UPDATE peers SET status='expired' WHERE token=?`, token)
+		if err := h.db.PeerStateAction(token, "expire", "", ""); err != nil {
+			http.Error(w, "expiry unavailable", 503)
+			return
+		}
 		if h.OnRevoke != nil {
 			h.OnRevoke(token)
 		}
@@ -605,7 +656,7 @@ func (h *Handler) apiBlocklist(w http.ResponseWriter, r *http.Request) {
 			h.db.RecordEvent("blocklist", req.Domain+" unblocked")
 		}
 	}
-	invalidateBlockCache()
+	h.db.invalidateBlockCache()
 	w.Write([]byte(`{"ok":true}`))
 }
 
@@ -743,7 +794,7 @@ func (h *Handler) apiSentinel(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"mode": mode})
 }
 
-func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) legacySettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		sshMax, sshDaily, sshTrickle := h.db.SSHTierLimits()
 		resp := map[string]any{
@@ -924,6 +975,10 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	// (audit round four, N-11 chain). Store the canonical single-line
 	// ed25519 form or refuse.
 	req.SSHPubKey = strings.TrimSpace(req.SSHPubKey)
+	if req.SSHPubKey == "" {
+		http.Error(w, "new enrollment requires an Ed25519 public key", 400)
+		return
+	}
 	if req.SSHPubKey != "" {
 		canon, cok := CanonicalSSHPubKey(req.SSHPubKey)
 		if !cok {
@@ -949,7 +1004,7 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	// A public bootstrap request is not proof of private-key possession.
 	// Existing identities are immutable here; only an authenticated admin
 	// can replace an approved key through the rekey action above.
-	res, err := h.db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen) VALUES(?,?,?, ?, ?, datetime('now'), datetime('now'))`,
+	res, err := h.db.Exec(`INSERT OR IGNORE INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen,auth_epoch) VALUES(?,?,?, ?, ?, datetime('now'), datetime('now'),hex(randomblob(16)))`,
 		req.Token, req.Fingerprint, req.DeviceName, req.SSHPubKey, status)
 	if err != nil {
 		http.Error(w, "registration unavailable", http.StatusServiceUnavailable)
@@ -957,8 +1012,9 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		var existingStatus, existingKey, existingFP string
-		if err := h.db.QueryRow(`SELECT status, COALESCE(ssh_pubkey,''), fingerprint FROM peers WHERE token=?`, req.Token).
-			Scan(&existingStatus, &existingKey, &existingFP); err != nil {
+		var approvalRequired bool
+		if err := h.db.QueryRow(`SELECT status, COALESCE(ssh_pubkey,''), fingerprint, approval_required FROM peers WHERE token=?`, req.Token).
+			Scan(&existingStatus, &existingKey, &existingFP, &approvalRequired); err != nil {
 			http.Error(w, "registration unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -983,8 +1039,11 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 		// A device that registered before an auto-accept window opened must
 		// not stay stuck pending forever: while the window is open, upgrade
 		// it and install its SSH key so early launchers connect too.
-		if status == "pending" && h.db.AutoAcceptActive() && req.SSHPubKey != "" {
-			h.db.Exec(`UPDATE peers SET status='approved' WHERE token=?`, req.Token)
+		if status == "pending" && !approvalRequired && h.db.AutoAcceptActive() && req.SSHPubKey != "" {
+			if _, err := h.db.Exec(`UPDATE peers SET status='approved' WHERE token=? AND status='pending' AND approval_required=0`, req.Token); err != nil {
+				http.Error(w, "approval unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			status = "approved"
 			h.db.RecordEvent("auto-accept", req.DeviceName+" upgraded to approved (auto-accept window)")
 			if h.OnApprove != nil {
@@ -1026,15 +1085,17 @@ func (h *Handler) tokenStatus(w http.ResponseWriter, r *http.Request) {
 			token = req.Token
 		}
 	}
-	var status, kickReason, banReason, kickExpires string
-	err := h.db.QueryRow(`SELECT status, COALESCE(kick_reason,''), COALESCE(ban_reason,''), COALESCE(kick_expires,'') FROM peers WHERE token=?`, token).
-		Scan(&status, &kickReason, &banReason, &kickExpires)
+	p, err := h.db.AccessPolicy(token)
 	if err == sql.ErrNoRows {
 		http.Error(w, "not found", 404)
 		return
 	}
+	if err != nil {
+		http.Error(w, "status unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": status, "kick_reason": kickReason, "ban_reason": banReason, "kick_expires": kickExpires,
+		"status": p.Status, "kick_reason": p.Reason, "ban_reason": p.Reason, "kick_expires": p.Expires,
 	})
 }
 
@@ -1049,11 +1110,20 @@ func (h *Handler) tokenHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
 	var req struct {
 		Token string `json:"token"`
 	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
+	if json.Unmarshal(body, &req) != nil {
 		http.Error(w, "bad request", 400)
+		return
+	}
+	if !h.verifyHTTPProof(r, req.Token, body) {
+		http.Error(w, "device proof required", 403)
 		return
 	}
 	h.db.Exec(`UPDATE peers SET last_seen=datetime('now') WHERE token=?`, req.Token)
@@ -1066,11 +1136,16 @@ func (h *Handler) tokenHealth(w http.ResponseWriter, r *http.Request) {
 	if !requirePOST(w, r) {
 		return
 	}
-	if !h.regAllowed(clientIP(r)) {
+	if !h.rateAllowed(clientIP(r), 120, time.Minute, "health") {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4<<10) // telemetry is tiny
+	body, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
 	var req struct {
 		Token        string  `json:"token"`
 		Version      string  `json:"version"`
@@ -1084,13 +1159,17 @@ func (h *Handler) tokenHealth(w http.ResponseWriter, r *http.Request) {
 		JitterMs     float64 `json:"jitter_ms"`
 		ProbeLossPct float64 `json:"probe_loss_pct"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+	if err := json.Unmarshal(body, &req); err != nil || req.Token == "" {
 		http.Error(w, "bad request", 400)
 		return
 	}
 	// Bounded telemetry strings (token length is enforced at registration).
 	if len(req.Version) > 64 || len(req.OS) > 64 || len(req.Arch) > 32 {
 		http.Error(w, "field too long", 400)
+		return
+	}
+	if !h.verifyHTTPProof(r, req.Token, body) {
+		http.Error(w, "device proof required", 403)
 		return
 	}
 	var n int

@@ -92,7 +92,7 @@ export function Monitoring() {
         <QualityCard
           icon={<GaugeIcon />}
           label="Active Sessions"
-          value={health ? String(health.active_sessions) : "—"}
+          value={health?.relay_online ? String(health.active_sessions) : "—"}
           hint={
             health?.load_1m !== undefined
               ? `relay load ${health.load_1m.toFixed(2)} · ${health.cpu_cores ?? "?"} cores`

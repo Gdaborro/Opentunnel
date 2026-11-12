@@ -47,6 +47,7 @@ func TestRegisterRejectsPathStructuralTokens(t *testing.T) {
 	// Legit base64url token (43 chars) passes.
 	if code := post(map[string]string{
 		"token": "AbCdEfGh1234567890_-AbCdEfGh1234567890_-AbCd", "fingerprint": "fp", "device_name": "ok",
+		"ssh_pubkey": testKeyLine(t),
 	}); code != http.StatusOK {
 		t.Fatalf("valid token: got %d, want 200", code)
 	}
