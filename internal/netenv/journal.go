@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -99,6 +100,12 @@ func settingsNames(path string) []string {
 }
 func settingsPaths() []string { return append([]string{regKeyPath}, chromiumPolicyPaths...) }
 
+// policyPath reports whether path is an optional Chromium policy key.
+// Managed machines commonly make HKCU\Software\Policies read-only; v1.1.5
+// applied these keys best-effort, so a denied policy write must never take
+// down the client. The WinINET settings in regKeyPath stay mandatory.
+func policyPath(path string) bool { return path != regKeyPath }
+
 func (m *Manager) acquireLease() error {
 	if m.leaseRelease != nil {
 		return nil
@@ -156,16 +163,24 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 	for _, path := range settingsPaths() {
 		exists, err := m.store.KeyExists(path)
 		if err != nil {
-			m.releaseLease()
-			return fmt.Errorf("netenv: snapshot key: %w", err)
+			if !policyPath(path) {
+				m.releaseLease()
+				return fmt.Errorf("netenv: snapshot key: %w", err)
+			}
+			// Do not let an unreadable optional policy key block the proxy.
+			// HadKeys=true keeps restore from deleting a key we could not read.
+			exists = true
 		}
 		s.HadKeys[path] = exists
 		s.Values[path] = make(map[string]registryValue)
 		for _, name := range settingsNames(path) {
 			v, err := m.store.Read(path, name)
 			if err != nil {
-				m.releaseLease()
-				return fmt.Errorf("netenv: snapshot %s: %w", name, err)
+				if !policyPath(path) {
+					m.releaseLease()
+					return fmt.Errorf("netenv: snapshot %s: %w", name, err)
+				}
+				v = registryValue{}
 			}
 			s.Values[path][name] = v
 		}
@@ -193,7 +208,12 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 	}
 	// Detect a competing proxy change between snapshot and apply before
 	// mutating anything. The lease serializes opentunnel, not other software.
+	// Optional browser policy keys are applied best-effort (v1.1.5 behaviour)
+	// and must not block the mandatory WinINET change.
 	for _, path := range settingsPaths() {
+		if policyPath(path) {
+			continue
+		}
 		for _, name := range settingsNames(path) {
 			current, err := m.store.Read(path, name)
 			if err != nil {
@@ -204,22 +224,39 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 			}
 		}
 	}
+	var policyWarning error
 	for _, path := range settingsPaths() {
+		optional := policyPath(path)
 		for _, name := range settingsNames(path) {
 			current, err := m.store.Read(path, name)
 			if err != nil {
+				if optional {
+					continue
+				}
 				return errors.Join(err, m.restoreSnapshot(s, false))
 			}
-			if !sameValue(current, s.Values[path][name]) {
+			if !optional && !sameValue(current, s.Values[path][name]) {
 				return errors.Join(ErrSettingsConflict, m.restoreSnapshot(s, false))
 			}
 			if err := m.store.Write(path, name, s.Applied[path][name]); err != nil {
+				if optional {
+					if policyWarning == nil {
+						policyWarning = fmt.Errorf("browser policy keys are read-only: %w", err)
+					}
+					continue
+				}
 				return errors.Join(fmt.Errorf("netenv: apply %s: %w", name, err), m.restoreSnapshot(s, false))
 			}
 			if actual, err := m.store.Read(path, name); err != nil || !sameValue(actual, s.Applied[path][name]) {
+				if optional {
+					continue
+				}
 				return errors.Join(errors.New("netenv: settings application did not persist"), err, m.restoreSnapshot(s, false))
 			}
 		}
+	}
+	if policyWarning != nil {
+		log.Printf("netenv: %v; system proxy still applied (open browsers may need a restart)", policyWarning)
 	}
 	if m.notify != nil {
 		m.notify()
@@ -494,6 +531,10 @@ func (m *Manager) restoreSnapshot(s snapshot, force bool) error {
 		if !captured {
 			continue
 		}
+		// Optional browser policy keys are best-effort on restore too: a
+		// managed PC can deny them without blocking restoration of the
+		// mandatory WinINET proxy settings.
+		optional := policyPath(path)
 		// Settings within one registry key form a logical bundle. If a user
 		// changed the server, do not restore ProxyEnable and silently disable
 		// their replacement proxy while retaining only its address.
@@ -505,13 +546,17 @@ func (m *Manager) restoreSnapshot(s snapshot, force bool) error {
 			}
 			current, err := m.store.Read(path, name)
 			if err != nil {
-				failures = append(failures, err)
+				if !optional {
+					failures = append(failures, err)
+				}
 				conflict = true
 				continue
 			}
 			if applied, ok := s.Applied[path][name]; !force && s.Applied != nil && !sameValue(current, original) && (!ok || !sameValue(current, applied)) {
 				conflict = true
-				failures = append(failures, ErrSettingsConflict)
+				if !optional {
+					failures = append(failures, ErrSettingsConflict)
+				}
 			}
 		}
 		if conflict {
@@ -524,27 +569,33 @@ func (m *Manager) restoreSnapshot(s snapshot, force bool) error {
 			}
 			current, err := m.store.Read(path, name)
 			if err != nil {
-				failures = append(failures, fmt.Errorf("netenv: read %s: %w", name, err))
+				if !optional {
+					failures = append(failures, fmt.Errorf("netenv: read %s: %w", name, err))
+				}
 				continue
 			}
 			if sameValue(current, original) {
 				continue
 			}
 			if applied, ok := s.Applied[path][name]; !force && s.Applied != nil && (!ok || !sameValue(current, applied)) {
-				failures = append(failures, ErrSettingsConflict)
+				if !optional {
+					failures = append(failures, ErrSettingsConflict)
+				}
 				continue
 			}
 			if err := m.store.Write(path, name, original); err != nil {
-				failures = append(failures, fmt.Errorf("netenv: restore %s: %w", name, err))
+				if !optional {
+					failures = append(failures, fmt.Errorf("netenv: restore %s: %w", name, err))
+				}
 			}
 			if actual, err := m.store.Read(path, name); err != nil || !sameValue(actual, original) {
-				failures = append(failures, errors.New("netenv: restore was not durable; journal retained"), err)
+				if !optional {
+					failures = append(failures, errors.New("netenv: restore was not durable; journal retained"), err)
+				}
 			}
 		}
-		if !s.HadKeys[path] && path != regKeyPath {
-			if err := m.store.DeleteEmptyKey(path); err != nil {
-				failures = append(failures, err)
-			}
+		if !s.HadKeys[path] && optional {
+			_ = m.store.DeleteEmptyKey(path)
 		}
 	}
 	if m.notify != nil {

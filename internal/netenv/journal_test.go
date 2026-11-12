@@ -109,6 +109,76 @@ func TestPartialApplyRollsBackBeforeReturning(t *testing.T) {
 	}
 }
 
+// Managed machines often make HKCU\Software\Policies read-only. v1.1.5
+// treated those browser policy keys as best-effort; v1.1.6 must do the same
+// or the client exits during --auto-proxy startup after an update.
+func TestReadOnlyPolicyKeysDoNotBlockProxyApply(t *testing.T) {
+	m, s := memoryManager(t)
+	s.fail = func(path, name string, v registryValue) error {
+		if policyPath(path) {
+			return errors.New("synthetic access denied")
+		}
+		return nil
+	}
+	if err := m.Begin("127.0.0.1:18080", nil); err != nil {
+		t.Fatalf("Begin with read-only policy keys: %v", err)
+	}
+	if got := s.keys[regKeyPath]["ProxyServer"].Text; got != "127.0.0.1:18080" {
+		t.Fatalf("mandatory ProxyServer not applied: %q", got)
+	}
+	if _, err := os.Stat(m.snapPath()); err != nil {
+		t.Fatal("journal not created before mutation")
+	}
+	if err := m.Restore(); err != nil {
+		t.Fatalf("Restore with read-only policy keys: %v", err)
+	}
+	if got := s.keys[regKeyPath]["ProxyServer"].Text; got != "original.test:8080" {
+		t.Fatalf("mandatory ProxyServer not restored: %q", got)
+	}
+	if _, err := os.Stat(m.snapPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("best-effort policy restore retained the journal")
+	}
+}
+
+func TestMandatoryProxyWriteStillFails(t *testing.T) {
+	m, s := memoryManager(t)
+	before := copyKeys(s)
+	s.fail = func(path, name string, v registryValue) error {
+		if path == regKeyPath && name == "ProxyServer" && v.Exists {
+			return errors.New("synthetic access denied")
+		}
+		return nil
+	}
+	if err := m.Begin("127.0.0.1:18080", nil); err == nil {
+		t.Fatal("denied mandatory ProxyServer write was accepted")
+	}
+	if !reflect.DeepEqual(s.keys, before) {
+		t.Fatal("failed mandatory apply did not roll back")
+	}
+}
+
+func TestPolicyRestoreFailureIsBestEffort(t *testing.T) {
+	m, s := memoryManager(t)
+	if err := m.Begin("127.0.0.1:18080", nil); err != nil {
+		t.Fatal(err)
+	}
+	s.fail = func(path, name string, v registryValue) error {
+		if policyPath(path) {
+			return errors.New("synthetic denied policy restore")
+		}
+		return nil
+	}
+	if err := m.Restore(); err != nil {
+		t.Fatalf("policy restore failure blocked main restore: %v", err)
+	}
+	if got := s.keys[regKeyPath]["ProxyServer"].Text; got != "original.test:8080" {
+		t.Fatalf("mandatory ProxyServer not restored: %q", got)
+	}
+	if _, err := os.Stat(m.snapPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("best-effort policy restore retained the journal")
+	}
+}
+
 func TestFailedRestoreRetainsRetryableJournal(t *testing.T) {
 	m, s := memoryManager(t)
 	before := copyKeys(s)
