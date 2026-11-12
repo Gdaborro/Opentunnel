@@ -106,6 +106,15 @@ func settingsPaths() []string { return append([]string{regKeyPath}, chromiumPoli
 // down the client. The WinINET settings in regKeyPath stay mandatory.
 func policyPath(path string) bool { return path != regKeyPath }
 
+// legacyBypass reports whether a legacy v1.1.5 journal entry cannot be
+// compared exactly. The old journal recorded the applied server but not the
+// applied bypass list, so a config-specific override looks like a third-party
+// change during update recovery. Restore it unconditionally, as v1.1.5 did;
+// the server address still gets the normal conflict check.
+func legacyBypass(version int, name string) bool {
+	return version == 0 && name == "ProxyOverride"
+}
+
 func (m *Manager) acquireLease() error {
 	if m.leaseRelease != nil {
 		return nil
@@ -552,7 +561,7 @@ func (m *Manager) restoreSnapshot(s snapshot, force bool) error {
 				conflict = true
 				continue
 			}
-			if applied, ok := s.Applied[path][name]; !force && s.Applied != nil && !sameValue(current, original) && (!ok || !sameValue(current, applied)) {
+			if applied, ok := s.Applied[path][name]; !force && s.Applied != nil && !legacyBypass(s.Version, name) && !sameValue(current, original) && (!ok || !sameValue(current, applied)) {
 				conflict = true
 				if !optional {
 					failures = append(failures, ErrSettingsConflict)
@@ -577,7 +586,7 @@ func (m *Manager) restoreSnapshot(s snapshot, force bool) error {
 			if sameValue(current, original) {
 				continue
 			}
-			if applied, ok := s.Applied[path][name]; !force && s.Applied != nil && (!ok || !sameValue(current, applied)) {
+			if applied, ok := s.Applied[path][name]; !force && s.Applied != nil && !legacyBypass(s.Version, name) && (!ok || !sameValue(current, applied)) {
 				if !optional {
 					failures = append(failures, ErrSettingsConflict)
 				}

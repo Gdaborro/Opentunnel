@@ -179,6 +179,73 @@ func TestPolicyRestoreFailureIsBestEffort(t *testing.T) {
 	}
 }
 
+// A v1.1.5 updater exits with os.Exit after swapping binaries, leaving its
+// legacy journal and system proxy behind. The legacy journal records the
+// applied server but not the config-specific bypass list, so recovery must
+// not mistake that bypass list for a third-party change.
+func TestLegacyJournalWithCustomBypassRecovers(t *testing.T) {
+	m, s := memoryManager(t)
+	s.keys[regKeyPath] = map[string]registryValue{
+		"ProxyEnable": {Exists: true, Kind: 4, Integer: 0},
+	}
+	legacy := `{"proxy_enable":0,"proxy_server":{"exists":false},"proxy_override":{"exists":false},"autoconfig_url":{"exists":false},"policies":{},"otu_applied_server":"127.0.0.1:18080"}`
+	if err := os.WriteFile(m.snapPath(), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.lockPath(), []byte("99999"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.keys[regKeyPath] = map[string]registryValue{
+		"ProxyEnable":   {Exists: true, Kind: 4, Integer: 1},
+		"ProxyServer":   {Exists: true, Kind: 1, Text: "127.0.0.1:18080"},
+		"ProxyOverride": {Exists: true, Kind: 1, Text: "localhost;127.0.0.1;<local>;cdn.aborro.dev;*.aborro.dev;localhost;127.0.0.1"},
+	}
+	if err := m.Recover(); err != nil {
+		t.Fatalf("legacy journal recovery: %v", err)
+	}
+	if got := s.keys[regKeyPath]["ProxyEnable"].Integer; got != 0 {
+		t.Fatalf("ProxyEnable not restored: %d", got)
+	}
+	if s.keys[regKeyPath]["ProxyServer"].Exists {
+		t.Fatal("ProxyServer not restored to absent")
+	}
+	if s.keys[regKeyPath]["ProxyOverride"].Exists {
+		t.Fatal("ProxyOverride not restored to absent")
+	}
+	if _, err := os.Stat(m.snapPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("recovered legacy journal was retained")
+	}
+}
+
+// Legacy recovery must still refuse to overwrite a replacement proxy server.
+func TestLegacyJournalDoesNotOverwriteReplacementProxy(t *testing.T) {
+	m, s := memoryManager(t)
+	s.keys[regKeyPath] = map[string]registryValue{
+		"ProxyEnable": {Exists: true, Kind: 4, Integer: 0},
+	}
+	legacy := `{"proxy_enable":0,"proxy_server":{"exists":false},"proxy_override":{"exists":false},"autoconfig_url":{"exists":false},"policies":{},"otu_applied_server":"127.0.0.1:18080"}`
+	if err := os.WriteFile(m.snapPath(), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.lockPath(), []byte("99999"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.keys[regKeyPath] = map[string]registryValue{
+		"ProxyEnable":   {Exists: true, Kind: 4, Integer: 1},
+		"ProxyServer":   {Exists: true, Kind: 1, Text: "user-replacement.test:9000"},
+		"ProxyOverride": {Exists: true, Kind: 1, Text: "localhost;127.0.0.1;<local>"},
+	}
+	if err := m.Recover(); !errors.Is(err, ErrSettingsConflict) {
+		t.Fatalf("replacement proxy conflict=%v", err)
+	}
+	if got := s.keys[regKeyPath]["ProxyServer"].Text; got != "user-replacement.test:9000" {
+		t.Fatalf("replacement proxy overwritten: %q", got)
+	}
+	if _, err := os.Stat(m.snapPath()); err != nil {
+		t.Fatal("conflict journal not retained")
+	}
+}
+
 func TestFailedRestoreRetainsRetryableJournal(t *testing.T) {
 	m, s := memoryManager(t)
 	before := copyKeys(s)

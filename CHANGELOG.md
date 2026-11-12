@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.1.8 - update-handoff recovery fix
+
+### Fixed
+- The client no longer exits during `--auto-proxy` startup when
+  `HKCU\Software\Policies` browser policy keys are read-only. Policy-key
+  apply and restore are best-effort again, matching v1.1.5; the WinINET
+  system proxy write remains mandatory.
+- Update handoff from v1.1.5 now recovers its legacy settings journal. The
+  old journal recorded the applied proxy server but not the config-specific
+  bypass list, so v1.1.6+ mistook the applied bypass for a third-party
+  change and refused to start. Recovery now restores the bypass list while
+  still refusing to overwrite a genuinely replaced proxy server.
+- Added regression coverage for read-only policy apply, mandatory proxy
+  write failure, best-effort policy restore and legacy-journal recovery.
+
+No transport, authentication, protocol or admission behavior changed.
+Version and update floor raised to v1.1.8. Supersedes the withdrawn v1.1.7
+prerelease.
+
 ## v1.1.7 - managed-PC proxy startup fix
 
 ### Fixed
