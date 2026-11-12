@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.1.7 - managed-PC proxy startup fix
+
+### Fixed
+- The client no longer exits during `--auto-proxy` startup when
+  `HKCU\Software\Policies` browser policy keys are read-only. Policy-key
+  apply and restore are best-effort again, matching v1.1.5; the WinINET
+  system proxy write remains mandatory.
+- Added regression coverage for read-only policy apply, mandatory proxy
+  write failure and best-effort policy restore.
+
+No transport, authentication, protocol or admission behavior changed.
+Version and update floor raised to v1.1.7.
+
 ## v1.1.6 - relay hardening and supervised updates
 
 ### Security and recovery
