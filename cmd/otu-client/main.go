@@ -1,6 +1,6 @@
 // otu-client is the opentunnel user-level proxy client for Windows.
 // It exposes local SOCKS5 + HTTP proxies, can auto-configure the per-user
-// system proxy (--auto-proxy), and always restores prior settings on exit.
+// system proxy (--auto-proxy), and attempts journaled restoration on exit.
 package main
 
 import (
@@ -79,12 +79,18 @@ func safeGo(name string, fn func()) {
 func singleInstance(mgr *netenv.Manager, socksAddr, httpAddr string) bool {
 	if mgr != nil {
 		if err := mgr.Recover(); err != nil {
-			// Journal + live lock holder = another instance is running.
-			fmt.Println("otu is already running in the background.")
-			fmt.Println("Nothing to do - this window closes. Use " + version.StopHelper + " to stop it.")
-			time.Sleep(3 * time.Second)
-			return true
+			if errors.Is(err, netenv.ErrAlreadyRunning) {
+				fmt.Println("otu is already running in the background.")
+				fmt.Println("Nothing to do - this window closes. Use " + version.StopHelper + " to stop it.")
+				time.Sleep(3 * time.Second)
+				return true
+			}
+			// A corrupt/conflicting journal is not proof of another instance.
+			// Automatic mode already rejects this in recoverNetwork; manual
+			// proxy operation can continue without touching network settings.
+			log.Printf("settings recovery incomplete; evidence retained: %v", err)
 		}
+		reportNetworkWarnings(mgr, "recovery")
 	}
 	// Ports held by an otu process (no journal, e.g. manual mode) — same story.
 	for _, addr := range []string{socksAddr, httpAddr} {
@@ -108,14 +114,18 @@ func singleInstance(mgr *netenv.Manager, socksAddr, httpAddr string) bool {
 }
 
 // portFailExit reports a proxy-port bind failure in plain language, restores
-// any journaled settings so this path can never leave the proxy stuck, and
+// any journaled settings, retaining retry evidence if cleanup is denied, and
 // exits without looking like a crash.
 func portFailExit(addr string, err error, mgr *netenv.Manager) {
 	fmt.Printf("\n[X] Could not start the proxy on %s (%v).\n", addr, err)
 	fmt.Println("    Another otu may already be running, or another app uses this port.")
 	if mgr != nil {
-		if rerr := mgr.Restore(); rerr == nil {
-			fmt.Println("    Network settings were restored to normal.")
+		if rerr := mgr.Restore(); rerr != nil {
+			log.Printf("settings restore incomplete; journal retained for retry: %v", rerr)
+		} else if reportNetworkWarnings(mgr, "restore") {
+			fmt.Println("    System proxy restored; browser-policy cleanup is still pending.")
+		} else {
+			fmt.Println("    Journaled network settings were restored.")
 		}
 	}
 	fmt.Println("\nPress Enter to close...")
@@ -167,7 +177,10 @@ func main() {
 			log.Printf("PANIC (main): %v", r)
 			fmt.Println("[!] Something went wrong. Your network settings are being restored.")
 			if mgr, err := netenv.NewManager(); err == nil {
-				_ = mgr.Restore()
+				if err := mgr.Restore(); err != nil {
+					log.Printf("panic recovery incomplete; journal retained: %v", err)
+				}
+				reportNetworkWarnings(mgr, "panic recovery")
 			}
 			if doubleClick {
 				time.Sleep(5 * time.Second)
@@ -190,7 +203,8 @@ func run() {
 
 	// Double-click mode: launched with no arguments from Explorer. Route the
 	// browser automatically and keep the window informative; everything is
-	// still restored on exit, crash, or window close.
+	// restored where possible on exit, crash, or window close, with retry
+	// evidence retained when the OS denies cleanup.
 	doubleClick = flag.NFlag() == 0 && flag.NArg() == 0
 	if doubleClick {
 		*autoProxy = true
@@ -246,8 +260,8 @@ func run() {
 				image := filepath.Base(exe)
 				bat := "@echo off\r\n" +
 					"taskkill /IM " + image + " /F >nul 2>&1\r\n" +
-					"\"%~dp0" + image + "\" --restore >nul 2>&1\r\n" +
-					"echo otu stopped - your normal connection is restored.\r\n" +
+					"\"%~dp0" + image + "\" --restore\r\n" +
+					"if errorlevel 1 (echo Recovery incomplete - keep the journal and retry.) else (echo otu stopped - review any pending-policy warnings above.)\r\n" +
 					"pause\r\n"
 				_ = os.WriteFile(stop, []byte(bat), 0o755)
 			}
@@ -272,7 +286,11 @@ func run() {
 		if err := mgr.Restore(); err != nil {
 			log.Fatalf("restore: %v", err)
 		}
-		fmt.Println("network settings restored.")
+		if reportNetworkWarnings(mgr, "restore") {
+			fmt.Println("system proxy restored; browser-policy cleanup remains pending. Retry --restore when policy access is available.")
+		} else {
+			fmt.Println("journaled network settings restored.")
+		}
 		return
 	}
 
@@ -280,7 +298,11 @@ func run() {
 		if err := mgr.RestoreFrom(*restoreFrom); err != nil {
 			log.Fatalf("restore-from: %v", err)
 		}
-		fmt.Println("network settings restored from backup.")
+		if reportNetworkWarnings(mgr, "restore-from") {
+			fmt.Println("system proxy restored from backup; browser-policy cleanup remains pending.")
+		} else {
+			fmt.Println("network settings restored from backup.")
+		}
 		return
 	}
 
@@ -754,6 +776,7 @@ func run() {
 			if err := mgr.Restore(); err != nil {
 				log.Printf("settings restore incomplete; journal retained for retry: %v", err)
 			}
+			reportNetworkWarnings(mgr, "restore")
 		}
 		// Register cleanup BEFORE mutation. Begin also rolls back a partial
 		// apply itself; forced termination is covered by the independent helper.
@@ -767,6 +790,7 @@ func run() {
 			log.Printf("auto-proxy: %v", err)
 			return
 		}
+		reportNetworkWarnings(mgr, "auto-proxy")
 		fmt.Printf("[+] System proxy set to %s (journaled restore + crash-recovery helper)\n", sysProxy)
 	}
 
@@ -775,15 +799,16 @@ func run() {
 	} else if doubleClick {
 		fmt.Println()
 		fmt.Println("================================================================")
-		fmt.Println(" otu is running. Your web browser now goes through the tunnel.")
+		fmt.Println(" otu is running. The Windows user-level proxy is configured.")
 		fmt.Println()
 		fmt.Println(" HOW TO USE")
-		fmt.Println("   1. Just browse normally - no other setup needed.")
+		fmt.Println("   1. Apps using the system proxy can use the tunnel.")
+		fmt.Println("      Enforced browser policies may differ; check warnings above.")
 		fmt.Println("   2. First time only: the admin must approve this device,")
 		fmt.Println("      then pages load automatically (can take a minute).")
 		fmt.Println("   3. This window hides itself in a few seconds and otu keeps")
 		fmt.Println("      running in the background. To stop, run " + version.StopHelper)
-		fmt.Println("      (next to otu-client.exe). Settings restore automatically.")
+		fmt.Println("      (next to otu-client.exe). Journaled cleanup runs on exit.")
 		fmt.Println("================================================================")
 		// Close-proof: hide the console once the banner has been read so an
 		// accidental window close can't take the tunnel down.
@@ -806,7 +831,7 @@ func run() {
 	if lnHTTP != nil {
 		_ = lnHTTP.Close()
 	}
-	fmt.Println("\nbye - settings restored where changed.")
+	fmt.Println("\nbye - journaled settings cleanup runs on exit; check any warnings.")
 }
 
 // banGracePeriod is how long a banned client stays up serving the ban
@@ -899,12 +924,32 @@ func recoverNetwork(mgr *netenv.Manager) error {
 	for {
 		err := mgr.Recover()
 		if !client.IsUpdateReplacement() || !errors.Is(err, netenv.ErrAlreadyRunning) || time.Now().After(deadline) {
+			reportNetworkWarnings(mgr, "recovery")
 			return err
 		}
 		// A recovery helper may briefly own the lease after the old process
 		// exits. Wait for its bounded restore before starting the replacement.
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// A nil mandatory error is not a claim that browser policies were changed or
+// restored. Keep nonfatal degradation visible in both the console and crash log.
+func reportNetworkWarnings(mgr *netenv.Manager, operation string) bool {
+	if mgr == nil {
+		return false
+	}
+	r := mgr.LastResult()
+	for _, warning := range r.Warnings {
+		log.Printf("settings %s warning: %v", operation, warning)
+	}
+	if len(r.SkippedPolicies) != 0 {
+		fmt.Println("[!] Some browser-policy bundles were skipped. Enforced browser settings may not use the tunnel; a restart is not guaranteed to override them.")
+	}
+	if len(r.PendingPolicies) != 0 {
+		fmt.Println("[!] Browser-policy cleanup remains pending; recovery evidence is retained. Retry --restore when access/conflicts are resolved.")
+	}
+	return len(r.PendingPolicies) != 0
 }
 
 func boolPtr(b bool) *bool { return &b }

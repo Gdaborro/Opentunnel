@@ -136,7 +136,10 @@ func TestReadOnlyPolicyKeysDoNotBlockProxyApply(t *testing.T) {
 		t.Fatalf("mandatory ProxyServer not restored: %q", got)
 	}
 	if _, err := os.Stat(m.snapPath()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("best-effort policy restore retained the journal")
+		t.Fatal("untouched read-only policies retained active session ownership")
+	}
+	if m.PendingPolicyCleanup() {
+		t.Fatal("policies never changed by Begin should not require pending cleanup")
 	}
 }
 
@@ -175,7 +178,17 @@ func TestPolicyRestoreFailureIsBestEffort(t *testing.T) {
 		t.Fatalf("mandatory ProxyServer not restored: %q", got)
 	}
 	if _, err := os.Stat(m.snapPath()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("best-effort policy restore retained the journal")
+		t.Fatal("optional cleanup blocked release of mandatory session ownership")
+	}
+	if !m.PendingPolicyCleanup() || len(m.LastResult().PendingPolicies) == 0 {
+		t.Fatal("failed optional cleanup discarded recovery evidence or its warning")
+	}
+	s.fail = nil
+	if err := m.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if m.PendingPolicyCleanup() {
+		t.Fatal("successful optional retry retained unnecessary cleanup evidence")
 	}
 }
 
@@ -263,6 +276,14 @@ func TestFailedRestoreRetainsRetryableJournal(t *testing.T) {
 	}
 	if _, err := os.Stat(m.snapPath()); err != nil {
 		t.Fatal("last recovery journal was deleted after failed restore")
+	}
+	if s.keys[regKeyPath]["ProxyEnable"].Exists {
+		t.Fatal("a denied server restore prevented disabling the journal-owned proxy")
+	}
+	for _, path := range chromiumPolicyPaths {
+		if !reflect.DeepEqual(s.keys[path], before[path]) {
+			t.Fatal("mandatory restoration failure prevented independent policy cleanup")
+		}
 	}
 	s.fail = nil
 	if err := m.Restore(); err != nil {
@@ -367,6 +388,14 @@ func FuzzJournalDecode(f *testing.F) {
 	f.Add([]byte(`{}`))
 	f.Add([]byte(`{"version":999}`))
 	f.Add([]byte(`not json`))
+	f.Add([]byte(`{"proxy_enable":0,"proxy_server":{"exists":false},"proxy_override":{"exists":false},"autoconfig_url":{"exists":false},"otu_applied_server":"127.0.0.1:18080"}`))
+	values := appliedSettings("127.0.0.1:18080", []string{"synthetic.invalid"})
+	s := snapshot{Version: 3, ID: "00000000000000000000000000000000", Owner: journalOwner{PID: 123}, Values: values, Applied: values, HadKeys: make(map[string]bool), Touched: make(map[string]bool)}
+	for path := range values {
+		s.HadKeys[path], s.Touched[path] = true, true
+	}
+	raw, _ := json.Marshal(s)
+	f.Add(raw)
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 256<<10 {
 			return

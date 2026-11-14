@@ -63,17 +63,35 @@ cannot replace it. Relay UDP accepts replies only from recently contacted
 destinations and applies pacing/accounting in both directions.
 
 Windows snapshots preserve value existence and type, including a missing
-`ProxyEnable`. Journaling completes before mutation, partial apply rolls back,
-and readback verifies both application and restoration. Any failed restore
-retains its recovery journal. A cross-process settings
-lease prevents concurrent writers. A separate same-executable helper confirms
-parent readiness before automatic settings are applied, then attempts recovery
-after parent termination. Next-start recovery remains the final backstop.
+`ProxyEnable`. Journaling completes before mutation, partial apply attempts
+rollback, and readback verifies both application and restoration. Mandatory
+WinINET failures retain the active journal. Optional Chromium policies are
+skipped as a bundle if originals cannot be captured or a competing change is
+detected; read-only policy writes do not terminate otherwise valid startup.
 
-Concurrent changes by another application are treated as conflicts rather than
-overwritten. An explicit `--restore-from` is the operator's force-restore path.
+Failed optional cleanup is preserved in private, per-session
+`pending-policies/*.json` records before active session ownership is released.
+Next-start/`--restore` retries do not recapture unresolved policy bundles as
+new originals. A corrupt pending record is retained and conservatively skips
+optional policy application without blocking mandatory WinINET startup.
+Persistence failure never authorizes deleting the only recovery copy.
+
+A cross-process settings lease prevents concurrent opentunnel writers. Its
+empty lease file can remain after cleanup; an open OS handle, not file presence,
+is ownership. A separate same-executable helper confirms parent readiness before
+automatic settings are applied, then makes bounded recovery attempts after
+parent termination. Next-start recovery remains the final backstop.
+
+Concurrent changes by another application are checked for the whole bundle
+before and between writes, rather than intentionally overwritten. Windows has
+no atomic compare-and-swap for these bundles: a competing syscall inside the
+final check/write window cannot be ruled out. An explicit `--restore-from` is
+the operator's force-restore path; it journals the observed current values so
+later retries still refuse a different competing update.
 The OS can prevent helper execution, registry writes or disk access; power-off
 and killing all recovery processes cannot be covered by an absolute promise.
+See [WINDOWS-RECOVERY.md](WINDOWS-RECOVERY.md) for migration, warnings and
+fixture-only acceptance boundaries.
 
 Local proxy and internal carrier listeners require literal loopback endpoints
 by default. `allow_non_loopback_proxy` is an explicit unsafe sharing choice,

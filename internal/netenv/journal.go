@@ -4,11 +4,11 @@
 package netenv
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -65,10 +65,17 @@ type policySnap struct {
 }
 type snapshot struct {
 	Version int                                 `json:"version,omitempty"`
+	ID      string                              `json:"id,omitempty"`
 	Owner   journalOwner                        `json:"owner,omitempty"`
 	Values  map[string]map[string]registryValue `json:"values,omitempty"`
 	Applied map[string]map[string]registryValue `json:"applied,omitempty"`
 	HadKeys map[string]bool                     `json:"had_keys,omitempty"`
+	Touched map[string]bool                     `json:"touched,omitempty"`
+	// Only migrated journals may have an owner without a PID or an unknown
+	// applied bypass. Resolve that bypass durably before restoring its bundle.
+	RecoveryOnly bool            `json:"recovery_only,omitempty"`
+	LegacyBypass map[string]bool `json:"legacy_bypass,omitempty"`
+	importRaw    []byte
 	// Preserve the old journal format for recovery of existing clients.
 	ProxyEnable      uint32                `json:"proxy_enable"`
 	ProxyServer      stringVal             `json:"proxy_server"`
@@ -88,6 +95,7 @@ type Manager struct {
 	leaseFactory func(string) (func(), error)
 	leaseRelease func()
 	backup       func([]byte)
+	result       Result
 }
 
 func (m *Manager) snapPath() string { return filepath.Join(m.Dir, "snapshot.json") }
@@ -104,15 +112,13 @@ func settingsPaths() []string { return append([]string{regKeyPath}, chromiumPoli
 // Managed machines commonly make HKCU\Software\Policies read-only; v1.1.5
 // applied these keys best-effort, so a denied policy write must never take
 // down the client. The WinINET settings in regKeyPath stay mandatory.
-func policyPath(path string) bool { return path != regKeyPath }
-
-// legacyBypass reports whether a legacy v1.1.5 journal entry cannot be
-// compared exactly. The old journal recorded the applied server but not the
-// applied bypass list, so a config-specific override looks like a third-party
-// change during update recovery. Restore it unconditionally, as v1.1.5 did;
-// the server address still gets the normal conflict check.
-func legacyBypass(version int, name string) bool {
-	return version == 0 && name == "ProxyOverride"
+func policyPath(path string) bool {
+	for _, allowed := range chromiumPolicyPaths {
+		if path == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) acquireLease() error {
@@ -140,6 +146,7 @@ func (m *Manager) releaseLease() {
 func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.result = Result{}
 	if m.store == nil {
 		return errors.New("netenv: --auto-proxy is only supported on Windows")
 	}
@@ -160,7 +167,17 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 		}
 		return errors.New("netenv: existing journal must be recovered before applying settings")
 	}
-	s := snapshot{Version: 2, Values: make(map[string]map[string]registryValue), HadKeys: make(map[string]bool), OtuAppliedServer: proxyAddr}
+	// Retry detached cleanup first. Unresolved or unreadable records block only
+	// their policy bundles, not the mandatory WinINET settings. Never capture a
+	// previous session's applied policy as the next session's original value.
+	blocked := m.retryPendingPolicies()
+	id := make([]byte, 16)
+	if _, err := rand.Read(id); err != nil {
+		m.releaseLease()
+		return err
+	}
+	s := snapshot{Version: 3, ID: hex.EncodeToString(id), Values: make(map[string]map[string]registryValue),
+		Applied: make(map[string]map[string]registryValue), HadKeys: make(map[string]bool), Touched: make(map[string]bool), OtuAppliedServer: proxyAddr}
 	if m.owner != nil {
 		var err error
 		s.Owner, err = m.owner()
@@ -169,39 +186,35 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 			return err
 		}
 	}
+	if s.Owner.PID <= 0 {
+		m.releaseLease()
+		return errors.New("netenv: could not identify settings journal owner")
+	}
+	intended := appliedSettings(proxyAddr, bypass)
 	for _, path := range settingsPaths() {
-		exists, err := m.store.KeyExists(path)
+		if blocked[path] {
+			m.result.SkippedPolicies = append(m.result.SkippedPolicies, path)
+			continue
+		}
+		exists, values, err := m.captureBundle(path)
 		if err != nil {
 			if !policyPath(path) {
 				m.releaseLease()
-				return fmt.Errorf("netenv: snapshot key: %w", err)
+				return fmt.Errorf("netenv: snapshot: %w", err)
 			}
-			// Do not let an unreadable optional policy key block the proxy.
-			// HadKeys=true keeps restore from deleting a key we could not read.
-			exists = true
+			m.warn(path, "snapshot skipped; original values are unknown", err)
+			m.result.SkippedPolicies = append(m.result.SkippedPolicies, path)
+			continue
 		}
-		s.HadKeys[path] = exists
-		s.Values[path] = make(map[string]registryValue)
-		for _, name := range settingsNames(path) {
-			v, err := m.store.Read(path, name)
-			if err != nil {
-				if !policyPath(path) {
-					m.releaseLease()
-					return fmt.Errorf("netenv: snapshot %s: %w", name, err)
-				}
-				v = registryValue{}
-			}
-			s.Values[path][name] = v
-		}
+		s.HadKeys[path], s.Values[path], s.Applied[path], s.Touched[path] = exists, values, intended[path], false
 	}
-	s.Applied = appliedSettings(proxyAddr, bypass)
 	s.fillLegacy()
 	raw, err := json.Marshal(s)
 	if err != nil {
 		m.releaseLease()
 		return err
 	}
-	if len(raw) > 256<<10 {
+	if len(raw) > journalSizeLimit {
 		m.releaseLease()
 		return errors.New("netenv: settings snapshot exceeds recovery size limit; nothing changed")
 	}
@@ -209,63 +222,51 @@ func (m *Manager) Begin(proxyAddr string, bypass []string) error {
 		m.releaseLease()
 		return fmt.Errorf("netenv: journal: %w", err)
 	}
-	if err := os.WriteFile(m.lockPath(), []byte(strconv.Itoa(s.Owner.PID)), 0o600); err != nil {
+	if err := privatefile.Write(m.lockPath(), []byte(strconv.Itoa(s.Owner.PID))); err != nil {
 		return errors.Join(err, m.restoreSnapshot(s, false))
 	}
 	if m.backup != nil {
 		m.backup(raw)
 	}
-	// Detect a competing proxy change between snapshot and apply before
-	// mutating anything. The lease serializes opentunnel, not other software.
-	// Optional browser policy keys are applied best-effort (v1.1.5 behaviour)
-	// and must not block the mandatory WinINET change.
 	for _, path := range settingsPaths() {
-		if policyPath(path) {
+		if _, captured := s.Values[path]; !captured {
 			continue
 		}
-		for _, name := range settingsNames(path) {
-			current, err := m.store.Read(path, name)
-			if err != nil {
+		err := m.applyBundle(path, s.bundle(path), func() error {
+			s.Touched[path] = true
+			if err := m.saveSnapshot(s); err != nil {
+				s.Touched[path] = false
 				return err
 			}
-			if !sameValue(current, s.Values[path][name]) {
-				return ErrSettingsConflict
+			return nil
+		})
+		if err == nil {
+			if policyPath(path) {
+				m.result.AppliedPolicies = append(m.result.AppliedPolicies, path)
+			}
+			continue
+		}
+		if !policyPath(path) {
+			return errors.Join(err, m.restoreSnapshot(s, false))
+		}
+		m.warn(path, "apply skipped", err)
+		m.result.SkippedPolicies = append(m.result.SkippedPolicies, path)
+		if s.Touched[path] {
+			// A failed write/readback can have changed part of the bundle.
+			// Roll back only known values, with the same conflict checks used
+			// for crash recovery. Failed rollback remains journal-owned.
+			b := s.bundle(path)
+			if err := m.restoreBundle(path, &b, nil); err != nil {
+				m.warn(path, "partial apply cleanup pending", err)
+				m.result.PendingPolicies = appendUnique(m.result.PendingPolicies, path)
+				continue
+			}
+			s.Touched[path] = false
+			if err := m.saveSnapshot(s); err != nil {
+				s.Touched[path] = true // the durable journal still owns it
+				m.warn(path, "rollback completed but journal update failed", err)
 			}
 		}
-	}
-	var policyWarning error
-	for _, path := range settingsPaths() {
-		optional := policyPath(path)
-		for _, name := range settingsNames(path) {
-			current, err := m.store.Read(path, name)
-			if err != nil {
-				if optional {
-					continue
-				}
-				return errors.Join(err, m.restoreSnapshot(s, false))
-			}
-			if !optional && !sameValue(current, s.Values[path][name]) {
-				return errors.Join(ErrSettingsConflict, m.restoreSnapshot(s, false))
-			}
-			if err := m.store.Write(path, name, s.Applied[path][name]); err != nil {
-				if optional {
-					if policyWarning == nil {
-						policyWarning = fmt.Errorf("browser policy keys are read-only: %w", err)
-					}
-					continue
-				}
-				return errors.Join(fmt.Errorf("netenv: apply %s: %w", name, err), m.restoreSnapshot(s, false))
-			}
-			if actual, err := m.store.Read(path, name); err != nil || !sameValue(actual, s.Applied[path][name]) {
-				if optional {
-					continue
-				}
-				return errors.Join(errors.New("netenv: settings application did not persist"), err, m.restoreSnapshot(s, false))
-			}
-		}
-	}
-	if policyWarning != nil {
-		log.Printf("netenv: %v; system proxy still applied (open browsers may need a restart)", policyWarning)
 	}
 	if m.notify != nil {
 		m.notify()
@@ -297,161 +298,63 @@ func (s *snapshot) fillLegacy() {
 	s.AutoConfigURL = legacy(v["AutoConfigURL"])
 	s.Policies = make(map[string]policySnap)
 	for _, path := range chromiumPolicyPaths {
-		v := s.Values[path]
+		v, captured := s.Values[path]
+		if !captured {
+			continue
+		}
 		s.Policies[path] = policySnap{Mode: legacy(v[polMode]), Server: legacy(v[polServer]), Bypass: legacy(v[polBypass]), HadKey: s.HadKeys[path]}
 	}
 }
 
-func readSnapshot(path string) (snapshot, error) {
-	s := snapshot{}
-	f, err := os.Open(path)
-	if err != nil {
-		return s, err
-	}
-	defer f.Close()
-	raw, err := io.ReadAll(io.LimitReader(f, 256<<10+1))
-	if err != nil {
-		return s, err
-	}
-	if len(raw) > 256<<10 {
-		return s, errors.New("netenv: journal too large")
-	}
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return s, fmt.Errorf("netenv: corrupt journal retained: %w", err)
-	}
-	if s.Version != 0 && s.Version != 2 {
-		return s, errors.New("netenv: unsupported journal version")
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return s, err
-	}
-	if s.Version == 0 {
-		for _, name := range []string{"proxy_enable", "proxy_server", "proxy_override", "autoconfig_url"} {
-			if _, ok := fields[name]; !ok {
-				return s, errors.New("netenv: incomplete legacy journal")
-			}
-		}
-	} else {
-		if s.Owner.PID <= 0 {
-			return s, errors.New("netenv: settings journal has no valid owner")
-		}
-		for _, path := range settingsPaths() {
-			if _, ok := s.HadKeys[path]; !ok {
-				return s, errors.New("netenv: incomplete key-existence journal")
-			}
-			for _, name := range settingsNames(path) {
-				if _, ok := s.Values[path][name]; !ok {
-					return s, errors.New("netenv: incomplete settings journal")
-				}
-				if _, ok := s.Applied[path][name]; !ok {
-					return s, errors.New("netenv: incomplete applied-settings journal")
-				}
-			}
-		}
-	}
-	if s.Values == nil {
-		str := func(v stringVal) registryValue { return registryValue{Exists: v.Exists, Kind: 1, Text: v.Data} }
-		s.Values = map[string]map[string]registryValue{regKeyPath: {"ProxyEnable": {Exists: true, Kind: 4, Integer: uint64(s.ProxyEnable)}, "ProxyServer": str(s.ProxyServer), "ProxyOverride": str(s.ProxyOverride), "AutoConfigURL": str(s.AutoConfigURL)}}
-		s.HadKeys = map[string]bool{regKeyPath: true}
-		for path, v := range s.Policies {
-			s.Values[path] = map[string]registryValue{polMode: str(v.Mode), polServer: str(v.Server), polBypass: str(v.Bypass)}
-			s.HadKeys[path] = v.HadKey
-		}
-		if s.OtuAppliedServer != "" {
-			s.Applied = appliedSettings(s.OtuAppliedServer, nil)
-		}
-	}
-	allowed := map[string]bool{}
-	for _, path := range settingsPaths() {
-		allowed[path] = true
-	}
-	for path, values := range s.Values {
-		if !allowed[path] {
-			return s, errors.New("netenv: journal names an unrelated registry key")
-		}
-		names := map[string]bool{}
-		for _, name := range settingsNames(path) {
-			names[name] = true
-		}
-		for name, v := range values {
-			if v.Kind == 4 && v.Integer > 1<<32-1 {
-				return s, errors.New("netenv: DWORD restoration would overflow")
-			}
-			if !names[name] || (v.Exists && v.Kind != 1 && v.Kind != 2 && v.Kind != 3 && v.Kind != 4 && v.Kind != 7 && v.Kind != 11) {
-				return s, errors.New("netenv: invalid journal value")
-			}
-		}
-	}
-	return s, nil
+func writeJournal(path string, raw []byte) error {
+	// No-replace publication preserves even an orphaned recovery journal.
+	return newRecoveryState(path, raw)
 }
 
-func writeJournal(path string, raw []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	if err := privatefile.EnsureDir(filepath.Dir(path)); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".network-journal-*")
+func (m *Manager) saveSnapshot(s snapshot) error {
+	raw, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if err := privatefile.Protect(tmp); err != nil {
-		_ = f.Close()
-		return err
+	if len(raw) > journalSizeLimit {
+		return errors.New("netenv: settings journal exceeds recovery size limit")
 	}
-	if _, err = f.Write(raw); err == nil {
-		err = f.Sync()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return err
-	}
-	// The exclusive settings lease prevents concurrent writers. Do not
-	// overwrite even an orphaned journal; it may be the only recovery copy.
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		return errors.New("netenv: journal already exists")
-	}
-	return os.Rename(tmp, path)
+	return writeRecoveryState(m.snapPath(), raw)
 }
 
 func (m *Manager) Recover() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.result = Result{}
 	if m.store == nil {
 		return nil
 	}
-	if _, err := os.Stat(m.snapPath()); errors.Is(err, os.ErrNotExist) {
+	// Even without an active journal there may be detached policy cleanup.
+	// Do not touch either kind of state while another client owns the lease.
+	if !m.hasRecoveryState() {
 		return nil
-	} else if err != nil {
-		return err
 	}
+	hadLease := m.leaseRelease != nil
 	if err := m.acquireLease(); err != nil {
 		return err
 	}
-	defer m.releaseLease()
+	// A live session calling Recover must not release its own lease on the
+	// ErrAlreadyRunning path. Other managers release their temporary lease.
+	defer func() {
+		if !hadLease {
+			m.releaseLease()
+		}
+	}()
 	s, err := readSnapshot(m.snapPath())
+	if errors.Is(err, os.ErrNotExist) {
+		m.retryPendingPolicies()
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if s.Owner.PID == 0 {
-		if raw, err := os.ReadFile(m.lockPath()); err == nil {
-			s.Owner.PID, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
-		}
-	}
-	if s.Owner.PID > 0 && m.ownerAlive != nil {
-		alive, err := m.ownerAlive(s.Owner)
-		if err != nil {
-			return err
-		}
-		if alive {
-			return ErrAlreadyRunning
-		}
+	if err := m.checkOwner(s); err != nil {
+		return err
 	}
 	return m.restoreSnapshot(s, false)
 }
@@ -459,19 +362,27 @@ func (m *Manager) Recover() error {
 func (m *Manager) Restore() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.result = Result{}
 	if m.store == nil {
 		return nil
 	}
+	hadLease := m.leaseRelease != nil
+	if !hadLease && !m.hasRecoveryState() {
+		return nil
+	}
+	if err := m.acquireLease(); err != nil {
+		return err
+	}
 	s, err := readSnapshot(m.snapPath())
 	if errors.Is(err, os.ErrNotExist) {
-		m.releaseLease()
+		defer m.releaseLease()
+		m.retryPendingPolicies()
 		return nil
 	}
 	if err != nil {
-		return err
-	}
-	hadLease := m.leaseRelease != nil
-	if err := m.acquireLease(); err != nil {
+		if !hadLease {
+			m.releaseLease()
+		}
 		return err
 	}
 	if !hadLease {
@@ -486,6 +397,7 @@ func (m *Manager) Restore() error {
 func (m *Manager) RestoreFrom(path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.result = Result{}
 	if m.store == nil {
 		return nil
 	}
@@ -498,20 +410,100 @@ func (m *Manager) RestoreFrom(path string) error {
 		return err
 	}
 	if !hadLease {
-		if current, err := readSnapshot(m.snapPath()); err == nil {
+		if err := m.checkOwner(s); err != nil {
+			m.releaseLease()
+			return err
+		}
+	}
+	if current, err := readSnapshot(m.snapPath()); err == nil {
+		if !hadLease {
 			if err := m.checkOwner(current); err != nil {
 				m.releaseLease()
 				return err
 			}
 		}
+		if current.ID != s.ID {
+			if !hadLease {
+				m.releaseLease()
+			}
+			return errors.New("netenv: active journal belongs to a different session; recover it before restoring this backup")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		if !hadLease {
+			m.releaseLease()
+		}
+		return err // never discard an unreadable active journal
+	}
+	// Capture the mandatory bundle before installing backup state as the
+	// active journal. A read failure must not overwrite another retry boundary
+	// or turn operator force into an unjournaled write.
+	mandatoryCurrent, err := m.readBundle(regKeyPath)
+	if err != nil {
+		if !hadLease {
+			m.releaseLease()
+		}
+		return err
+	}
+	if err := m.upgradeSnapshot(&s); err != nil {
+		if !hadLease {
+			m.releaseLease()
+		}
+		return err
+	}
+	if s.Applied == nil {
+		s.Applied = make(map[string]map[string]registryValue)
+	}
+	if s.LegacyBypass == nil {
+		s.LegacyBypass = make(map[string]bool)
+	}
+	// An explicit backup restore still needs an active write-ahead journal.
+	// Pin the CURRENT bundle values so a crash or partial force restoration
+	// can be retried normally without a permanent permission to force later
+	// administrator changes. The source backup itself is never modified.
+	for _, bundlePath := range settingsPaths() {
+		if _, captured := s.Values[bundlePath]; !captured {
+			continue
+		}
+		current := mandatoryCurrent
+		var err error
+		if bundlePath != regKeyPath {
+			current, err = m.readBundle(bundlePath)
+		}
+		if err != nil {
+			if !policyPath(bundlePath) {
+				if !hadLease {
+					m.releaseLease()
+				}
+				return err
+			}
+			m.warn(bundlePath, "force restore could not capture current policy; normal conflict checks retained", err)
+		} else {
+			s.Applied[bundlePath] = current
+			delete(s.LegacyBypass, bundlePath)
+		}
+		s.Touched[bundlePath] = true
+	}
+	if err := m.saveSnapshot(s); err != nil {
+		if !hadLease {
+			m.releaseLease()
+		}
+		return err
 	}
 	return m.restoreSnapshot(s, true)
 }
 
 func (m *Manager) checkOwner(s snapshot) error {
 	if s.Owner.PID == 0 {
-		if raw, err := os.ReadFile(m.lockPath()); err == nil {
-			s.Owner.PID, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
+		raw, err := privatefile.Read(m.lockPath(), 64)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("netenv: legacy owner record unreadable; journal retained: %w", err)
+		}
+		if err == nil {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+			if err != nil || pid <= 0 {
+				return errors.New("netenv: legacy owner record invalid; journal retained")
+			}
+			s.Owner.PID = pid
 		}
 	}
 	if s.Owner.PID > 0 && m.ownerAlive != nil {
@@ -533,94 +525,80 @@ func sameValue(a, b registryValue) bool {
 	return reflect.DeepEqual(a, b)
 }
 
+func (m *Manager) upgradeSnapshot(s *snapshot) error {
+	if s.Version == 3 {
+		return nil
+	}
+	if len(s.importRaw) != 0 {
+		archive := filepath.Join(m.Dir, "journal-imports", s.ID+".json")
+		if err := privatefile.WriteNew(archive, s.importRaw); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return fmt.Errorf("netenv: preserve original imported journal: %w", err)
+			}
+			existing, err := privatefile.Read(archive, journalSizeLimit)
+			if err != nil || !reflect.DeepEqual(existing, s.importRaw) {
+				return errors.Join(errors.New("netenv: imported journal archive differs; evidence retained"), err)
+			}
+		}
+	}
+	s.Version, s.RecoveryOnly = 3, true
+	s.fillLegacy()
+	// Pin imported data before registry mutation. Resolved unknown bypasses
+	// and the exact-address contamination rule must survive partial recovery.
+	return m.saveSnapshot(*s)
+}
+
 func (m *Manager) restoreSnapshot(s snapshot, force bool) error {
-	var failures []error
-	for _, path := range settingsPaths() {
-		values, captured := s.Values[path]
-		if !captured {
-			continue
+	defer func() {
+		if m.notify != nil {
+			m.notify()
 		}
-		// Optional browser policy keys are best-effort on restore too: a
-		// managed PC can deny them without blocking restoration of the
-		// mandatory WinINET proxy settings.
-		optional := policyPath(path)
-		// Settings within one registry key form a logical bundle. If a user
-		// changed the server, do not restore ProxyEnable and silently disable
-		// their replacement proxy while retaining only its address.
-		conflict := false
-		for _, name := range settingsNames(path) {
-			original, captured := values[name]
-			if !captured {
-				continue
-			}
-			current, err := m.store.Read(path, name)
-			if err != nil {
-				if !optional {
-					failures = append(failures, err)
-				}
-				conflict = true
-				continue
-			}
-			if applied, ok := s.Applied[path][name]; !force && s.Applied != nil && !legacyBypass(s.Version, name) && !sameValue(current, original) && (!ok || !sameValue(current, applied)) {
-				conflict = true
-				if !optional {
-					failures = append(failures, ErrSettingsConflict)
-				}
-			}
-		}
-		if conflict {
-			continue
-		}
-		for _, name := range settingsNames(path) {
-			original, captured := values[name]
-			if !captured {
-				continue
-			}
-			current, err := m.store.Read(path, name)
-			if err != nil {
-				if !optional {
-					failures = append(failures, fmt.Errorf("netenv: read %s: %w", name, err))
-				}
-				continue
-			}
-			if sameValue(current, original) {
-				continue
-			}
-			if applied, ok := s.Applied[path][name]; !force && s.Applied != nil && !legacyBypass(s.Version, name) && (!ok || !sameValue(current, applied)) {
-				if !optional {
-					failures = append(failures, ErrSettingsConflict)
-				}
-				continue
-			}
-			if err := m.store.Write(path, name, original); err != nil {
-				if !optional {
-					failures = append(failures, fmt.Errorf("netenv: restore %s: %w", name, err))
-				}
-			}
-			if actual, err := m.store.Read(path, name); err != nil || !sameValue(actual, original) {
-				if !optional {
-					failures = append(failures, errors.New("netenv: restore was not durable; journal retained"), err)
-				}
-			}
-		}
-		if !s.HadKeys[path] && optional {
-			_ = m.store.DeleteEmptyKey(path)
-		}
-	}
-	if m.notify != nil {
-		m.notify()
-	}
-	if err := errors.Join(failures...); err != nil {
-		return err
-	} // preserve journal and lease for retry
-	if err := os.Remove(m.snapPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	}()
+	if err := m.upgradeSnapshot(&s); err != nil {
 		return err
 	}
-	if err := os.Remove(m.lockPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if force || s.Touched[regKeyPath] {
+		b := s.bundle(regKeyPath)
+		// RestoreFrom already pinned the operator-authorized current values;
+		// even that path refuses a later competing change during journaling.
+		if err := m.restoreBundle(regKeyPath, &b, func(b settingsBundle) error {
+			s.setBundle(regKeyPath, b)
+			return m.saveSnapshot(s)
+		}); err != nil {
+			// WinINET failure must remain fatal/retryable, but it is not a
+			// reason to leave writable browser policies pointing to a dead
+			// local listener. Their evidence stays in the active journal until
+			// mandatory restoration can finish and detach any remaining work.
+			for _, path := range chromiumPolicyPaths {
+				if !s.Touched[path] {
+					continue
+				}
+				b := s.bundle(path)
+				if policyErr := m.restoreBundle(path, &b, func(b settingsBundle) error {
+					s.setBundle(path, b)
+					return m.saveSnapshot(s)
+				}); policyErr != nil {
+					m.warn(path, "cleanup pending in active recovery journal", policyErr)
+					m.result.PendingPolicies = appendUnique(m.result.PendingPolicies, path)
+				}
+			}
+			return err // mandatory restoration keeps the active journal/lease
+		}
+	}
+	// Detach optional evidence BEFORE releasing mandatory session ownership.
+	// The no-replace, per-session record also works when an older pending file
+	// is corrupt or unreadable; that file is never overwritten or discarded.
+	if err := m.detachPolicies(s, force); err != nil {
+		return fmt.Errorf("netenv: could not preserve pending policy cleanup; active journal retained: %w", err)
+	}
+	if err := removeRecoveryState(m.lockPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	if err := removeRecoveryState(m.snapPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	m.retryPendingPolicies()
 	m.releaseLease()
-	_ = os.Remove(filepath.Join(m.Dir, "network-settings.lease"))
 	return nil
 }
 
@@ -630,11 +608,11 @@ func backupSnapshot(raw []byte) {
 		return
 	}
 	dir := filepath.Join(filepath.Dir(exe), "settings-backup")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := privatefile.EnsureDir(dir); err != nil {
 		return
 	}
-	name := "network-settings-" + time.Now().Format("20060102-150405") + ".json"
-	if err := os.WriteFile(filepath.Join(dir, name), raw, 0o600); err != nil {
+	name := "network-settings-" + time.Now().Format("20060102-150405.000000000") + ".json"
+	if err := privatefile.WriteNew(filepath.Join(dir, name), raw); err != nil {
 		return
 	}
 	entries, _ := filepath.Glob(filepath.Join(dir, "network-settings-*.json"))
@@ -643,6 +621,6 @@ func backupSnapshot(raw []byte) {
 		_ = os.Remove(entries[0])
 		entries = entries[1:]
 	}
-	bat := "@echo off\r\n\"%~dp0..\\" + filepath.Base(exe) + "\" --restore-from \"%~dp0" + name + "\"\r\nif errorlevel 1 (echo Restore failed - keep the backup and retry.) else (echo Network settings restored.)\r\npause\r\n"
-	_ = os.WriteFile(filepath.Join(dir, "restore-network.bat"), []byte(bat), 0o755)
+	bat := "@echo off\r\n\"%~dp0..\\" + filepath.Base(exe) + "\" --restore-from \"%~dp0" + name + "\"\r\nif errorlevel 1 (echo Restore failed - keep the backup and retry.) else (echo Recovery attempted; review any pending-policy warnings.)\r\npause\r\n"
+	_ = privatefile.Write(filepath.Join(dir, "restore-network.bat"), []byte(bat))
 }

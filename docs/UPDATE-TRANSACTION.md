@@ -35,7 +35,9 @@ new signatures merely because old clients accepted the previous asset set.
    companion shutdown before replacement.
 4. Helper preserves a unique original backup, swaps the staged file and starts
    the replacement. The replacement initializes its proxies, settings journal
-   and optional companion before writing its private readiness token.
+   and optional companion before writing its private readiness token. Skipped
+   browser-policy bundles and durably pending optional cleanup are nonfatal
+   degraded results, not evidence that all browsers were reconfigured.
 5. Require readiness plus a short stability window. Failed child creation,
    premature exit, readiness timeout or failed commit rolls back the original
    verified executable and restarts it. A successful transaction keeps the
@@ -55,6 +57,16 @@ pretending the failed replacement became healthy.
 Windows tests use copied test executables/private temporary files for real
 rename/readiness/rollback; they do not replace the installed client. Recovery
 tests use isolated settings adapters rather than changing the user's proxy.
+
+Automatic-proxy executable acceptance uses a separate client build with
+`-tags=netenvfixture`: that build has **no proxy or ban-marker registry adapter**. It exercises
+the real startup/update-parent/recovery-helper paths with synthetic policy
+dictionaries, custom legacy bypasses and permission transitions. It is never a
+release asset, and does not establish managed-device ACL, logoff/shutdown or
+intended-network acceptance. Manual-proxy handoff also uses the registry-free
+fixture build: a normal client can clear ban markers even in manual mode. The
+normal staged release executable is built/scanned and its state-free version
+preflight is tested separately, not run against the operator's registry.
 
 The version-only preflight runs before identity/recovery initialization and
 does not inspect recovery state belonging to the temporary staged path. Update

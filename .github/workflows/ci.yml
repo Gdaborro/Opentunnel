@@ -5,7 +5,7 @@ permissions:
 
 on:
   push:
-    branches: [main, "review/hardening-reality-*", "release/*"]
+    branches: [main, "review/hardening-reality-*", "release/*", "fix/*"]
   pull_request:
 
 jobs:
@@ -56,14 +56,26 @@ jobs:
         run: go vet ./...
       - name: module integrity
         run: go mod verify
-      - name: staged Windows client acceptance fixture
+      - name: staged Windows production client version preflight
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $target = Join-Path $env:RUNNER_TEMP 'otu-release-client.exe'
           go build -buildvcs=false -trimpath -ldflags="-s -w" -o $target ./cmd/otu-client
           if ($LASTEXITCODE -ne 0) { throw 'Client acceptance binary build failed' }
+          "OTU_TEST_PRODUCTION_CLIENT_BINARY=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: fixture-only Windows automatic-proxy client
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'otu-autoproxy-fixture.exe'
+          go build -buildvcs=false -tags=netenvfixture -trimpath -ldflags="-s -w" -o $target ./cmd/otu-client
+          if ($LASTEXITCODE -ne 0) { throw 'Automatic-proxy fixture build failed' }
+          "OTU_TEST_AUTOPROXY_BINARY=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
           "OTU_TEST_CLIENT_BINARY=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: automatic-proxy startup and legacy policy migration acceptance
+        if: runner.os == 'Windows'
+        run: go test -race -count=1 -v -run '^TestFixtureClientAutomaticProxyStartupAndLegacyRecovery$' -timeout 180s ./test
       - name: gofmt check
         run: |
           OUT=$(gofmt -l .)

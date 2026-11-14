@@ -120,12 +120,18 @@ func runRecoveryWatcher(parent uint32) error {
 	}
 	for attempt := 0; attempt < 5; attempt++ {
 		err = mgr.Recover()
-		if err == nil || errors.Is(err, ErrAlreadyRunning) {
+		if errors.Is(err, ErrAlreadyRunning) {
+			return nil // another active session must never be restored
+		}
+		if err == nil && !mgr.PendingPolicyCleanup() {
 			return nil
 		}
 		if attempt < 4 {
 			time.Sleep(time.Second)
 		}
+	}
+	if err == nil {
+		return errors.New("optional browser-policy cleanup remains pending; evidence retained for next-start or --restore retry")
 	}
 	return fmt.Errorf("recovery journal retained for manual retry: %w", err)
 }

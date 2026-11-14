@@ -217,7 +217,7 @@ func TestExecutableTransactionCommitsOrRollsBack(t *testing.T) {
 						want = "original restarted"
 					}
 					if string(data) != want {
-						t.Fatal("incorrect recovery outcome")
+						t.Fatalf("incorrect recovery outcome: got %q, want %q", data, want)
 					}
 					break
 				}

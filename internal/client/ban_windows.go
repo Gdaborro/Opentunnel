@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows && !netenvfixture
 
 package client
 
@@ -21,18 +21,6 @@ func deviceFingerprint() string {
 	raw := fmt.Sprintf("%s|%s", guid, hostname)
 	sum := sha256.Sum256([]byte(raw))
 	return fmt.Sprintf("%x", sum[:16])
-}
-
-func isRegistryBanned() bool {
-	return banState.Banned()
-}
-func writeRegistryBan(reason, duration string) { banState.Write(reason, duration) }
-func clearRegistryBan()                        { banState.Clear() }
-
-type banBackend interface {
-	Banned() bool
-	Write(string, string)
-	Clear()
 }
 
 var banState banBackend = windowsBanBackend{}

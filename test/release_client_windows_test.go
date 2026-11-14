@@ -44,7 +44,11 @@ func TestLegacyReleaseLauncherChild(t *testing.T) {
 	if err := os.WriteFile(exe, data, 0700); err != nil {
 		os.Exit(54)
 	}
-	cmd := exec.Command(exe, "-c", os.Getenv("OTU_TEST_RELEASE_CONFIG"))
+	args := []string{"-c", os.Getenv("OTU_TEST_RELEASE_CONFIG")}
+	if os.Getenv("OTU_TEST_RELEASE_AUTOPROXY") == "1" {
+		args = append(args, "--auto-proxy")
+	}
+	cmd := exec.Command(exe, args...)
 	cmd.Env = append(os.Environ(), "OTU_UPDATE_PARENT_PID=")
 	if os.Getenv("OTU_TEST_LEGACY_HINT") == "1" {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("OTU_UPDATE_PARENT_PID=%d", os.Getpid()))
@@ -79,8 +83,9 @@ func releaseFreePort(t *testing.T) string {
 func TestActualReleaseClientStartupAndLegacyUpgradeHandoff(t *testing.T) {
 	binary := os.Getenv("OTU_TEST_CLIENT_BINARY")
 	if binary == "" {
-		t.Skip("set OTU_TEST_CLIENT_BINARY to a staged release executable")
+		t.Skip("set OTU_TEST_CLIENT_BINARY to a netenvfixture client; a normal client can mutate ban markers even in manual-proxy mode")
 	}
+	binary = requireFixtureClientBinary(t, binary)
 	for _, hint := range []bool{false, true} {
 		t.Run(fmt.Sprintf("parent_hint_%t", hint), func(t *testing.T) {
 			dir := t.TempDir()
@@ -90,10 +95,14 @@ func TestActualReleaseClientStartupAndLegacyUpgradeHandoff(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			seedFixtureIdentity(t, store, "manual-handoff-fixture")
 			device, err := store.LoadOrCreate()
 			if err != nil {
 				t.Fatal(err)
 			}
+			fixturePath := filepath.Join(dir, "synthetic-settings.json")
+			t.Setenv("OTU_NETENV_FIXTURE", fixturePath)
+			writeProxyFixture(t, fixturePath, proxyFixture{Keys: map[string]map[string]fixtureValue{fixtureWinINET: {}}})
 			pub, err := store.EnsureSSHKey()
 			if err != nil {
 				t.Fatal(err)
@@ -129,7 +138,7 @@ func TestActualReleaseClientStartupAndLegacyUpgradeHandoff(t *testing.T) {
 			}
 			pidFile, logFile := filepath.Join(dir, "child.pid"), filepath.Join(dir, "client.log")
 			parent := exec.Command(launcher, "-test.run=^TestLegacyReleaseLauncherChild$")
-			parent.Env = append(os.Environ(), "OTU_LEGACY_RELEASE_LAUNCHER=1", "OTU_TEST_RELEASE_CLIENT="+binary, "OTU_TEST_RELEASE_CONFIG="+cfgPath, "OTU_TEST_RELEASE_PID="+pidFile, "OTU_TEST_RELEASE_LOG="+logFile)
+			parent.Env = append(os.Environ(), "OTU_LEGACY_RELEASE_LAUNCHER=1", "OTU_TEST_RELEASE_CLIENT="+binary, "OTU_TEST_RELEASE_CONFIG="+cfgPath, "OTU_TEST_RELEASE_PID="+pidFile, "OTU_TEST_RELEASE_LOG="+logFile, "OTU_TEST_RELEASE_AUTOPROXY=0")
 			if hint {
 				parent.Env = append(parent.Env, "OTU_TEST_LEGACY_HINT=1")
 			}
@@ -187,7 +196,7 @@ func TestActualReleaseClientStartupAndLegacyUpgradeHandoff(t *testing.T) {
 			if err != nil || policy.UsedBytes < int64(len(bulk)) {
 				t.Fatal("release fixture bypassed authenticated relay/accounting", err)
 			}
-			t.Logf("actual client legacy handoff (parent hint=%t), preserved synthetic identity and %d payload bytes passed; no system proxy mutation", hint, len(bulk))
+			t.Logf("fixture client legacy handoff (parent hint=%t), preserved synthetic identity and %d payload bytes passed; no registry adapters", hint, len(bulk))
 		})
 	}
 }

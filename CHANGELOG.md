@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased - Windows recovery ownership fixes
+
+- Skip unknown or conflicting optional browser-policy bundles without treating
+  unreadable originals as absent or terminating valid WinINET startup.
+- Preserve failed optional cleanup in private per-session records; retry across
+  restarts without blocking mandatory startup or recapturing stale policy values.
+- Scope legacy WinINET/Chromium custom-bypass migration to journal-owned applied
+  bundles, and preserve v1.1.5's exact-address contaminated-original recovery rule.
+- Journal partial/explicit restoration, retain corrupt/persistence-failed evidence
+  and expose nonfatal apply/cleanup warnings without promising browser routing.
+- Add synthetic recovery regressions, fixture-only Windows `--auto-proxy` legacy
+  handoff acceptance and CI triggers for `fix/*` branches.
+
+No version/update-floor bump, release, transport enablement or deployment is
+part of these local source changes.
+
 ## v1.1.8 - update-handoff recovery fix
 
 ### Fixed
