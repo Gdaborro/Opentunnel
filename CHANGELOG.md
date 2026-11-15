@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased - Windows recovery ownership fixes
+## v1.1.9 - Windows recovery ownership fixes
 
 - Skip unknown or conflicting optional browser-policy bundles without treating
   unreadable originals as absent or terminating valid WinINET startup.
@@ -13,8 +13,10 @@
 - Add synthetic recovery regressions, fixture-only Windows `--auto-proxy` legacy
   handoff acceptance and CI triggers for `fix/*` branches.
 
-No version/update-floor bump, release, transport enablement or deployment is
-part of these local source changes.
+Version and update floor raised to v1.1.9. No transport, authentication, admission
+policy or listener enablement changes. Server/panel deployment is not required
+for this Windows client recovery update. See `docs/WINDOWS-RECOVERY.md` for
+pending-cleanup behavior, older-client compatibility and acceptance boundaries.
 
 ## v1.1.8 - update-handoff recovery fix
 
