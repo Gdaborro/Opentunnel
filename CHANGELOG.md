@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.1.10 - trusted server pools and enrollment accounts
+
+- Add explicitly imported, Ed25519-signed, credential-free self-hosted profiles
+  with bounded expiry, rollback protection and explicit operator consent.
+- Choose the lowest measured verified latency within the selected pool; bounded
+  setup failover never changes operator or retries a password to another entry.
+- Isolate each operator's device key, token, fingerprint, approvals and bans;
+  imported pools do not inherit default SSH/carrier credentials or learned trust.
+- Add separate password-gated enrollment user accounts. Login permits enrollment
+  only; a device still needs administrator approval and registered-key tunnel
+  authentication. Protected pools have no unsigned legacy downgrade exception.
+- Bind each pool to a single local approval/accounting authority, add signed
+  status and durable bounded HTTP-proof replay protection, and provide the
+  `otu-pool` source tool for dedicated operator keys and profile export.
+- Preserve orphan Windows proxy-journal recovery when selected pool state is
+  invalid; retain the existing default configuration and device identity until
+  an operator profile is explicitly selected.
+- Cover trust, account/admin separation, approval/revocation, ranking/failover,
+  cancellation, scoped identities and registry-free executable acceptance.
+
+Version and update floor raised to v1.1.10. Updating clients and server/panel
+does not enable a pool, change admission/kill-switch settings, open a listener,
+or force device reenrollment. Multiple entries must share one local database;
+independent remote databases are not synchronized federation. Known limitations
+from the separate audit remain; this release is not a production-readiness or
+stealth certification. See `docs/TRUSTED-SERVER-POOLS.md` for provisioning and
+`docs/UPDATE-TRANSACTION.md` for delivery and supervised-update behavior.
+Offline or auto-update-disabled devices need reconnection/manual delivery;
+publishing an update is not proof of fleet adoption.
+
 ## v1.1.9 - Windows recovery ownership fixes
 
 - Skip unknown or conflicting optional browser-policy bundles without treating

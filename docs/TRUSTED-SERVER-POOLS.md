@@ -1,8 +1,9 @@
-# Trusted server pools (feature branch)
+# Trusted server pools
 
-This feature is implemented in source but is **not part of the published
-v1.1.9 release**. No server deployment, fleet migration or public directory is
-performed by importing a profile.
+Introduced in v1.1.10. Updating the client/server executables does not enable a
+pool or change existing approval policy. No server deployment, fleet migration
+or public directory is performed by importing a profile. The `otu-pool`
+provisioning tool can be built from the matching release source as shown below.
 
 ## What automatic selection means
 

@@ -11,7 +11,7 @@ on a VPS (`otu-server`); one runs locally without administrator rights
   SSH key; the admin approves new devices once from the web panel (NAC).
   No shared secret ships in the binary. Banned devices (fingerprint + key)
   stay banned. Inactive devices are purged and re-approved on return.
-- **Trusted pools (new source feature)** — explicitly imported signed
+- **Trusted pools (v1.1.10+)** — explicitly imported signed
   self-hosted profiles select the lowest-latency verified entry. Optional
   enrollment user login is separate from administrator approval; device
   identities remain isolated per operator. See
