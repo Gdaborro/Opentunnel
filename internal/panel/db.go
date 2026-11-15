@@ -137,6 +137,32 @@ func migrateSchema(db schemaDB) error {
 		username TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS enrollment_accounts (
+		username TEXT PRIMARY KEY,
+		password_hash TEXT NOT NULL,
+		enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+		max_devices INTEGER NOT NULL DEFAULT 5 CHECK(max_devices BETWEEN 1 AND 32),
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS peer_enrollments (
+		token TEXT PRIMARY KEY,
+		username TEXT NOT NULL,
+		pool_id TEXT NOT NULL,
+		public_key TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_peer_enrollments_username ON peer_enrollments(username);
+	CREATE TABLE IF NOT EXISTS server_pool_authority (
+		id INTEGER PRIMARY KEY CHECK(id=1),
+		pool_id TEXT NOT NULL,
+		authority_id TEXT NOT NULL,
+		login_required INTEGER NOT NULL CHECK(login_required IN (0,1))
+	);
+	CREATE TABLE IF NOT EXISTS pool_http_proofs (
+		nonce TEXT PRIMARY KEY,
+		valid_until INTEGER NOT NULL
+	);
 	CREATE TABLE IF NOT EXISTS peers (
 		token TEXT PRIMARY KEY,
 		fingerprint TEXT NOT NULL,
@@ -267,6 +293,17 @@ func migrateSchema(db schemaDB) error {
 	if _, err := db.Exec(`UPDATE peers SET auth_epoch=hex(randomblob(16)) WHERE auth_epoch=''`); err != nil {
 		return err
 	}
+	for _, col := range []string{"pool_id", "public_key"} {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('peer_enrollments') WHERE name=?`, col).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec(`ALTER TABLE peer_enrollments ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+	}
 	// Seed the built-in categories (disabled until an admin enables them).
 	for cat := range categoryLists {
 		if _, err := db.Exec(`INSERT OR IGNORE INTO blocked_categories(category,enabled) VALUES(?,0)`, cat); err != nil {
@@ -296,6 +333,7 @@ func reaper(db *DB, purgeAfterDays int) {
 			db.Exec(`DELETE FROM daily_usage WHERE token NOT IN (SELECT token FROM peers)`)
 			db.Exec(`DELETE FROM ingress_usage WHERE token NOT IN (SELECT token FROM peers) OR day < date('now','-30 days')`)
 			db.Exec(`DELETE FROM device_health WHERE token NOT IN (SELECT token FROM peers)`)
+			db.Exec(`DELETE FROM peer_enrollments WHERE token NOT IN (SELECT token FROM peers)`)
 			db.Exec(`DELETE FROM peer_ips WHERE token NOT IN (SELECT token FROM peers)`)
 			db.Exec(`DELETE FROM peer_ips WHERE at < datetime('now','-7 days')`)
 			db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE status='kicked' AND kick_expires IS NOT NULL AND kick_expires < datetime('now')`)

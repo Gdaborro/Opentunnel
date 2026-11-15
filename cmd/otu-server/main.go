@@ -36,6 +36,7 @@ import (
 	"opentunnel/internal/privatefile"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/server"
+	"opentunnel/internal/serverpool"
 	"opentunnel/internal/transport"
 	"opentunnel/internal/version"
 )
@@ -209,12 +210,17 @@ func main() {
 		stateDirForPanel = "/var/lib/opentunnel"
 	}
 	var panelDB *panel.DB
+	var poolInfo serverpool.Info
 	if !cfg.StaticTokenOnly {
 		panelDB, err = panel.Open(filepath.Join(stateDirForPanel, "panel.db"), cfg.PurgeAfterDays)
 		if err != nil {
 			log.Fatalf("panel policy database unavailable; refusing to disable enforcement: %v", err)
 		}
 		defer panelDB.Close()
+		poolInfo, err = panelDB.BindServerPool(cfg.PoolID, cfg.EnrollmentLogin)
+		if err != nil {
+			log.Fatalf("server pool authority: %v", err)
+		}
 	}
 	metricsCtx, stopMetrics := context.WithCancel(context.Background())
 	defer stopMetrics()
@@ -235,6 +241,7 @@ func main() {
 	}
 
 	baseOpts := server.Options{
+		PoolID: cfg.PoolID, AuthorityID: poolInfo.AuthorityID,
 		InnerTLSCertificate:    innerCertificate,
 		RequireInnerTLS:        cfg.RequireInnerTLS,
 		Token:                  cfg.Token,
@@ -304,6 +311,11 @@ func main() {
 			server.SanitizeConnectionHeaders(r.Header)
 			r.Header.Set("X-Otu-Client-IP", server.ResolveClientIP(r, cfg.TrustCloudflareIPs))
 			r.Header.Set("X-Otu-Original-Host", r.Host)
+			scheme := "http"
+			if r.TLS != nil {
+				scheme = "https"
+			}
+			r.Header.Set("X-Otu-Original-Scheme", scheme)
 			proxy.ServeHTTP(w, r)
 		})
 		mux := http.NewServeMux()

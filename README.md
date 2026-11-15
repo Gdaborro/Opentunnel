@@ -11,6 +11,12 @@ on a VPS (`otu-server`); one runs locally without administrator rights
   SSH key; the admin approves new devices once from the web panel (NAC).
   No shared secret ships in the binary. Banned devices (fingerprint + key)
   stay banned. Inactive devices are purged and re-approved on return.
+- **Trusted pools (new source feature)** — explicitly imported signed
+  self-hosted profiles select the lowest-latency verified entry. Optional
+  enrollment user login is separate from administrator approval; device
+  identities remain isolated per operator. See
+  [docs/TRUSTED-SERVER-POOLS.md](docs/TRUSTED-SERVER-POOLS.md) for setup and the
+  single-host shared-authority limitation; this is not remote federation.
 - **User-level by design** — no TUN driver, no services, no UAC prompts.
   Runs from `%USERPROFILE%` or a USB stick.
 - **Looks like HTTPS** — traffic rides a genuine TLS session to your server's
@@ -115,6 +121,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o otu-server-linux ./cmd/otu-ser
 cmd/otu-client/   local proxy binary (SOCKS5 + HTTP CONNECT)
 cmd/otu-server/   relay binary (TLS + WebSocket endpoint, decoy site)
 cmd/otu-reality/  explicit private provisioning and companion supervision
+cmd/otu-pool/     dedicated operator keys and credential-free signed profiles
 companions/xray/  separate pinned patched restricted Xray module
 internal/
   protocol/       wire format: handshake, target addressing, statuses
@@ -124,6 +131,7 @@ internal/
   server/         relay handler + decoy responder
   netenv/         Typed Windows proxy journal, rollback and retryable recovery
   reality/        typed fixed-target configs and verified child lifecycle
+  serverpool/     explicit signed operator trust, profiles and selection state
 test/             end-to-end integration tests
 deploy/           Dockerfile, systemd unit, install script
 ```

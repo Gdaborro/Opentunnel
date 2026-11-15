@@ -15,6 +15,7 @@ import (
 
 	"opentunnel/internal/config"
 	"opentunnel/internal/protocol"
+	"opentunnel/internal/serverpool"
 	"opentunnel/internal/transport"
 )
 
@@ -24,8 +25,16 @@ import (
 // is a two-packet confession under TLS interception — so control traffic
 // rides the identical pin/parrot stack.
 func panelHTTP(cfg *config.ClientConf) (*http.Client, string, error) {
-	fps := append(cfg.FingerprintSet(), LoadExtraPins()...)
-	key := fmt.Sprintf("%s|%s|%t|%s", cfg.DialHostPort(), cfg.SNIHost(), cfg.Insecure, strings.Join(fps, ","))
+	var err error
+	cfg, err = cfg.ControlConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	fps := cfg.FingerprintSet()
+	if cfg.Pool == nil {
+		fps = append(fps, LoadExtraPins()...)
+	}
+	key := fmt.Sprintf("%s|%s|%s|%t|%s", cfg.IdentityScope(), cfg.DialHostPort(), cfg.ServerAddr, cfg.Insecure, strings.Join(fps, ","))
 	panelMu.Lock()
 	defer panelMu.Unlock()
 	if panelClient != nil && panelKey == key {
@@ -85,11 +94,20 @@ func RegisterWithPanel(cfg *config.ClientConf, device *deviceFile) {
 			log.Printf("registration: stored device identity differs; verify the public key in the panel SSH-key recovery page")
 			return
 		}
+		if errors.Is(err, ErrEnrollmentLoginRequired) {
+			log.Printf("registration: selected pool requires enrollment login; restart in a terminal (no credentials saved or automatically retried)")
+			return
+		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
 func doRegister(cfg *config.ClientConf, device *deviceFile) error {
+	if cfg.Pool != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return EnrollPool(ctx, cfg, device, nil)
+	}
 	ts, err := NewTokenStore()
 	if err != nil {
 		return err
@@ -110,7 +128,7 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 			return registrationResponse(resp)
 		}
 	}
-	if cfg.CarrierSOCKS != "" {
+	if cfg.CarrierSOCKS != "" && cfg.Pool == nil {
 		cl, base, err := carrierHTTP(cfg)
 		if err != nil {
 			return err
@@ -192,7 +210,7 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 	// device, and an approved one must not leak its token on the first
 	// iteration (audit round three, N-1 Window B).
 	everApproved := false
-	if ts, terr := NewTokenStore(); terr == nil {
+	if ts, terr := NewPoolTokenStore(cfg.IdentityScope()); terr == nil {
 		everApproved = ts.EverApproved(device.Fingerprint)
 	}
 	bootstrap := !everApproved && (*last == "" || *last == "pending" || *last == "expired")
@@ -205,7 +223,7 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 		return
 	}
 	*last = status
-	if ts, terr := NewTokenStore(); terr == nil {
+	if ts, terr := NewPoolTokenStore(cfg.IdentityScope()); terr == nil {
 		// Durable approval marker (fingerprint-keyed): from now on this
 		// device's token never crosses a system-trusted channel again,
 		// across restarts and re-registrations.
@@ -227,7 +245,7 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 		// on a trusted verdict (1.0.1, N-2): an intercepting middlebox
 		// must not be able to lift a real ban's local marker.
 		if trusted {
-			if ts, terr := NewTokenStore(); terr == nil {
+			if ts, terr := NewPoolTokenStore(cfg.IdentityScope()); terr == nil {
 				ts.ClearBan()
 			}
 		}
@@ -249,7 +267,7 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 		// trusted verdict (1.0.1, N-2): a forged plain-channel "banned"
 		// used to brick the next start with os.Exit(1).
 		if trusted {
-			if ts, terr := NewTokenStore(); terr == nil {
+			if ts, terr := NewPoolTokenStore(cfg.IdentityScope()); terr == nil {
 				ts.WriteHardBan(banReason, "permanent")
 			}
 		}
@@ -274,11 +292,19 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 // (in-band session or pinned HTTPS): only those may drive DURABLE local
 // state — plain bootstrap answers are display-only (1.0.1, N-2).
 func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback bool) (status, kickReason, banReason, kickExpires string, trusted bool, err error) {
+	if cfg.Pool != nil {
+		if err := cfg.Pool.Verify(time.Now()); err != nil {
+			return "", "", "", "", false, err
+		}
+		if _, err := requirePoolIdentity(cfg.IdentityScope(), token); err != nil {
+			return "", "", "", "", false, err
+		}
+	}
 	// In-band first: on TLS-intercepting networks pinned HTTPS cannot
 	// connect by design, and the authenticated session is the covert
 	// path everywhere else too. Servers predating v0.9.23 close the
 	// stream, the exchange errors, and we fall through to HTTPS.
-	if fn := currentCtrl(); fn != nil {
+	if fn := currentPoolCtrl(cfg.IdentityScope()); fn != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), ctrlTimeout)
 		resp, cerr := fn(ctx, protocol.CtrlRequest{Op: "status", Token: token})
 		cancel()
@@ -288,7 +314,7 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 	}
 	var pinnedErr error
 	if cl, base, perr := panelHTTP(cfg); perr == nil {
-		st, kr, br, ke, ferr := fetchStatus(cl, base, token, true)
+		st, kr, br, ke, ferr := fetchStatusScoped(cl, base, token, cfg.Pool == nil, cfg.IdentityScope())
 		if ferr == nil {
 			return st, kr, br, ke, true, nil
 		}
@@ -296,7 +322,7 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 	} else {
 		pinnedErr = perr
 	}
-	if cfg.CarrierSOCKS != "" {
+	if cfg.CarrierSOCKS != "" && cfg.Pool == nil {
 		cl, base, cerr := carrierHTTP(cfg)
 		if cerr == nil {
 			defer cl.CloseIdleConnections()
@@ -309,7 +335,7 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 			pinnedErr = cerr
 		}
 	}
-	if allowPlainFallback {
+	if allowPlainFallback && cfg.Pool == nil {
 		// Bootstrap fallback (see checkOnce): system-trusted TLS so a
 		// new device can register and learn its approval on intercepted
 		// networks. The token is not yet a live credential here — and
@@ -326,8 +352,23 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 // to the PINNED channel against panels predating body parsing; the plain
 // client never puts the token in a URL.
 func fetchStatus(cl *http.Client, base, token string, allowLegacyGet bool) (status, kickReason, banReason, kickExpires string, err error) {
+	return fetchStatusScoped(cl, base, token, allowLegacyGet, "")
+}
+
+func fetchStatusScoped(cl *http.Client, base, token string, allowLegacyGet bool, scope string) (status, kickReason, banReason, kickExpires string, err error) {
 	payload, _ := json.Marshal(map[string]string{"token": token})
-	resp, err := cl.Post(base+"/api/token/status", "application/json", bytes.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, base+"/api/token/status", bytes.NewReader(payload))
+	if err != nil {
+		return "", "", "", "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if scope != "" {
+		allowLegacyGet = false
+		if err := SignPoolHTTPRequest(req, payload, scope); err != nil {
+			return "", "", "", "", err
+		}
+	}
+	resp, err := cl.Do(req)
 	if err == nil && allowLegacyGet && resp.StatusCode != http.StatusOK {
 		// Panels predating v0.9.22 answer every POST "not found" (they
 		// read the token from the query only). Legacy-GET fallback; the
@@ -346,7 +387,22 @@ func fetchStatus(cl *http.Client, base, token string, allowLegacyGet bool) (stat
 		return "", "", "", "", fmt.Errorf("control status returned HTTP %d", resp.StatusCode)
 	}
 	var res map[string]string
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<10)).Decode(&res); err != nil {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (16<<10)+1))
+	if err != nil || len(raw) > 16<<10 {
+		return "", "", "", "", errors.New("control status response oversized or incomplete")
+	}
+	if scope != "" {
+		var result struct {
+			Status      string `json:"status"`
+			KickReason  string `json:"kick_reason"`
+			BanReason   string `json:"ban_reason"`
+			KickExpires string `json:"kick_expires"`
+		}
+		if err := serverpool.DecodeStrict(raw, &result); err != nil {
+			return "", "", "", "", err
+		}
+		res = map[string]string{"status": result.Status, "kick_reason": result.KickReason, "ban_reason": result.BanReason, "kick_expires": result.KickExpires}
+	} else if err := json.Unmarshal(raw, &res); err != nil {
 		return "", "", "", "", errors.New("control status response is invalid")
 	}
 	switch res["status"] {

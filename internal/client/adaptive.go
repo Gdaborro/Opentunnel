@@ -115,18 +115,20 @@ func ValidProfile(name string) bool {
 // profile fails or responds slower than TTFBBudget, and periodically re-probes
 // lower profiles so users drop back to maximum speed whenever possible.
 type Adaptive struct {
-	mu          sync.Mutex
-	token       string
-	base        transport.WSTLSOptions
-	idx         int // index into profileOrder
-	auto        bool
-	lastProbe   time.Time
-	ttfbBudget  time.Duration
-	dialTimeout time.Duration
-	factory     func(a *Adaptive, idx int) *Client
-	Logger      *log.Logger // optional; nil = log.Default()
-	mux         bool        // multiplexing requested by config
-	failStreak  int         // consecutive failures on current tier
+	poolSelector  *PoolSelector
+	identityScope string
+	mu            sync.Mutex
+	token         string
+	base          transport.WSTLSOptions
+	idx           int // index into profileOrder
+	auto          bool
+	lastProbe     time.Time
+	ttfbBudget    time.Duration
+	dialTimeout   time.Duration
+	factory       func(a *Adaptive, idx int) *Client
+	Logger        *log.Logger // optional; nil = log.Default()
+	mux           bool        // multiplexing requested by config
+	failStreak    int         // consecutive failures on current tier
 
 	// clients caches one Client per tier so every browser connection reuses
 	// the tier's warm mux pool instead of paying a full transport handshake
@@ -318,6 +320,7 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		tr = transport.NewWSTLS(opt)
 	}
 	opts := Options{
+		IdentityScope:  a.identityScope,
 		Token:          a.token,
 		DialTimeout:    a.dialTimeout,
 		Profile:        "balanced", // under h3/ssh, mild padding; harmless elsewhere
@@ -325,7 +328,7 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		OnAuthRejected: a.OnAuthRejected,
 	}
 	if len(a.innerTLSPins) > 0 {
-		wrapped, err := WithInnerTLS(tr, a.innerTLSPins)
+		wrapped, err := withScopedInnerTLS(tr, a.innerTLSPins, a.identityScope)
 		if err != nil {
 			panic("validated inner TLS pin configuration changed")
 		}
@@ -341,6 +344,26 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		opts.MuxSessions = 2 // two warm + two draining fit the relay's loopback cap
 	}
 	return NewWithOptions(tr, opts)
+}
+
+func (a *Adaptive) SetIdentityScope(scope string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.identityScope = scope
+	a.invalidateClientsLocked()
+}
+
+// UseTrustedPool installs one immutable operator selection and removes every
+// unscoped fallback. Profile expiry is checked before new requests even when
+// an existing warm mux session would otherwise bypass a transport dial.
+func (a *Adaptive) UseTrustedPool(selector *PoolSelector) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.poolSelector, a.identityScope, a.token = selector, selector.profile.ID, ""
+	a.transportBuilder = func(string) transport.Transport { return selector.Transport(a.dialTimeout) }
+	a.sshFallback, a.h3Fallback, a.carrierFallback, a.innerTLSPins, a.entries = nil, nil, nil, nil, nil
+	a.AllowHostileSSH = false
+	a.invalidateClientsLocked()
 }
 
 func (a *Adaptive) build(idx int) *Client {
@@ -397,6 +420,12 @@ func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client)
 	if a.closed {
 		a.mu.Unlock()
 		return zero, net.ErrClosed
+	}
+	if a.poolSelector != nil {
+		if err := a.poolSelector.profile.Verify(time.Now()); err != nil {
+			a.mu.Unlock()
+			return zero, err
+		}
 	}
 	start := a.idx
 	probeDown := a.auto && start > 0 && time.Since(a.lastProbe) > 10*time.Minute

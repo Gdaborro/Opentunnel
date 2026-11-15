@@ -27,11 +27,19 @@ func (db *DB) PeerStateAction(token, action, reason, duration string) error {
 	var args []any
 	switch action {
 	case "approve":
+		p, err := accessPolicy(ctx, tx, token)
+		if err != nil {
+			return err
+		}
+		if p.PoolID != "" && !p.Enrolled {
+			return errors.New("signed pool enrollment is required before administrator approval")
+		}
 		var banned int
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fingerprints_banned WHERE fingerprint=?) OR EXISTS(SELECT 1 FROM pubkeys_banned WHERE pubkey=?)`, fp, pub).Scan(&banned); err != nil {
 			return err
 		}
-		if status == "banned" || banned != 0 || pub == "" {
+		_, validKey := CanonicalSSHPubKey(pub)
+		if status == "banned" || banned != 0 || !validKey {
 			return errors.New("identity must be verified and unbanned before approval")
 		}
 		query = `UPDATE peers SET status='approved',approval_required=0,kick_reason=NULL,kick_expires=NULL,last_seen=datetime('now') WHERE token=?`
@@ -73,7 +81,7 @@ func (db *DB) PeerStateAction(token, action, reason, duration string) error {
 	case "delete":
 		// Deleting a device row is not an unban. Preserve the durable banned
 		// fingerprint/key so a deletion cannot silently remove enforcement.
-		for _, table := range []string{"daily_usage", "ingress_usage", "visits", "device_health", "peer_ips"} {
+		for _, table := range []string{"daily_usage", "ingress_usage", "visits", "device_health", "peer_ips", "peer_enrollments"} {
 			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE token=?`, token); err != nil {
 				return err
 			}

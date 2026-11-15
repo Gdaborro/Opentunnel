@@ -175,6 +175,14 @@ func (h *HealthReporter) reportOnce() {
 }
 
 func (h *HealthReporter) reportWithContext(parent context.Context) {
+	if h.cfg.Pool != nil {
+		if err := h.cfg.Pool.Verify(time.Now()); err != nil {
+			return
+		}
+		if _, err := requirePoolIdentity(h.cfg.IdentityScope(), h.device.Token); err != nil {
+			return
+		}
+	}
 	s := healthSample{version: version.Version, osName: runtime.GOOS, arch: runtime.GOARCH}
 	if pcts, err := cpu.PercentWithContext(parent, time.Second, false); err == nil && len(pcts) > 0 {
 		s.cpuPct = math.Round(pcts[0]*10) / 10
@@ -207,7 +215,7 @@ func (h *HealthReporter) reportWithContext(parent context.Context) {
 
 	// Tunnel first: the in-band channel keeps the panel informed on
 	// networks where pinned HTTPS cannot connect (TLS interception).
-	if fn := currentCtrl(); fn != nil {
+	if fn := currentPoolCtrl(h.cfg.IdentityScope()); fn != nil {
 		ctx, cancel := context.WithTimeout(parent, ctrlTimeout)
 		resp, err := fn(ctx, protocol.CtrlRequest{
 			Op: "health", Token: h.device.Token,
@@ -269,7 +277,7 @@ func (h *HealthReporter) reportWithContext(parent context.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if err := SignHTTPRequest(req, body); err != nil {
+	if err := SignPoolHTTPRequest(req, body, h.cfg.IdentityScope()); err != nil {
 		return
 	}
 	resp, err := cl.Do(req)

@@ -18,7 +18,11 @@ import (
 const maxExtraPins = 8
 
 func extraPinPath() (string, error) {
-	ts, err := NewTokenStore()
+	return scopedPinPath("")
+}
+
+func scopedPinPath(scope string) (string, error) {
+	ts, err := NewPoolTokenStore(scope)
 	if err != nil {
 		return "", err
 	}
@@ -28,7 +32,11 @@ func extraPinPath() (string, error) {
 // LoadExtraPins returns the pins learned in-band from the relay (possibly
 // empty).
 func LoadExtraPins() []string {
-	path, err := extraPinPath()
+	return loadExtraPins("")
+}
+
+func loadExtraPins(scope string) []string {
+	path, err := scopedPinPath(scope)
 	if err != nil {
 		return nil
 	}

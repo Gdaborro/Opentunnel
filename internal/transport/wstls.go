@@ -40,10 +40,12 @@ const BrowserUA = browserUA
 
 // WSTLSOptions configures the ws-tls transport.
 type WSTLSOptions struct {
-	ServerAddr  string // host[:port]; port 443 added if missing
-	ServerName  string // optional SNI override; defaults to host part of ServerAddr
-	WSPath      string // defaults to DefaultWSPath
-	Fingerprint string // hex SHA-256 pin of the server certificate
+	ServerAddr            string // host[:port]; port 443 added if missing
+	ServerName            string // optional SNI override; defaults to host part of ServerAddr
+	HTTPAuthority         string // optional trusted HTTP host:port, independent of TCP dial address/port
+	DisableLegacyFallback bool   // signed pools authorize only their explicit websocket path
+	WSPath                string // defaults to DefaultWSPath
+	Fingerprint           string // hex SHA-256 pin of the server certificate
 	// Fingerprints are additional accepted pins (rotation): the leaf
 	// changes at every Let's Encrypt renewal, and pins learned in-band
 	// from the relay rejoin here. Any listed pin verifies.
@@ -163,11 +165,17 @@ func verifyConnectionPins(pins [][]byte, certs []*x509.Certificate) error {
 }
 
 func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
+	return t.DialSetup(ctx, ctx)
+}
+
+// DialSetup bounds connection establishment without assigning the setup
+// context to the returned WebSocket stream's lifetime.
+func (t *wsTLSTransport) DialSetup(setup, lifetime context.Context) (net.Conn, error) {
 	hostPort := t.opt.ServerAddr
 	if _, _, err := net.SplitHostPort(hostPort); err != nil {
 		hostPort = net.JoinHostPort(hostPort, "443")
 	}
-	host, _, _ := net.SplitHostPort(hostPort)
+	host, port, _ := net.SplitHostPort(hostPort)
 
 	tlsCfg, err := t.tlsConfig(host)
 	if err != nil {
@@ -177,7 +185,7 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	dctx, cancel := context.WithTimeout(ctx, timeout)
+	dctx, cancel := context.WithTimeout(setup, timeout)
 	defer cancel()
 
 	echList, echRejected := t.opt.ECHList, t.opt.ECHRejected
@@ -185,6 +193,19 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 		echList, echRejected = defaultECHHooks()
 	}
 	httpClient := newPinnedHTTPClient(tlsCfg, timeout, t.opt.ChromeHello, echList, echRejected)
+	// HTTP authority stays on the trusted name even when TCP uses a literal
+	// IP. Do not let redirects or DNS change the node selected from a pool.
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	httpClient.Transport.(*http.Transport).DialTLSContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return dialTLSWithECH(ctx, &net.Dialer{Timeout: timeout}, network, hostPort, tlsCfg, t.opt.ChromeHello, echList, echRejected)
+	}
+	authority := hostPort
+	if t.opt.ServerName != "" {
+		authority = net.JoinHostPort(t.opt.ServerName, port)
+	}
+	if t.opt.HTTPAuthority != "" {
+		authority = t.opt.HTTPAuthority
+	}
 
 	// No subprotocol and a browser-plausible User-Agent: under interception
 	// this reads as an ordinary app's realtime channel, not a custom
@@ -201,11 +222,11 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 	// server_ip override the origin keeps the SNI hostname (browsers never
 	// send IP-literal origins); otherwise it carries an explicit port
 	// exactly when browsers send one.
-	originHost := t.opt.ServerName
-	if originHost == "" {
-		originHost = hostPort
-		if strings.HasSuffix(originHost, ":443") {
-			originHost = strings.TrimSuffix(originHost, ":443")
+	originHost := authority
+	if h, p, err := net.SplitHostPort(originHost); err == nil && p == "443" {
+		originHost = h
+		if strings.Contains(h, ":") {
+			originHost = "[" + h + "]"
 		}
 	}
 	hdr := http.Header{
@@ -220,7 +241,7 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 		"sec-fetch-site":     {"same-origin"},
 	}
 	url := func(path string) string {
-		return wsScheme + "://" + hostPort + path
+		return wsScheme + "://" + authority + path
 	}
 	dial := func(path string) (*websocket.Conn, *http.Response, error) {
 		return websocket.Dial(dctx, url(path), &websocket.DialOptions{
@@ -228,12 +249,21 @@ func (t *wsTLSTransport) Dial(ctx context.Context) (net.Conn, error) {
 			HTTPHeader: hdr,
 		})
 	}
-	conn, _, err := dialWSWithLegacyFallback(dial, t.opt.wsPathOrDefault())
+	var conn *websocket.Conn
+	if t.opt.DisableLegacyFallback {
+		conn, _, err = dial(t.opt.wsPathOrDefault())
+	} else {
+		conn, _, err = dialWSWithLegacyFallback(dial, t.opt.wsPathOrDefault())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("transport: websocket dial %s: %w", url(t.opt.wsPathOrDefault()), err)
 	}
 	// Note: the 101 response's body is managed by the websocket library.
-	stream := websocket.NetConn(ctx, conn, websocket.MessageBinary)
+	if err := dctx.Err(); err != nil {
+		_ = conn.CloseNow()
+		return nil, err
+	}
+	stream := websocket.NetConn(lifetime, conn, websocket.MessageBinary)
 	return &wsConn{
 		Conn: stream,
 		wsc:  conn,
@@ -248,6 +278,13 @@ type wsConn struct {
 	net.Conn
 	wsc   *websocket.Conn
 	close func()
+}
+
+func (c *wsConn) CloseNow() error {
+	if c.wsc != nil {
+		return c.wsc.CloseNow()
+	}
+	return c.Conn.Close()
 }
 
 func (c *wsConn) Close() error {

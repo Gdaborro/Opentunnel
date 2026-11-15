@@ -74,6 +74,10 @@ func main() {
 		}
 	}
 	ph := panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo)
+	ph, err = ph.WithServerPool(cfg.PoolID, cfg.EnrollmentLogin)
+	if err != nil {
+		log.Fatalf("server pool authority: %v", err)
+	}
 
 	// permitopen pins device-key forwarding to the relay's internal ws
 	// listener (the ssh tier's direct-tcpip target). Defaults match the

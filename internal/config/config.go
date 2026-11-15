@@ -13,6 +13,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"opentunnel/internal/netutil"
+	"opentunnel/internal/serverpool"
 )
 
 type Server struct {
@@ -28,10 +29,12 @@ type Server struct {
 	Token                 string `toml:"token"` // shared secret; generate with a password manager
 	CertFile              string `toml:"cert_file"`
 	KeyFile               string `toml:"key_file"`
-	AcmeDomain            string `toml:"acme_domain"`  // optional: obtain/renew a public LE cert (TLS-ALPN)
-	WSPath                string `toml:"ws_path"`      // default "/ws"
-	Host                  string `toml:"host"`         // public hostname, used for self-signed CN
-	AutoApprove           bool   `toml:"auto_approve"` // new device registrations start approved (no manual gate)
+	AcmeDomain            string `toml:"acme_domain"`      // optional: obtain/renew a public LE cert (TLS-ALPN)
+	WSPath                string `toml:"ws_path"`          // default "/ws"
+	Host                  string `toml:"host"`             // public hostname, used for self-signed CN
+	AutoApprove           bool   `toml:"auto_approve"`     // new device registrations start approved (no manual gate)
+	PoolID                string `toml:"pool_id"`          // optional trusted-pool approval authority ID
+	EnrollmentLogin       bool   `toml:"enrollment_login"` // user login permits enrollment, never approval
 	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
 	// private, link-local/metadata, CGNAT). Default false.
 	AllowRestrictedTargets bool `toml:"allow_restricted_targets"`
@@ -83,11 +86,16 @@ func (s *Server) RequireV5Time() time.Time {
 }
 
 type ClientConf struct {
-	ServerAddr      string   `toml:"server_addr"`      // host[:port]
-	ServerIP        string   `toml:"server_ip"`        // optional literal IP to dial (SNI stays server_addr host; defeats DNS sinkholing)
-	ServerFallbacks []string `toml:"server_fallbacks"` // extra entry host[:port]s, rotated when an entry fails
-	Token           string   `toml:"token"`
-	Fingerprint     string   `toml:"fingerprint"` // SHA-256 hex pin of server cert (wstls only)
+	// Runtime-only, loaded from an explicitly imported signed profile. A TOML
+	// file cannot silently introduce an operator or an endpoint callback.
+	Pool            *serverpool.Profile    `toml:"-"`
+	PoolNode        func() serverpool.Node `toml:"-"`
+	PoolDialAddress string                 `toml:"-"`
+	ServerAddr      string                 `toml:"server_addr"`      // host[:port]
+	ServerIP        string                 `toml:"server_ip"`        // optional literal IP to dial (SNI stays server_addr host; defeats DNS sinkholing)
+	ServerFallbacks []string               `toml:"server_fallbacks"` // extra entry host[:port]s, rotated when an entry fails
+	Token           string                 `toml:"token"`
+	Fingerprint     string                 `toml:"fingerprint"` // SHA-256 hex pin of server cert (wstls only)
 	// Fingerprints are additional accepted SHA-256 pins: the leaf changes
 	// at every Let's Encrypt renewal, and pins learned in-band from the
 	// relay rejoin here after restarts.
@@ -236,6 +244,41 @@ func (c *ClientConf) UDPEnabled() bool { return c.UDP == nil || *c.UDP }
 // AutoUpdateEnabled reports the effective auto-update setting (default true).
 func (c *ClientConf) AutoUpdateEnabled() bool { return c.AutoUpdate == nil || *c.AutoUpdate }
 
+func (c *ClientConf) IdentityScope() string {
+	if c.Pool != nil {
+		return c.Pool.ID
+	}
+	return ""
+}
+
+// ControlConfig snapshots the selected node; it never mutates the shared
+// runtime config as selection/failover changes concurrently with polling.
+func (c *ClientConf) ControlConfig() (*ClientConf, error) {
+	if c.Pool == nil {
+		if c.PoolNode != nil {
+			return nil, fmt.Errorf("config: pool node callback without a trusted profile")
+		}
+		return c, nil
+	}
+	if c.PoolNode == nil || c.Insecure || c.AllowUntrustedBootstrap {
+		return nil, fmt.Errorf("config: trusted pool control configuration is incomplete or insecure")
+	}
+	if err := c.Pool.Verify(time.Now()); err != nil {
+		return nil, err
+	}
+	node := c.PoolNode()
+	if !c.Pool.ContainsNode(node) {
+		return nil, fmt.Errorf("config: selected control node is not in the accepted pool profile")
+	}
+	copy := *c
+	copy.PoolNode = nil
+	copy.ServerAddr, copy.ServerIP, copy.ServerFallbacks = node.Address, "", nil
+	copy.PoolDialAddress = node.DialAddr()
+	copy.Fingerprint, copy.Fingerprints, copy.WSPath = node.Pins[0], append([]string(nil), node.Pins...), node.WSPath
+	copy.Insecure, copy.AllowUntrustedBootstrap = false, false
+	return &copy, nil
+}
+
 // entryHostPort splits server_addr into host and port (default 443).
 func (c *ClientConf) entryHostPort() (string, string) {
 	if h, p, err := net.SplitHostPort(c.ServerAddr); err == nil {
@@ -247,6 +290,9 @@ func (c *ClientConf) entryHostPort() (string, string) {
 // DialHostPort is the address to open TCP toward: the IP literal when
 // server_ip is set (DNS-independent), else server_addr as configured.
 func (c *ClientConf) DialHostPort() string {
+	if c.Pool != nil && c.PoolDialAddress != "" {
+		return c.PoolDialAddress
+	}
 	if c.ServerIP != "" {
 		_, port := c.entryHostPort()
 		return net.JoinHostPort(c.ServerIP, port)
@@ -286,6 +332,12 @@ func LoadServer(path string) (*Server, error) {
 	}
 	if s.Listen == "" {
 		s.Listen = ":443"
+	}
+	if s.PoolID != "" && (!serverpool.ValidID(s.PoolID) || s.AutoApprove || s.StaticTokenOnly || s.AllowLegacyMaster) {
+		return nil, fmt.Errorf("config: a trusted pool needs a valid pool_id and manual per-device approval; legacy/automatic admission is not supported")
+	}
+	if s.EnrollmentLogin && s.PoolID == "" {
+		return nil, fmt.Errorf("config: enrollment_login requires an explicit pool_id")
 	}
 	if (s.StaticTokenOnly || s.AllowLegacyMaster) && (len(s.Token) < 16 || strings.HasPrefix(s.Token, "CHANGE_ME")) {
 		return nil, fmt.Errorf("config: server token is required")
@@ -421,6 +473,10 @@ key_file  = ""
 	# When true, newly registering devices start approved (no manual gate).
 	# Default false: every new device waits for admin approval.
 	auto_approve = false
+	# Opt-in signed trusted pool (see docs/TRUSTED-SERVER-POOLS.md). The ID is
+	# printed by otu-pool --gen-key; all entries must use one local authority.
+	# pool_id = "<operator-public-key SHA256>"
+	# enrollment_login = true # enrollment users, separate from admin approval
 	# When true, clients may dial loopback/private/link-local/metadata
 	# targets through the relay (SSRF filter off). Default false.
 	allow_restricted_targets = false
@@ -454,6 +510,8 @@ server_addr = "cdn.aborro.dev:443"
 # server_fallbacks: extra entry host[:port]s, rotated when an entry fails
 # or looks shaped. Needs a second IP/hostname to matter.
 # server_fallbacks = []
+# Signed self-hosted profiles are imported/selected with --pool-import and
+# --pool-select, not by copying other operators' keys into this config.
 fingerprint = "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"
 # fingerprints: extra accepted pins for certificate rotation. The relay
 # announces its current pin in-band and clients learn it automatically;

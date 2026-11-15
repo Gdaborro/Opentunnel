@@ -147,6 +147,13 @@ func main() {
 		fmt.Println("opentunnel client", version.Version)
 		return
 	}
+	if handled, err := handlePoolCommands(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "server pools:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if handled, err := client.RunUpdateHelper(os.Args[1:]); handled {
 		if err != nil {
 			log.Printf("update recovery: %v", err)
@@ -199,6 +206,11 @@ func run() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	shareLink := flag.Bool("share-link", false, "print an otu:// share link for this config and exit")
 	qrOut := flag.String("qr", "", "with -share-link: also write a PNG QR code to this path")
+	poolUse := flag.String("pool-use", "", "use an already imported pool ID, or default, for this run only")
+	flag.String("pool-import", "", "import a signed pool profile with explicit fingerprint consent (standalone command)")
+	flag.Bool("pool-list", false, "list imported trusted pools (standalone command)")
+	flag.String("pool-select", "", "select an imported pool ID, or default, for the next start (standalone command)")
+	flag.String("accept-pool", "", "with --pool-import: exact independently verified operator fingerprint")
 	flag.Parse()
 
 	// Double-click mode: launched with no arguments from Explorer. Route the
@@ -268,6 +280,20 @@ func run() {
 		}
 	}
 
+	var cfg *config.ClientConf
+	var poolSelector *client.PoolSelector
+	var err error
+	var startupErr error
+	if !*restoreOnly && *restoreFrom == "" {
+		cfg, startupErr = config.LoadClient(*cfgPath)
+		if startupErr == nil {
+			poolSelector, startupErr = selectedPool(cfg, *poolUse)
+			if startupErr == nil && cfg.Pool != nil && *shareLink {
+				startupErr = errors.New("trusted pools use credential-free signed profile files, not token-bearing share links")
+			}
+		}
+	}
+
 	mgr, mgrErr := netenv.NewManager()
 	if mgrErr != nil && (*autoProxy || *restoreOnly || *restoreFrom != "") {
 		log.Fatalf("settings manager: %v", mgrErr)
@@ -306,9 +332,12 @@ func run() {
 		return
 	}
 
-	cfg, err := config.LoadClient(*cfgPath)
-	if err != nil {
-		log.Fatalf("load config: %v", err)
+	// Invalid pool trust blocks new identity/network activity, never the
+	// orphan recovery above. An expired imported profile must not strand a
+	// previous client's proxy journal after a crash.
+	if startupErr != nil {
+		log.Printf("client startup refused after orphan recovery: %v", startupErr)
+		return
 	}
 
 	// Friendly single-instance: if another otu is already running, say so
@@ -327,8 +356,8 @@ func run() {
 	// once, and the panel's approve/revoke hooks manage per-device keys —
 	// never the shared one. A custom key path (anything not named
 	// tun.key) is still honored for advanced deployments.
-	useDeviceKey := cfg.SSHKey == "" || strings.EqualFold(filepath.Base(cfg.SSHKey), "tun.key")
-	if !useDeviceKey {
+	useDeviceKey := cfg.Pool == nil && (cfg.SSHKey == "" || strings.EqualFold(filepath.Base(cfg.SSHKey), "tun.key"))
+	if cfg.Pool == nil && !useDeviceKey {
 		if _, err := os.Stat(cfg.SSHKey); err != nil {
 			useDeviceKey = true // configured key vanished: fall back
 		}
@@ -351,7 +380,7 @@ func run() {
 	// handshake and seeds the per-session AEAD keys; no shared secret ships
 	// in the binary. The panel gates it via approval, and purges it after
 	// extended inactivity (re-register → re-approve).
-	tokenStore, err := client.NewTokenStore()
+	tokenStore, err := client.NewPoolTokenStore(cfg.IdentityScope())
 	if err != nil {
 		log.Fatalf("token store: %v", err)
 	}
@@ -371,6 +400,21 @@ func run() {
 		})
 	}
 	defer requestStop()
+	if poolSelector != nil {
+		setup, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := poolSelector.Refresh(setup)
+		cancel()
+		if err != nil {
+			log.Printf("trusted pool selection failed (no other operator tried): %v", err)
+			return
+		}
+		node := poolSelector.Current()
+		fmt.Printf("[i] pool: %s; lowest verified latency node: %s (%s)\n", cfg.Pool.Name, node.Name, node.Address)
+		if err := enrollPoolAtStartup(ctx, cfg, device); err != nil {
+			log.Printf("pool enrollment: %v", err)
+			return
+		}
+	}
 	var carrierOpts transport.CarrierOptions
 	if cfg.Reality != nil && cfg.Reality.Enabled {
 		profile, err := reality.LoadProfile(cfg.Reality.ProfilePath)
@@ -431,7 +475,7 @@ func run() {
 		// token to the middlebox at every start (audit round three, N-1
 		// Window A). The re-register paths that matter (purged token →
 		// OnAuthRejected) still fire on demand.
-		if !tokenStore.EverApproved(device.Fingerprint) {
+		if cfg.Pool == nil && !tokenStore.EverApproved(device.Fingerprint) {
 			safeGo("register", func() { client.RegisterWithPanel(cfg, device) })
 		}
 		// A mid-session ban switches to notice mode (ban page everywhere)
@@ -497,7 +541,9 @@ func run() {
 		// Pin set: configured primary + rotation list + pins learned
 		// in-band from the relay (survive LE renewals automatically).
 		fpSet := cfg.FingerprintSet()
-		fpSet = append(fpSet, client.LoadExtraPins()...)
+		if cfg.Pool == nil {
+			fpSet = append(fpSet, client.LoadExtraPins()...)
+		}
 		baseOpts := transport.WSTLSOptions{
 			ServerAddr:   cfg.DialHostPort(),
 			ServerName:   cfg.SNIHost(),
@@ -524,6 +570,10 @@ func run() {
 			}
 		}
 		dialer = client.NewAdaptive(cfg.Token, baseOpts, cfg.Profile, 15*time.Second)
+		dialer.SetIdentityScope(cfg.IdentityScope())
+		if poolSelector != nil {
+			dialer.UseTrustedPool(poolSelector)
+		}
 		if len(cfg.InnerTLSPins) > 0 {
 			if err := dialer.EnableInnerTLS(cfg.InnerTLSPins); err != nil {
 				log.Printf("inner TLS configuration rejected")
@@ -545,7 +595,9 @@ func run() {
 			e.ServerName = fhost
 			entries = append(entries, e)
 		}
-		dialer.SetEntries(entries)
+		if poolSelector == nil {
+			dialer.SetEntries(entries)
+		}
 		if cfg.CarrierSOCKS != "" {
 			builder := func() transport.Transport {
 				return transport.NewCarrier(carrierOpts)
@@ -586,12 +638,12 @@ func run() {
 			dialer.AddPin(fp)
 			fmt.Println("[+] relay certificate rotated — new pin learned automatically")
 		}
-		client.SetControlChannel(func(ctx context.Context, req protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
+		client.SetPoolControlChannel(cfg.IdentityScope(), func(ctx context.Context, req protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
 			if dialer == nil {
 				return nil, fmt.Errorf("client: tunnel not ready")
 			}
 			resp, err := dialer.CtrlExchange(ctx, req)
-			if err == nil && resp != nil {
+			if err == nil && resp != nil && cfg.Pool == nil {
 				learnPin(resp.Pin)
 				// In-band ssh-tier dial-host learning: persists so the
 				// ssh tier survives CDN fronting on hostile networks.
@@ -601,6 +653,7 @@ func run() {
 			}
 			return resp, err
 		})
+		defer client.SetPoolControlChannel(cfg.IdentityScope(), nil)
 		// If the panel no longer knows our device token (purged after
 		// inactivity), re-register and wait for approval again.
 		dialer.OnAuthRejected = func() { client.RegisterWithPanel(cfg, device) }
@@ -734,6 +787,14 @@ func run() {
 		}
 		if h := cfg.SSHHostOnly(); h != "" {
 			loopHosts[strings.ToLower(h)] = true
+		}
+		if cfg.Pool != nil {
+			for _, n := range cfg.Pool.Nodes {
+				loopHosts[strings.ToLower(n.ServerName())] = true
+				if h, _, err := net.SplitHostPort(n.DialAddr()); err == nil {
+					loopHosts[strings.ToLower(h)] = true
+				}
+			}
 		}
 		serveDialer = &proxy.BanDialer{Inner: &proxy.DirectDialer{Inner: dialer, Hosts: loopHosts}, Gate: banGate}
 	}

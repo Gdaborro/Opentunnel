@@ -9,6 +9,8 @@ package access
 type Snapshot struct {
 	Status, Reason, Expires string
 	PublicKey, Generation   string
+	PoolID, AuthorityID     string
+	Enrolled                bool
 	V5Seen                  bool
 	MaxBps, QuotaBytes      int64
 	UsedBytes               int64

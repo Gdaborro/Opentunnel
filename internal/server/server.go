@@ -52,12 +52,13 @@ func isWebSocketUpgrade(r *http.Request) bool {
 }
 
 type Options struct {
-	Token       string                // shared secret (no-panel mode; legacy fallback when AllowLegacyMaster)
-	WSPath      string                // websocket endpoint path (default /ws)
-	Logger      *log.Logger           // nil = std log
-	DecoyHTML   []byte                // served to non-tunnel requests
-	ReplayCache *protocol.ReplayCache // nil = default (10 min TTL, 100k salts)
-	Guard       *Guard                // nil = DefaultGuard()
+	PoolID, AuthorityID string                // nonempty pools require the matching shared authority and v5 device-key authentication
+	Token               string                // shared secret (no-panel mode; legacy fallback when AllowLegacyMaster)
+	WSPath              string                // websocket endpoint path (default /ws)
+	Logger              *log.Logger           // nil = std log
+	DecoyHTML           []byte                // served to non-tunnel requests
+	ReplayCache         *protocol.ReplayCache // nil = default (10 min TTL, 100k salts)
+	Guard               *Guard                // nil = DefaultGuard()
 	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
 	// private, link-local/metadata, CGNAT ranges). Off by default.
 	AllowRestrictedTargets bool
@@ -274,6 +275,22 @@ func Handler(opt Options) http.Handler {
 // validated against the panel (approval is the gate â€” no shared secret in
 // the client binary). Without a panel, the static shared token is used.
 func (o Options) verifyHandshakeToken(tok string) byte {
+	if o.PoolID != "" {
+		p, err := o.readPolicy(tok)
+		if err != nil {
+			return protocol.StatusPending
+		}
+		switch p.Status {
+		case "approved", "kicked":
+			return protocol.StatusOK
+		case "banned":
+			return protocol.StatusBanned
+		case "expired":
+			return protocol.StatusExpired
+		default:
+			return protocol.StatusPending
+		}
+	}
 	if o.PanelDB == nil {
 		return protocol.StaticVerifier(o.Token)(tok)
 	}
@@ -379,7 +396,7 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 		}
 		opt.sessionBound = true
 		opt.sessionGeneration, opt.sessionPublicKey = p.Generation, pub
-		if pub == "" && !opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After) {
+		if pub == "" && (opt.PoolID != "" || (!opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After))) {
 			// The migration deadline applies to keyless legacy rows too.
 			// A v5 version byte without a registered verification key is
 			// not proof of possession and cannot bypass enforcement.
@@ -407,8 +424,8 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 			// proof-of-possession check, so a harvested token alone used
 			// to survive by downgrading. Keyless and never-v5 peers stay
 			// admitted (migration window, auto-closing per identity).
-			enforce := pub != ""
-			if enforce && !p.V5Seen {
+			enforce := opt.PoolID != "" || pub != ""
+			if opt.PoolID == "" && enforce && !p.V5Seen {
 				// Not yet upgraded: only a passed enforcement date can
 				// demand v5 now.
 				enforce = !opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After)
@@ -830,11 +847,16 @@ func serveCtrlStream(rw deadlineRW, opt Options, authTok string) {
 		resp.KickReason = kickReason
 		resp.KickExpires = kickExpires
 		resp.BanReason = opt.PanelDB.BanReason(authTok)
-		opt.PanelDB.TouchPeer(authTok)
+		if _, denied, _ := opt.freshDataPolicy(authTok, "approved"); denied == "" {
+			opt.PanelDB.TouchPeer(authTok)
+		}
 	case "health":
 		// Only known peers may write telemetry (RecordHealth upserts, so
 		// arbitrary token strings used to mint unbounded rows).
 		if !opt.PanelDB.KnownPeer(authTok) {
+			return
+		}
+		if _, denied, _ := opt.freshDataPolicy(authTok, "approved"); denied != "" {
 			return
 		}
 		opt.PanelDB.RecordHealth(authTok, req.Version, req.OS, req.Arch,

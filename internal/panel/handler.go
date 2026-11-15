@@ -21,10 +21,14 @@ import (
 var _ = time.Second // peers carry time.Time fields
 
 type Handler struct {
-	db          *DB
-	auth        *Auth
-	autoApprove bool
-	geo         *GeoIP // optional; nil = no country resolution
+	poolAuthorityID string
+	poolID          string
+	enrollmentLogin bool
+	enrollmentSlots chan struct{}
+	db              *DB
+	auth            *Auth
+	autoApprove     bool
+	geo             *GeoIP // optional; nil = no country resolution
 
 	rlMu        sync.Mutex
 	rlMap       map[string]*regLimit // per-IP rate-limit buckets (bucket|ip)
@@ -52,7 +56,7 @@ const regLimitMax = 10 // registrations per IP per window
 const regLimitWindow = time.Minute
 
 func New(db *DB, auth *Auth, autoApprove bool) *Handler {
-	return &Handler{db: db, auth: auth, autoApprove: autoApprove, rlMap: make(map[string]*regLimit)}
+	return &Handler{db: db, auth: auth, autoApprove: autoApprove, rlMap: make(map[string]*regLimit), enrollmentSlots: make(chan struct{}, 4)}
 }
 
 // WithGeoIP attaches an offline GeoIP resolver (panel map / countries).
@@ -94,6 +98,9 @@ func (h *Handler) rateAllowed(ip string, max int, window time.Duration, bucket s
 	}
 	r := h.rlMap[key]
 	if r == nil || now.Sub(r.windowStart) > window {
+		if r == nil && len(h.rlMap) >= 4096 {
+			return false // expiry is not a memory bound; fail closed on new-source pressure
+		}
 		r = &regLimit{windowStart: now}
 		h.rlMap[key] = r
 	}
@@ -139,6 +146,9 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	mux.Handle("/admin/ssh-keys", h.auth.RequireAuth(http.HandlerFunc(h.sshKeysPage)))
 	mux.Handle("/admin/ssh-keys.js", h.auth.RequireAuth(http.HandlerFunc(h.sshKeysScript)))
 	mux.Handle("/admin/api/ssh-keys", h.auth.RequireAuth(http.HandlerFunc(h.sshKeysAPI)))
+	mux.Handle("/admin/enrollment-accounts", h.auth.RequireAuth(http.HandlerFunc(h.enrollmentAccountsPage)))
+	mux.Handle("/admin/enrollment-accounts.js", h.auth.RequireAuth(http.HandlerFunc(h.enrollmentAccountsScript)))
+	mux.Handle("/admin/api/enrollment-accounts", h.auth.RequireAuth(http.HandlerFunc(h.enrollmentAccountsAPI)))
 	mux.Handle("/admin/api/peers", h.auth.RequireAuth(http.HandlerFunc(h.apiPeers)))
 	mux.Handle("/admin/api/peers/", h.auth.RequireAuth(http.HandlerFunc(h.apiPeerAction)))
 	mux.Handle("/admin/api/blocklist", h.auth.RequireAuth(http.HandlerFunc(h.apiBlocklist)))
@@ -157,6 +167,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 
 	// Public token api (no auth)
 	mux.Handle("/api/token/request", http.HandlerFunc(h.tokenRequest))
+	mux.Handle("/api/token/server-info", http.HandlerFunc(h.serverInfo))
 	mux.Handle("/api/token/status", http.HandlerFunc(h.tokenStatus))
 	mux.Handle("/api/token/heartbeat", http.HandlerFunc(h.tokenHeartbeat))
 	mux.Handle("/api/token/health", http.HandlerFunc(h.tokenHealth))
@@ -929,6 +940,10 @@ func (h *Handler) apiCategories(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
+	if h.poolID != "" {
+		h.enrollPool(w, r)
+		return
+	}
 	if !requirePOST(w, r) {
 		return
 	}
@@ -1064,6 +1079,10 @@ func (h *Handler) tokenRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tokenStatus(w http.ResponseWriter, r *http.Request) {
+	if h.poolID != "" {
+		h.poolTokenStatus(w, r)
+		return
+	}
 	// Status is how devices learn their admission state — but an
 	// unauthenticated oracle that answers at line speed also enumerates
 	// tokens and leaks ban/kick reasons. 60 queries per IP per minute is

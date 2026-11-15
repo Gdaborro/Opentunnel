@@ -32,7 +32,13 @@ func (db *DB) ApprovedSSHPubKeys() []string {
 	if db == nil {
 		return nil
 	}
-	rows, err := db.Query(`SELECT COALESCE(ssh_pubkey,'') FROM peers WHERE status='approved'`)
+	rows, err := db.Query(`SELECT COALESCE(p.ssh_pubkey,'') FROM peers p
+		WHERE p.status='approved' AND NOT EXISTS(SELECT 1 FROM fingerprints_banned f WHERE f.fingerprint=p.fingerprint)
+		AND NOT EXISTS(SELECT 1 FROM pubkeys_banned k WHERE k.pubkey=p.ssh_pubkey)
+		AND (NOT EXISTS(SELECT 1 FROM server_pool_authority) OR (p.approval_required=0 AND EXISTS(
+			SELECT 1 FROM server_pool_authority a JOIN peer_enrollments e ON e.pool_id=a.pool_id
+			WHERE e.token=p.token AND e.public_key=p.ssh_pubkey
+			AND (a.login_required=0 OR EXISTS(SELECT 1 FROM enrollment_accounts u WHERE u.username=e.username)))))`)
 	if err != nil {
 		return nil
 	}

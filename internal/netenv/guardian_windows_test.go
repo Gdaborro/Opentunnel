@@ -42,8 +42,15 @@ func TestGuardianParentHelper(t *testing.T) {
 func TestGuardianSurvivesForcedParentExit(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "guardian-observed-exit")
+	// The registry-free tagged test binary also runs this lifecycle test.
+	// Its NewManager requires an explicit synthetic store after parent exit;
+	// production ignores this hint and still has no snapshot to restore.
+	fixture := filepath.Join(dir, "synthetic-guardian-settings.json")
+	if err := os.WriteFile(fixture, []byte(`{"keys":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestGuardianParentHelper$")
-	cmd.Env = append(os.Environ(), "LOCALAPPDATA="+dir, "OTU_TEST_GUARDIAN_PARENT=1", "OTU_TEST_GUARDIAN_MARKER="+marker)
+	cmd.Env = append(os.Environ(), "LOCALAPPDATA="+dir, "OTU_NETENV_FIXTURE="+fixture, "OTU_TEST_GUARDIAN_PARENT=1", "OTU_TEST_GUARDIAN_MARKER="+marker)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"opentunnel/internal/access"
+	"opentunnel/internal/serverpool"
 )
 
 // AccessPolicy reads admission, identity, limits and global policy in ONE SQL
@@ -32,7 +33,7 @@ func accessPolicy(ctx context.Context, reader policyReader, token string) (acces
 	p := access.Snapshot{Status: "pending"}
 	var kickReason, banReason, identityReason, kickExpiry, expiry, schedule string
 	var kill, allow, sshMax, sshDaily, sshTrickle string
-	var identityBanned bool
+	var identityBanned, approvalRequired bool
 	err := reader.QueryRowContext(ctx, `SELECT p.status, COALESCE(p.kick_reason,''),
 		COALESCE(p.ban_reason,''), COALESCE(p.kick_expires,''), COALESCE(p.expires_at,''),
 		COALESCE(p.ssh_pubkey,''), COALESCE(p.auth_epoch,''), COALESCE(p.schedule,''),
@@ -45,13 +46,17 @@ func accessPolicy(ctx context.Context, reader policyReader, token string) (acces
 		COALESCE((SELECT value FROM settings WHERE key='ssh_tier_daily_mb'),'0'),
 		COALESCE((SELECT value FROM settings WHERE key='ssh_tier_trickle_kbps'),'0'),
 		COALESCE((SELECT up+down FROM ingress_usage WHERE token=p.token AND ingress='ssh' AND day=date('now')),0),
-		(p.v5_seen IS NOT NULL AND p.v5_seen!='')
+		(p.v5_seen IS NOT NULL AND p.v5_seen!=''), p.approval_required,
+		COALESCE(a.pool_id,''), COALESCE(a.authority_id,''),
+		EXISTS(SELECT 1 FROM peer_enrollments e WHERE e.token=p.token AND e.pool_id=a.pool_id AND e.public_key=p.ssh_pubkey
+			AND (a.login_required=0 OR EXISTS(SELECT 1 FROM enrollment_accounts u WHERE u.username=e.username)))
 		FROM peers p LEFT JOIN fingerprints_banned f ON f.fingerprint=p.fingerprint
-		LEFT JOIN pubkeys_banned k ON k.pubkey=p.ssh_pubkey WHERE p.token=?`, token).
+		LEFT JOIN pubkeys_banned k ON k.pubkey=p.ssh_pubkey LEFT JOIN server_pool_authority a ON a.id=1 WHERE p.token=?`, token).
 		Scan(&p.Status, &kickReason, &banReason, &kickExpiry, &expiry, &p.PublicKey,
 			&p.Generation, &schedule, &p.MaxBps, &p.QuotaBytes, &p.UsedBytes,
 			&identityBanned, &identityReason, &kill, &p.KillReason, &allow,
-			&sshMax, &sshDaily, &sshTrickle, &p.SSHUsedBytes, &p.V5Seen)
+			&sshMax, &sshDaily, &sshTrickle, &p.SSHUsedBytes, &p.V5Seen, &approvalRequired,
+			&p.PoolID, &p.AuthorityID, &p.Enrolled)
 	if err != nil {
 		return p, err
 	}
@@ -100,6 +105,15 @@ func accessPolicy(ctx context.Context, reader policyReader, token string) (acces
 			p.Reason = "device identity banned"
 		}
 		return p, nil
+	}
+	if p.PoolID != "" {
+		if !serverpool.ValidID(p.PoolID) || !serverpool.ValidID(p.AuthorityID) {
+			return p, errors.New("invalid pool authority state")
+		}
+		if !p.Enrolled || p.PublicKey == "" || approvalRequired {
+			p.Status, p.Reason = "pending", "signed pool enrollment and separate administrator approval required"
+			return p, nil
+		}
 	}
 	if p.Status == "kicked" {
 		if kickExpiry == "" {

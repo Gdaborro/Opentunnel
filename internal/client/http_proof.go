@@ -5,23 +5,27 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"opentunnel/internal/privatefile"
 	"opentunnel/internal/protocol"
 )
 
 func SignHTTPRequest(req *http.Request, body []byte) error {
-	ts, err := NewTokenStore()
+	return SignPoolHTTPRequest(req, body, "")
+}
+
+func SignPoolHTTPRequest(req *http.Request, body []byte, scope string) error {
+	ts, err := NewPoolTokenStore(scope)
 	if err != nil {
 		return err
 	}
 	if _, err := ts.EnsureSSHKey(); err != nil {
 		return err
 	}
-	raw, err := os.ReadFile(ts.SSHPrivatePath())
+	raw, err := privatefile.Read(ts.SSHPrivatePath(), 16<<10)
 	if err != nil {
 		return err
 	}

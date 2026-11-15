@@ -56,22 +56,35 @@ func (c *Client) CtrlExchange(ctx context.Context, req protocol.CtrlRequest) (*p
 
 // ctrlFn holds the installed in-band exchange (nil = HTTPS only).
 var (
-	ctrlMu sync.Mutex
-	ctrlFn func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error)
+	ctrlMu    sync.Mutex
+	ctrlFn    func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error)
+	ctrlScope string
 )
 
 // SetControlChannel installs the tunnel-riding control exchange consulted
 // by the status poll and health reporter before their pinned-HTTPS
 // fallbacks. nil uninstalls (tests, shutdown).
 func SetControlChannel(fn func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error)) {
+	SetPoolControlChannel("", fn)
+}
+
+func SetPoolControlChannel(scope string, fn func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error)) {
 	ctrlMu.Lock()
 	ctrlFn = fn
+	ctrlScope = scope
 	ctrlMu.Unlock()
 }
 
 // currentCtrl returns the installed exchange or nil.
 func currentCtrl() func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
+	return currentPoolCtrl("")
+}
+
+func currentPoolCtrl(scope string) func(context.Context, protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
 	ctrlMu.Lock()
 	defer ctrlMu.Unlock()
+	if ctrlScope != scope {
+		return nil
+	}
 	return ctrlFn
 }

@@ -10,6 +10,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"opentunnel/internal/access"
+	"opentunnel/internal/serverpool"
 )
 
 const (
@@ -60,12 +61,22 @@ func (o *Options) ensureState() {
 
 func (o Options) readPolicy(token string) (access.Snapshot, error) {
 	if o.PanelDB == nil {
+		if o.PoolID != "" {
+			return access.Snapshot{}, errors.New("pool approval authority unavailable")
+		}
 		return access.Snapshot{Status: "approved"}, nil
 	}
 	if store, ok := o.PanelDB.(interface {
 		AccessPolicy(string) (access.Snapshot, error)
 	}); ok {
-		return store.AccessPolicy(token)
+		p, err := store.AccessPolicy(token)
+		if err == nil && (o.PoolID != "" || p.PoolID != "") && (!serverpool.ValidID(o.PoolID) || !serverpool.ValidID(o.AuthorityID) || p.PoolID != o.PoolID || p.AuthorityID != o.AuthorityID || ((p.Status == "approved" || p.Status == "kicked") && !p.Enrolled)) {
+			return p, errors.New("pool approval authority or signed enrollment mismatch")
+		}
+		return p, err
+	}
+	if o.PoolID != "" {
+		return access.Snapshot{}, errors.New("pool needs an authoritative policy store; legacy admission is not supported")
 	}
 	// Compatibility for embedders and synthetic tests. Errors still fail
 	// closed; there is deliberately no session-snapshot approval fallback.

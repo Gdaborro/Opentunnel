@@ -10,21 +10,22 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"opentunnel/internal/privatefile"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/transport"
 )
 
 type Options struct {
-	Token       string
-	DialTimeout time.Duration // per-connection budget for handshake+target
-	Profile     string        // fast | balanced | stealth (shaping on our writes)
-	Mux         bool          // multiplex targets over pooled sessions
+	IdentityScope string
+	Token         string
+	DialTimeout   time.Duration // per-connection budget for handshake+target
+	Profile       string        // fast | balanced | stealth (shaping on our writes)
+	Mux           bool          // multiplex targets over pooled sessions
 	// MuxByteCap overrides the per-session rotation byte cap (0 = default
 	// 160 MiB). The h3 tier sets this below Cloudflare's 100 MB proxied
 	// request-body limit so sessions rotate before the edge cuts them.
@@ -59,7 +60,7 @@ func New(t transport.Transport, token string) *Client {
 func NewWithOptions(t transport.Transport, o Options) *Client { return &Client{Transport: t, opts: o} }
 
 func (c *Client) perDeviceToken() string {
-	store, err := NewTokenStore()
+	store, err := NewPoolTokenStore(c.opts.IdentityScope)
 	if err != nil {
 		return ""
 	}
@@ -75,6 +76,12 @@ func (c *Client) perDeviceToken() string {
 // the per-device token (panel mode). Fresh installs have no configured
 // token, so only the device token is tried — no shared secret in the binary.
 func (c *Client) authCandidates() []string {
+	if c.opts.IdentityScope != "" {
+		if token := c.perDeviceToken(); token != "" {
+			return []string{token}
+		}
+		return nil
+	}
 	var out []string
 	seen := map[string]bool{}
 	for _, t := range []string{c.opts.Token, c.perDeviceToken()} {
@@ -91,14 +98,14 @@ func (c *Client) authCandidates() []string {
 // when no usable key exists (fresh/pending identity): the dial then falls
 // back to the unsigned v4 handshake.
 func (c *Client) signHandshake(token string, salt []byte) ([]byte, bool) {
-	ts, err := NewTokenStore()
+	ts, err := NewPoolTokenStore(c.opts.IdentityScope)
 	if err != nil {
 		return nil, false
 	}
 	if _, err := ts.EnsureSSHKey(); err != nil {
 		return nil, false
 	}
-	pemBytes, err := os.ReadFile(ts.SSHPrivatePath())
+	pemBytes, err := privatefile.Read(ts.SSHPrivatePath(), 16<<10)
 	if err != nil {
 		return nil, false
 	}
@@ -125,14 +132,18 @@ func (c *Client) signHandshake(token string, salt []byte) ([]byte, bool) {
 // means it was carried (and is already replayed-protected) inside a v5
 // handshake; nil means the caller writes it as usual (v4 flow).
 func (c *Client) dialAndAuth(ctx context.Context, authTok string, timeout time.Duration) (net.Conn, []byte, error) {
+	salt := protocol.RandomSalt()
+	sig, signed := c.signHandshake(authTok, salt)
+	if !signed && c.opts.IdentityScope != "" {
+		return nil, nil, errors.New("client: trusted pool requires the scoped Ed25519 device key; unsigned downgrade refused")
+	}
 	raw, err := c.Transport.Dial(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("client: transport dial: %w", err)
 	}
 	_ = raw.SetDeadline(time.Now().Add(timeout))
 
-	salt := protocol.RandomSalt()
-	if sig, signed := c.signHandshake(authTok, salt); signed {
+	if signed {
 		if err := protocol.WriteHandshakeV5(raw, authTok, salt, sig); err != nil {
 			raw.Close()
 			return nil, nil, fmt.Errorf("client: handshake write: %w", err)
@@ -142,7 +153,7 @@ func (c *Client) dialAndAuth(ctx context.Context, authTok string, timeout time.D
 			raw.Close()
 			return nil, nil, err
 		}
-		if ver == protocol.ProtoVersionLegacy && st == protocol.StatusBadVersion {
+		if ver == protocol.ProtoVersionLegacy && st == protocol.StatusBadVersion && c.opts.IdentityScope == "" {
 			// Pre-v5 server: retry as the legacy unsigned handshake on the
 			// same connection (it never consumed the v5 bytes beyond the
 			// version byte it rejected on).
@@ -157,7 +168,7 @@ func (c *Client) dialAndAuth(ctx context.Context, authTok string, timeout time.D
 			}
 			salt = nil
 		}
-		if ver != protocol.ProtoVersion && ver != protocol.ProtoVersionLegacy {
+		if ver != protocol.ProtoVersion && (c.opts.IdentityScope != "" || ver != protocol.ProtoVersionLegacy) {
 			raw.Close()
 			return nil, nil, protocol.ErrVersionMismatch
 		}
@@ -528,7 +539,7 @@ func (c *Client) legacyConnect(ctx context.Context) (*protocol.SecureStream, err
 // (fingerprint-keyed), keeping the live token off system-trusted channels
 // from this point on — across restarts and re-registrations.
 func (c *Client) markEverApproved() {
-	store, err := NewTokenStore()
+	store, err := NewPoolTokenStore(c.opts.IdentityScope)
 	if err != nil {
 		return
 	}

@@ -52,7 +52,7 @@ func NewPinnedHTTPClient(opt PinnedHTTPOptions) (*http.Client, error) {
 	}
 	cfg := &tls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: opt.Insecure, // pin governs trust unless dev-insecure
+		InsecureSkipVerify: true, // explicit pin checks govern trust, including self-signed relays
 		MinVersion:         tls.VersionTLS12,
 		ClientSessionCache: sessionCache,
 	}
