@@ -26,14 +26,14 @@ import (
 const softCapStreams = 192
 
 // rotationWindow bounds a session's useful life: sessions older than
-// maxAge stop taking new streams (graceful drain) so no single TLS flow
-// lives for hours — the signature a human spots first in a flow table.
-// Draining sessions close once empty or past maxAge+maxDrain, so long
-// downloads are never cut (unlike a hard kill).
+// maxAge stop taking new streams (graceful drain). A long active transfer may
+// outlive rotation; it is not secretly cut by an arbitrary drain timeout.
 const (
 	rotationAge = 25 * time.Minute
-	maxDrain    = 10 * time.Minute
-	sweepEvery  = 5 * time.Minute
+	// Draining sessions take no new streams, but active transfers are not
+	// killed by a timer. The fixed aggregate drain/session cap bounds memory;
+	// explicit process shutdown/revocation still closes streams immediately.
+	sweepEvery = 5 * time.Minute
 )
 
 // rotationBytesBase bounds a session's total transfer: no single flow
@@ -59,6 +59,8 @@ type MuxPool struct {
 	sweeper     bool
 	ctx         context.Context
 	cancel      context.CancelFunc
+	setupCtx    context.Context
+	cancelSetup context.CancelFunc
 	closed      bool
 
 	// dialing guards session creation so a page-load burst (dozens of
@@ -82,6 +84,7 @@ type muxEntry struct {
 	bytes       *atomic.Int64 // wire bytes crossing the underlying conn
 	draining    bool
 	drainAt     time.Time // bound the drain from when it actually started
+	opening     int       // reservations include SYN writes not yet in NumStreams
 }
 
 // minRotationAge floors self-tuning: rotation never gets twitchier than this.
@@ -138,6 +141,7 @@ func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions
 		dialTimeout = 15 * time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	setupCtx, cancelSetup := context.WithCancel(ctx)
 	return &MuxPool{
 		factory:     factory,
 		maxSessions: maxSessions,
@@ -147,6 +151,8 @@ func newMuxPool(factory func(ctx context.Context) (net.Conn, error), maxSessions
 		softCap:     softCapStreams,
 		ctx:         ctx,
 		cancel:      cancel,
+		setupCtx:    setupCtx,
+		cancelSetup: cancelSetup,
 	}
 }
 
@@ -187,10 +193,13 @@ func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
 	// Cancellation and the setup budget apply only while the factory runs.
 	sessionCtx, cancel := context.WithCancel(p.ctx)
 	stopCaller := context.AfterFunc(ctx, cancel)
+	stopDrain := context.AfterFunc(p.setupCtx, cancel)
 	timer := time.AfterFunc(p.dialTimeout, cancel)
 	conn, err := p.factory(sessionCtx)
-	stopCaller()
-	timer.Stop()
+	callerStopped, drainStopped, timerStopped := stopCaller(), stopDrain(), timer.Stop()
+	if err == nil && (!callerStopped || !drainStopped || !timerStopped) {
+		cancel()
+	}
 	if err == nil && sessionCtx.Err() != nil {
 		_ = conn.Close()
 		err = sessionCtx.Err()
@@ -239,7 +248,7 @@ func (p *MuxPool) createSession(ctx context.Context) (*muxEntry, error) {
 // retireLocked marks expired sessions draining and drops finished ones,
 // returning sessions to close OUTSIDE the pool lock. Draining sessions take
 // no new streams (pick skips them); in-flight streams finish undisturbed
-// until empty or past the hard cap, so rotation never cuts a download.
+// until empty. Explicit shutdown and policy revocation remain interruptions.
 func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
 	alive := p.sessions[:0]
 	for _, e := range p.sessions {
@@ -247,11 +256,7 @@ func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
 			continue
 		}
 		if e.draining {
-			drainAt := e.drainAt
-			if drainAt.IsZero() {
-				drainAt = e.retireAt
-			}
-			if e.sess.NumStreams() == 0 || now.After(drainAt.Add(maxDrain)) {
+			if e.sess.NumStreams() == 0 && e.opening == 0 {
 				p.noteDeath(e.born)
 				dead = append(dead, e)
 				continue
@@ -276,13 +281,14 @@ func (p *MuxPool) retireLocked(now time.Time) (dead []*muxEntry) {
 func (p *MuxPool) retire() {
 	p.mu.Lock()
 	dead := p.retireLocked(time.Now())
-	if p.closed && len(p.sessions) == 0 && p.cancel != nil {
-		p.cancel()
-	}
+	finished := p.closed && !p.dialing && len(p.sessions) == 0
 	p.mu.Unlock()
 	for _, e := range dead {
 		_ = e.sess.Close()
 	}
+	if finished && p.cancel != nil {
+		p.cancel()
+	} // carrier close precedes its lifetime cancellation
 }
 
 // sweep retires on a timer so even idle pools (keepalive-only flows, the
@@ -325,19 +331,31 @@ func poolWait(ctx context.Context, d time.Duration) bool {
 // Drain rejects new streams while allowing existing ones to finish. Used
 // when pins/entries rebuild a tier client instead of leaking the old pool.
 func (p *MuxPool) Drain() {
+	p.beginDrain()
+	p.retire()
+}
+
+// Mark retirement without closing a carrier under its adaptive owner's mutex.
+// Teardown belongs to one bounded client drain worker outside that mutex.
+func (p *MuxPool) beginDrain() {
 	p.mu.Lock()
 	p.closed = true
+	if p.cancelSetup != nil {
+		p.cancelSetup()
+	}
 	for _, e := range p.sessions {
 		e.draining = true
 		e.drainAt = time.Now()
 	}
 	p.mu.Unlock()
-	p.retire()
 }
 
 func (p *MuxPool) Close() error {
 	p.mu.Lock()
 	p.closed = true
+	if p.cancelSetup != nil {
+		p.cancelSetup()
+	}
 	sessions := p.sessions
 	p.sessions = nil
 	p.mu.Unlock()
@@ -364,7 +382,7 @@ func overCap(e *muxEntry, cap int) bool {
 	if cap <= 0 {
 		return false
 	}
-	return e.sess.NumStreams() >= cap
+	return e.sess.NumStreams()+e.opening >= cap || e.opening >= 8
 }
 
 // pick returns the next healthy entry round-robin, pruning dead sessions.
@@ -470,9 +488,19 @@ func (p *MuxPool) Open(ctx context.Context) (net.Conn, error) {
 				return nil, err
 			}
 		}
-		stream, err := e.sess.OpenStream()
+		p.mu.Lock()
+		if p.closed || e.draining || e.sess.IsClosed() || overCap(e, p.softCap) {
+			p.mu.Unlock()
+			continue
+		}
+		e.opening++
+		p.mu.Unlock()
+		stream, err := p.openReserved(ctx, e)
 		if err == nil {
 			return stream, nil
+		}
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err // one caller's cancelled SYN must not kill other active streams
 		}
 		if errors.Is(err, smux.ErrGoAway) || e.sess.IsClosed() {
 			p.drop(e)
@@ -482,6 +510,59 @@ func (p *MuxPool) Open(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	return nil, errors.New("client: mux pool exhausted")
+}
+
+func (p *MuxPool) openReserved(ctx context.Context, e *muxEntry) (*smux.Stream, error) {
+	// smux bounds a SYN write internally, but exposes no OpenStreamContext.
+	// Return promptly on caller cancellation while retaining the reservation
+	// until that one bounded worker exits. At most eight workers per session.
+	setup, cancel := context.WithTimeout(ctx, p.dialTimeout)
+	defer cancel()
+	type result struct {
+		stream *smux.Stream
+		err    error
+	}
+	done := make(chan result)
+	go func() {
+		stream, err := e.sess.OpenStream()
+		if setup.Err() != nil {
+			if stream != nil {
+				_ = stream.Close()
+			}
+			stream, err = nil, setup.Err()
+		}
+		p.mu.Lock()
+		e.opening--
+		p.mu.Unlock()
+		select {
+		case done <- result{stream, err}:
+		case <-setup.Done():
+			if stream != nil {
+				_ = stream.Close()
+			}
+		}
+	}()
+	select {
+	case r := <-done:
+		p.mu.Lock()
+		retired := p.closed || e.draining
+		p.mu.Unlock()
+		if retired {
+			if r.stream != nil {
+				_ = r.stream.Close()
+			}
+			return nil, net.ErrClosed
+		}
+		if setup.Err() != nil {
+			if r.stream != nil {
+				_ = r.stream.Close()
+			}
+			return nil, setup.Err()
+		}
+		return r.stream, r.err
+	case <-setup.Done():
+		return nil, setup.Err()
+	}
 }
 
 // getOrDial returns a usable session, dialing one if none exists. Only one

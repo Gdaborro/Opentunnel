@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { api, type Peer, type PeerLimits } from "@/lib/api"
 import {
   Card,
@@ -57,12 +57,16 @@ function statusTone(status: string): string {
 export function Clients() {
   const [peers, setPeers] = useState<Peer[]>([])
   const [limitsPeer, setLimitsPeer] = useState<Peer | null>(null)
-  const [limits, setLimits] = useState<PeerLimits>({ schedule: "", max_bps: 0, quota_bytes: 0 })
+  const [limits, setLimits] = useState<PeerLimits | null>(null)
+  const limitsRequest = useRef(0)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
+  const [notice, setNotice] = useState("")
+  const [inventoryError, setInventoryError] = useState("")
 
   const load = useCallback(() => {
-    api.peers().then(setPeers).catch(() => {})
+    api.peers().then((values) => { setPeers(values); setInventoryError("") })
+      .catch(() => setInventoryError("Device inventory unavailable. Previously shown data may be stale."))
   }, [])
   useEffect(() => {
     load()
@@ -72,32 +76,64 @@ export function Clients() {
 
   const act = (token: string, action: string, body?: unknown) => {
     setBusy(true)
+    setError("")
+    setNotice("")
     api
       .peerAction(token, action, body)
-      .then(load)
+      .then((result) => {
+        if (result.ssh_reconcile_pending) {
+          setNotice("Admission policy committed, but SSH key reconciliation is still pending. The authority will retry; do not assume the SSH file is applied.")
+        }
+        load()
+      })
       .catch((e) => setError(String(e)))
       .finally(() => setBusy(false))
   }
 
   const openLimits = (p: Peer) => {
+    const request = ++limitsRequest.current
     setLimitsPeer(p)
+    setLimits(null)
     setError("")
     api
       .peerLimits(p.token)
-      .then(setLimits)
-      .catch(() => setLimits({ schedule: "", max_bps: 0, quota_bytes: 0 }))
+      .then((value) => { if (request === limitsRequest.current) setLimits(value) })
+      .catch(() => {
+        if (request === limitsRequest.current) setError("Device controls unavailable. No unlimited defaults were substituted; close and reopen to retry.")
+      })
+  }
+
+  const closeLimits = () => {
+    ++limitsRequest.current
+    setLimitsPeer(null)
+    setLimits(null)
   }
 
   const saveLimits = () => {
-    if (!limitsPeer) return
+    if (!limitsPeer || !limits || busy) return
+    if (!Number.isSafeInteger(limits.max_bps) || !Number.isSafeInteger(limits.quota_bytes) || limits.max_bps < 0 || limits.quota_bytes < 0) {
+      setError("Caps and quotas must be nonnegative whole-byte values.")
+      return
+    }
+    const token = limitsPeer.token
+    const requested = limits
     setBusy(true)
+    setError("")
     api
-      .setPeerLimits(limitsPeer.token, limits)
-      .then(() => {
-        setLimitsPeer(null)
+      .setPeerLimits(token, requested)
+      .then(() => api.peerLimits(token))
+      .then((verified) => {
+        if (verified.schedule !== requested.schedule.trim() || verified.max_bps !== requested.max_bps || verified.quota_bytes !== requested.quota_bytes) {
+          throw new Error("Device controls changed concurrently; reopen to read the authoritative values.")
+        }
+        closeLimits()
+        setNotice("Device controls saved and read back from the authority.")
         load()
       })
-      .catch((e) => setError(String(e)))
+      .catch(() => {
+        setLimits(null)
+        setError("Save or read-back failed. Device control state is unconfirmed; close and reopen before retrying.")
+      })
       .finally(() => setBusy(false))
   }
 
@@ -113,6 +149,9 @@ export function Clients() {
         </CardDescription>
       </CardHeader>
       <CardContent>
+        {notice && <p role="status" aria-live="polite" className="mb-3 rounded-md border p-3 text-sm">{notice}</p>}
+        {error && <p role="alert" className="mb-3 text-sm text-destructive">{error}</p>}
+        {inventoryError && <p role="alert" className="mb-3 text-sm text-destructive">{inventoryError}</p>}
         <Table>
           <TableHeader>
             <TableRow>
@@ -125,7 +164,7 @@ export function Clients() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {peers.length === 0 && (
+            {peers.length === 0 && !inventoryError && (
               <TableRow>
                 <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
                   No devices registered yet.
@@ -164,11 +203,11 @@ export function Clients() {
                 <TableCell>
                   <div className="flex items-center justify-end gap-1">
                     {p.status === "pending" && (
-                      <Button size="icon" variant="ghost" title="Approve" disabled={busy} onClick={() => act(p.token, "approve")}>
+                      <Button size="icon" variant="ghost" title="Approve" aria-label={`Approve ${p.device_name || "device"}`} disabled={busy} onClick={() => act(p.token, "approve")}>
                         <CheckIcon className="text-primary" />
                       </Button>
                     )}
-                    <Button size="icon" variant="ghost" title="Schedule & caps" onClick={() => openLimits(p)}>
+                    <Button size="icon" variant="ghost" title="Schedule & caps" aria-label={`Service controls for ${p.device_name || "device"}`} disabled={busy} onClick={() => openLimits(p)}>
                       <GaugeIcon />
                     </Button>
                     {p.status !== "kicked" && p.status !== "banned" && (
@@ -216,7 +255,7 @@ export function Clients() {
         </Table>
       </CardContent>
 
-      <Dialog open={!!limitsPeer} onOpenChange={(o) => !o && setLimitsPeer(null)}>
+      <Dialog open={!!limitsPeer} onOpenChange={(o) => { if (!o && !busy) closeLimits() }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -226,12 +265,15 @@ export function Clients() {
             <DialogDescription>Schedule, bandwidth cap and data quota for this device.</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
+            {!limits && !error && <p role="status">Reading authoritative device controls…</p>}
+            {limits && <>
             <div className="space-y-1.5">
               <Label htmlFor="sched">Access schedule</Label>
               <Input
                 id="sched"
                 placeholder="e.g. Mon-Fri 0800-1800 (empty = always)"
                 value={limits.schedule}
+                disabled={busy}
                 onChange={(e) => setLimits({ ...limits, schedule: e.target.value })}
               />
               <p className="text-xs text-muted-foreground">
@@ -245,6 +287,7 @@ export function Clients() {
                   id="bps"
                   type="number"
                   min={0}
+                  disabled={busy}
                   value={limits.max_bps ? Math.round(limits.max_bps / 1024) : 0}
                   onChange={(e) => setLimits({ ...limits, max_bps: Math.max(0, Number(e.target.value)) * 1024 })}
                 />
@@ -255,6 +298,7 @@ export function Clients() {
                   id="quota"
                   type="number"
                   min={0}
+                  disabled={busy}
                   value={limits.quota_bytes ? Math.round(limits.quota_bytes / (1024 * 1024)) : 0}
                   onChange={(e) =>
                     setLimits({ ...limits, quota_bytes: Math.max(0, Number(e.target.value)) * 1024 * 1024 })
@@ -262,13 +306,14 @@ export function Clients() {
                 />
               </div>
             </div>
-            {error && <p className="text-sm text-destructive">{error}</p>}
+            </>}
+            {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setLimitsPeer(null)}>
+            <Button variant="outline" disabled={busy} onClick={closeLimits}>
               Cancel
             </Button>
-            <Button onClick={saveLimits} disabled={busy}>
+            <Button onClick={saveLimits} disabled={busy || !limits}>
               Save controls
             </Button>
           </DialogFooter>

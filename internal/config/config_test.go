@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"opentunnel/internal/version"
 )
 
 func TestWriteDefaultClientConfigRoundtrip(t *testing.T) {
@@ -12,6 +14,15 @@ func TestWriteDefaultClientConfigRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := LoadClient(p)
+	if version.RequiresOwnServerConfiguration {
+		if err == nil {
+			t.Fatal("generic first-run template connected without operator configuration")
+		}
+		if strings.Contains(DefaultClientTOML, "aborro.dev") || strings.Contains(DefaultClientTOML, "CHANGE_ME_LONG_RANDOM_SECRET") {
+			t.Fatal("generic client embeds hosted routing or a shared credential template")
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +96,12 @@ func TestDefaultPathsAreBoring(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := LoadClient(p)
+	if version.RequiresOwnServerConfiguration {
+		if err == nil || !strings.Contains(DefaultClientTOML, `ws_path = "/api/v1/stream"`) {
+			t.Fatal("generic template has an implicit server or unexpected protocol path")
+		}
+		return
+	}
 	if err != nil {
 		t.Fatalf("default config must load: %v", err)
 	}

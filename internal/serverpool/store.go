@@ -123,6 +123,9 @@ func (s Store) Import(p Profile, consent bool, now time.Time) error {
 	if p.IssuedAt <= old.IssuedAt || p.ExpiresAt < old.ExpiresAt {
 		return errors.New("server pool rollback or conflicting same-version profile refused")
 	}
+	if old.RequireChannelAuth && !p.RequireChannelAuth {
+		return errors.New("server pool authentication downgrade refused; upgraded device identities remain connection-bound")
+	}
 	return privatefile.Write(path, raw)
 }
 

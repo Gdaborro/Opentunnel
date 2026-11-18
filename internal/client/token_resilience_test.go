@@ -41,6 +41,25 @@ func TestMissingPrivateKeyRequiresRecovery(t *testing.T) {
 	}
 }
 
+func TestBothKeyFilesMissingDoesNotRotateEstablishedIdentity(t *testing.T) {
+	s := &TokenStore{Dir: t.TempDir()}
+	if _, err := s.EnsureSSHKey(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(s.SSHPrivatePath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(s.SSHPublicPath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureSSHKey(); err == nil {
+		t.Fatal("both lost key files regenerated an established device identity")
+	}
+	if _, err := os.Stat(s.SSHPrivatePath()); !os.IsNotExist(err) {
+		t.Fatal("failed key recovery still created a new private key")
+	}
+}
+
 func TestConcurrentIdentityCreationIsStable(t *testing.T) {
 	s := &TokenStore{Dir: t.TempDir()}
 	var wg sync.WaitGroup

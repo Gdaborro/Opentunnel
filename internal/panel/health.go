@@ -53,6 +53,10 @@ func (h *Handler) apiServerHealth(w http.ResponseWriter, r *http.Request) {
 	if sample, at, err := h.db.RelayMetrics(); err == nil && time.Since(at) >= 0 && time.Since(at) < 30*time.Second {
 		out["version"], out["process_uptime_s"], out["goroutines"], out["heap_mb"], out["active_sessions"] = sample.Version, sample.UptimeS, sample.Goroutines, sample.HeapMB, sample.ActiveSessions
 		out["relay_online"] = true
+		out["guard_dropped_sources"] = sample.GuardDroppedSources
+		out["sentinel_dropped_subjects"] = sample.SentinelDroppedSubjects
+		out["sentinel_dropped_throttles"] = sample.SentinelDroppedThrottles
+		out["sentinel_saturated_events"] = sample.SentinelSaturatedEvents
 		out["metrics_age_s"] = int64(time.Since(at).Seconds())
 	} else {
 		out["version"] = ""
@@ -60,6 +64,11 @@ func (h *Handler) apiServerHealth(w http.ResponseWriter, r *http.Request) {
 		out["goroutines"] = 0
 		out["heap_mb"] = 0
 		out["active_sessions"] = 0
+	}
+	if nodes, err := h.db.NodeMetrics(r.Context()); err == nil {
+		out["relay_nodes"] = nodes
+	} else {
+		out["relay_node_metrics_unavailable"] = true
 	}
 
 	if vm, err := mem.VirtualMemory(); err == nil {

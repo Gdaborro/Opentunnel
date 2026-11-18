@@ -20,11 +20,12 @@ import (
 )
 
 const (
-	ProfileVersion = 1
-	MaxNodes       = 16
-	MaxProfileSize = 64 << 10
-	MaxValidity    = 90 * 24 * time.Hour
-	InfoPath       = "/api/token/server-info"
+	ProfileVersion        = 1
+	ChannelProfileVersion = 2
+	MaxNodes              = 16
+	MaxProfileSize        = 64 << 10
+	MaxValidity           = 90 * 24 * time.Hour
+	InfoPath              = "/api/token/server-info"
 )
 
 type Node struct {
@@ -40,26 +41,29 @@ type Node struct {
 // A pool is one approval/accounting authority, not just a geographical list.
 // Independent operators must have different keys/IDs and enrollments.
 type Profile struct {
-	Version          int    `json:"version"`
-	ID               string `json:"id"`           // SHA256 of the operator's Ed25519 public key
-	AuthorityID      string `json:"authority_id"` // immutable ID of the shared approval/accounting database
-	Name             string `json:"name"`
-	OperatorKey      string `json:"operator_key"`
-	IssuedAt         int64  `json:"issued_at"`
-	ExpiresAt        int64  `json:"expires_at"`
-	LoginRequired    bool   `json:"login_required"`
-	ApprovalRequired bool   `json:"approval_required"`
-	Nodes            []Node `json:"nodes"`
-	Signature        string `json:"signature,omitempty"`
+	Version            int    `json:"version"`
+	ID                 string `json:"id"`           // SHA256 of the operator's Ed25519 public key
+	AuthorityID        string `json:"authority_id"` // immutable ID of the shared approval/accounting database
+	Name               string `json:"name"`
+	OperatorKey        string `json:"operator_key"`
+	IssuedAt           int64  `json:"issued_at"`
+	ExpiresAt          int64  `json:"expires_at"`
+	LoginRequired      bool   `json:"login_required"`
+	ApprovalRequired   bool   `json:"approval_required"`
+	RequireChannelAuth bool   `json:"require_channel_auth,omitempty"`
+	Nodes              []Node `json:"nodes"`
+	Signature          string `json:"signature,omitempty"`
 }
 
 // Info is fetched without credentials over a node's pinned TLS connection.
 type Info struct {
-	Version          int    `json:"version"`
-	PoolID           string `json:"pool_id"`
-	AuthorityID      string `json:"authority_id"`
-	LoginRequired    bool   `json:"login_required"`
-	ApprovalRequired bool   `json:"approval_required"`
+	Version              int    `json:"version"`
+	PoolID               string `json:"pool_id"`
+	AuthorityID          string `json:"authority_id"`
+	LoginRequired        bool   `json:"login_required"`
+	ApprovalRequired     bool   `json:"approval_required"`
+	RequireChannelAuth   bool   `json:"require_channel_auth,omitempty"`
+	ChannelAuthSupported bool   `json:"channel_auth_supported,omitempty"`
 }
 
 func OperatorID(key ed25519.PublicKey) string {
@@ -145,7 +149,7 @@ func validPins(pins []string, required bool) bool {
 
 func (p Profile) Validate(now time.Time) error {
 	pub, err := base64.StdEncoding.DecodeString(p.OperatorKey)
-	if p.Version != ProfileVersion || err != nil || len(pub) != ed25519.PublicKeySize || base64.StdEncoding.EncodeToString(pub) != p.OperatorKey || p.ID != OperatorID(pub) || !ValidID(p.AuthorityID) || !cleanLabel(p.Name, 80) || !p.ApprovalRequired {
+	if (p.Version != ProfileVersion && p.Version != ChannelProfileVersion) || (p.Version == ProfileVersion && p.RequireChannelAuth) || err != nil || len(pub) != ed25519.PublicKeySize || base64.StdEncoding.EncodeToString(pub) != p.OperatorKey || p.ID != OperatorID(pub) || !ValidID(p.AuthorityID) || !cleanLabel(p.Name, 80) || !p.ApprovalRequired {
 		return errors.New("server pool identity or manual-approval policy is invalid")
 	}
 	if p.IssuedAt <= 0 || p.IssuedAt > now.Unix()+300 || p.ExpiresAt <= now.Unix() || p.ExpiresAt <= p.IssuedAt || p.ExpiresAt-p.IssuedAt > int64(MaxValidity/time.Second) {
@@ -158,6 +162,9 @@ func (p Profile) Validate(now time.Time) error {
 	for _, node := range p.Nodes {
 		if !validNodeID(node.ID) || !cleanLabel(node.Name, 80) || ids[node.ID] || endpoints[node.Address+"|"+node.DialAddress] || !validEndpoint(node.Address, false) || (node.DialAddress != "" && !validEndpoint(node.DialAddress, true)) || !validPins(node.Pins, true) || !validPins(node.InnerTLSPins, false) {
 			return errors.New("server pool node, endpoint or pin set is invalid")
+		}
+		if p.RequireChannelAuth && len(node.InnerTLSPins) == 0 {
+			return errors.New("connection-bound pool authentication requires independent mutual TLS pins on every node")
 		}
 		if node.WSPath == "" || len(node.WSPath) > 256 || node.WSPath[0] != '/' || strings.ContainsAny(node.WSPath, "?#\\\r\n\t %") || strings.Contains(node.WSPath, "//") || strings.Contains(node.WSPath, "..") {
 			return errors.New("server pool websocket path is invalid")
@@ -184,6 +191,9 @@ func (p *Profile) Sign(key ed25519.PrivateKey, now time.Time) error {
 	}
 	pub := key.Public().(ed25519.PublicKey)
 	p.Version, p.ID, p.OperatorKey = ProfileVersion, OperatorID(pub), base64.StdEncoding.EncodeToString(pub)
+	if p.RequireChannelAuth {
+		p.Version = ChannelProfileVersion
+	}
 	if err := p.Validate(now); err != nil {
 		return err
 	}

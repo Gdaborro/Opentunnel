@@ -1,0 +1,32 @@
+# Reference only. Do not install over an existing service without the guarded
+# backup/migration/canary checklist in docs/HARDENING-OPERATIONS.md.
+[Unit]
+Description=OpenTunnel approval/accounting authority and operator panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=otu-authority
+Group=otu-authority
+UMask=0077
+Environment=TMPDIR=/var/lib/opentunnel-authority
+ExecStart=/usr/local/bin/otu-panel -c /etc/opentunnel-authority/server.toml -listen 127.0.0.1:8090
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/opentunnel-authority
+LimitNOFILE=8192
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

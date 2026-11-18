@@ -73,19 +73,55 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Automatic-proxy fixture build failed' }
           "OTU_TEST_AUTOPROXY_BINARY=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
           "OTU_TEST_CLIENT_BINARY=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OTU_INTERNAL_REVIEW_FIXTURE=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OTU_SECURITY_REVIEW_REPRO=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: fixture-only generic Windows client
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'otu-generic-fixture.exe'
+          go build -buildvcs=false '-tags=genericclient,netenvfixture' -trimpath -ldflags="-s -w" -o $target ./cmd/otu-client
+          if ($LASTEXITCODE -ne 0) { throw 'Generic edition fixture build failed' }
+          "OTU_TEST_GENERIC_CLIENT_BINARY=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: generic-client configuration and edition tests
+        shell: pwsh
+        run: |
+          $priorFixture = $env:OTU_INTERNAL_REVIEW_FIXTURE
+          if ($IsWindows) { $env:OTU_INTERNAL_REVIEW_FIXTURE = $env:OTU_TEST_GENERIC_CLIENT_BINARY }
+          try {
+            go test -race '-tags=genericclient,netenvfixture' -count=1 -timeout 180s ./internal/config ./cmd/otu-client ./internal/client ./internal/protocol
+            if ($LASTEXITCODE -ne 0) { throw 'Generic edition checks failed' }
+          } finally { $env:OTU_INTERNAL_REVIEW_FIXTURE = $priorFixture }
+      - name: editions cannot share credentials or bypass network ownership
+        if: runner.os == 'Windows'
+        run: go test -race -tags=netenvfixture -count=1 -v -run '^TestGenericEdition|^TestClientEditions|^TestFixtureStartupRefusal' -timeout 180s ./test
       - name: automatic-proxy startup and legacy policy migration acceptance
         if: runner.os == 'Windows'
         run: go test -race -count=1 -v -run '^TestFixtureClientAutomaticProxyStartupAndLegacyRecovery$' -timeout 180s ./test
       - name: registry-free trusted-pool executable acceptance
         if: runner.os == 'Windows'
-        run: go test -race -count=1 -v -run '^TestFixtureClientTrustedPoolImportSelectionAndTraffic$' -timeout 180s ./test
+        run: go test -race -tags=netenvfixture -count=1 -v -run '^TestFixtureClientTrustedPoolImportSelectionAndTraffic$|^TestFixtureClientChannelPoolImportSelectionAndTraffic$|^TestFixtureSOCKSOnlyAutoProxy' -timeout 180s ./test
+      - name: staged native central authority and relay executables
+        shell: pwsh
+        run: |
+          $suffix = if ($IsWindows) { '.exe' } else { '' }
+          $server = Join-Path $env:RUNNER_TEMP ('otu-authority-relay-test' + $suffix)
+          $panel = Join-Path $env:RUNNER_TEMP ('otu-authority-panel-test' + $suffix)
+          go build -buildvcs=false -trimpath -o $server ./cmd/otu-server
+          if ($LASTEXITCODE -ne 0) { throw 'Relay process fixture build failed' }
+          go build -buildvcs=false -trimpath -o $panel ./cmd/otu-panel
+          if ($LASTEXITCODE -ne 0) { throw 'Authority process fixture build failed' }
+          "OTU_TEST_SERVER_BINARY=$server" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OTU_TEST_PANEL_BINARY=$panel" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: central authority with two real node processes
+        run: go test -race -tags=netenvfixture -count=1 -v -run '^TestCentralAuthorityNativeExecutables' -timeout 180s ./test
       - name: gofmt check
         run: |
           OUT=$(gofmt -l .)
           if [ -n "$OUT" ]; then echo "unformatted: $OUT"; exit 1; fi
         if: runner.os == 'Linux'
       - name: tests (race, includes test/security regression suite)
-        run: go test -race -timeout 300s ./...
+        run: go test -race -tags=netenvfixture -count=1 -timeout 300s ./...
       - name: govulncheck
         run: |
           go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
@@ -126,15 +162,21 @@ jobs:
           LDFLAGS="-s -w"
           mkdir -p dist
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-client-windows-amd64.exe ./cmd/otu-client
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags=genericclient -trimpath -ldflags="$LDFLAGS" -o dist/otu-client-generic-windows-amd64.exe ./cmd/otu-client
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-server-linux-amd64 ./cmd/otu-server
           CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-server-linux-arm64 ./cmd/otu-server
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-panel-linux-amd64 ./cmd/otu-panel
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-panel-linux-arm64 ./cmd/otu-panel
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -tags=genericclient -trimpath -ldflags="$LDFLAGS" -o dist/otu-client-linux-amd64 ./cmd/otu-client
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-windows-amd64.exe ./cmd/otu-reality
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-linux-amd64 ./cmd/otu-reality
           CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-linux-arm64 ./cmd/otu-reality
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-pool-windows-amd64.exe ./cmd/otu-pool
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-pool-linux-amd64 ./cmd/otu-pool
           CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-pool-linux-arm64 ./cmd/otu-pool
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-migrate-windows-amd64.exe ./cmd/otu-migrate
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-migrate-linux-amd64 ./cmd/otu-migrate
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-migrate-linux-arm64 ./cmd/otu-migrate
       - name: reproducible restricted companion cross-builds
         working-directory: companions/xray
         run: |
@@ -146,7 +188,7 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary dist/otu-xray-linux-amd64
       - name: host artifact vulnerability gate
         run: |
-          for asset in dist/otu-client-windows-amd64.exe dist/otu-server-linux-amd64 dist/otu-panel-linux-amd64; do
+          for asset in dist/otu-client-windows-amd64.exe dist/otu-client-generic-windows-amd64.exe dist/otu-server-linux-amd64 dist/otu-panel-linux-amd64; do
             go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "$asset"
           done
       - name: isolated native release executable smoke
@@ -157,6 +199,7 @@ jobs:
         run: |
           go version -m dist/otu-client-windows-amd64.exe | sed 's/\t/ /g' > dist/SBOM-otu-client.txt
           go version -m dist/otu-server-linux-amd64 | sed 's/\t/ /g' > dist/SBOM-otu-server.txt
+          go version -m dist/otu-panel-linux-amd64 | sed 's/\t/ /g' > dist/SBOM-otu-panel.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: opentunnel-binaries

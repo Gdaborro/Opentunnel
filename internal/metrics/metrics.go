@@ -22,11 +22,15 @@ func ActiveSessions() int64 { return activeSessions.Load() }
 var started = time.Now()
 
 type Snapshot struct {
-	Version        string  `json:"version"`
-	UptimeS        int64   `json:"process_uptime_s"`
-	Goroutines     int     `json:"goroutines"`
-	HeapMB         float64 `json:"heap_mb"`
-	ActiveSessions int64   `json:"active_sessions"`
+	Version                  string  `json:"version"`
+	UptimeS                  int64   `json:"process_uptime_s"`
+	Goroutines               int     `json:"goroutines"`
+	HeapMB                   float64 `json:"heap_mb"`
+	ActiveSessions           int64   `json:"active_sessions"`
+	GuardDroppedSources      uint64  `json:"guard_dropped_sources,omitempty"`
+	SentinelDroppedSubjects  uint64  `json:"sentinel_dropped_subjects,omitempty"`
+	SentinelDroppedThrottles uint64  `json:"sentinel_dropped_throttles,omitempty"`
+	SentinelSaturatedEvents  uint64  `json:"sentinel_saturated_events,omitempty"`
 }
 
 func Capture(version string) Snapshot {

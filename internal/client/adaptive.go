@@ -42,6 +42,8 @@ const SshTierName = "ssh"
 // on panel approval) clears the cooldown immediately.
 const sshRejectCooldown = 15 * time.Minute
 
+const maxRetiredTierClients = 24
+
 // H3TierName is the HTTP/3 tier: QUIC to :443 survives TLS interception
 // (middleboxes cannot re-sign what they cannot terminate), sits between
 // the ws-tls profiles and the ssh last resort, and carries bulk traffic
@@ -129,12 +131,17 @@ type Adaptive struct {
 	Logger        *log.Logger // optional; nil = log.Default()
 	mux           bool        // multiplexing requested by config
 	failStreak    int         // consecutive failures on current tier
+	lastFailure   string      // redacted runtime status category, never a destination/credential
+	lastAdmission string
+	generation    uint64 // network/config epoch; stale dials cannot relatch state
+	verifiedAt    time.Time
 
 	// clients caches one Client per tier so every browser connection reuses
 	// the tier's warm mux pool instead of paying a full transport handshake
 	// (TCP + TLS/SSH + auth) per request. Without this, page-load bursts
 	// mint hundreds of handshakes and melt a small relay.
-	clients map[int]*Client
+	clients        map[int]*Client
+	retiredClients []*Client // preserve shutdown ownership of gracefully draining pools
 
 	// transportBuilder lets configs swap the underlying transport per
 	// profile (e.g. ssh). Defaults to ws-tls with Chrome hello above fast.
@@ -147,9 +154,10 @@ type Adaptive struct {
 	// h3Fallback, when set, adds the HTTP/3 tier between the ws-tls
 	// profiles and ssh: QUIC cannot be transparently intercepted, so the
 	// pinned handshake reaches the relay untouched on MITM networks.
-	h3Fallback      func() transport.Transport
-	carrierFallback func() transport.Transport
-	innerTLSPins    []string
+	h3Fallback         func() transport.Transport
+	carrierFallback    func() transport.Transport
+	innerTLSPins       []string
+	requireChannelAuth bool
 
 	// AllowHostileSSH permits the SSH tier while hostile mode is active
 	// (TLS-intercepting network). Default true preserves connectivity;
@@ -161,6 +169,8 @@ type Adaptive struct {
 	sshCooldown  time.Time
 	sshRejects   int
 	tierCooldown map[int]time.Time // transient carrier failures, shared by data/control/probes
+	tcpRetryAt   time.Time         // one bounded strict-TLS recovery probe, never a pin bypass
+	tierFailures map[string]string
 	closed       bool
 
 	// hostile latches when every ws tier fails certificate pinning (TLS
@@ -236,6 +246,24 @@ func (a *Adaptive) EnableH3(builder func() transport.Transport) {
 	a.invalidateClientsLocked()
 }
 
+func (a *Adaptive) RequireChannelAuthentication() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.poolSelector != nil {
+		if !a.poolSelector.profile.RequireChannelAuth {
+			return errors.New("connection-bound pool requirement must come from the accepted signed profile")
+		}
+		a.requireChannelAuth = true
+		return nil // each selected node's already-validated inner pins are applied by the selector
+	}
+	if len(a.innerTLSPins) == 0 {
+		return errors.New("connection-bound authentication requires independent inner TLS pins")
+	}
+	a.requireChannelAuth = true
+	a.invalidateClientsLocked()
+	return nil
+}
+
 // EnableH3ForCurrentEntry keeps QUIC aligned with entry rotation and pins
 // learned in-band. A closure over the startup config kept obsolete pins and
 // the old entry forever, even after the WS tiers had learned a renewal.
@@ -243,13 +271,14 @@ func (a *Adaptive) EnableH3ForCurrentEntry() {
 	a.EnableH3(func() transport.Transport {
 		// defaultFactory invokes this while holding a.mu.
 		return transport.NewH3(transport.H3Options{
-			ServerAddr:   a.base.ServerAddr,
-			ServerName:   a.base.ServerName,
-			Path:         a.base.WSPath,
-			Fingerprint:  a.base.Fingerprint,
-			Fingerprints: append([]string(nil), a.base.Fingerprints...),
-			Insecure:     a.base.Insecure,
-			DialTimeout:  a.dialTimeout,
+			ServerAddr:    a.base.ServerAddr,
+			ServerName:    a.base.ServerName,
+			HTTPAuthority: a.base.HTTPAuthority,
+			Path:          a.base.WSPath,
+			Fingerprint:   a.base.Fingerprint,
+			Fingerprints:  append([]string(nil), a.base.Fingerprints...),
+			Insecure:      a.base.Insecure,
+			DialTimeout:   a.dialTimeout,
 		})
 	})
 }
@@ -290,10 +319,10 @@ func NewAdaptive(token string, base transport.WSTLSOptions, profile string, dial
 	return a
 }
 
-// h3MuxByteCap keeps one h3 session under Cloudflare's 100 MB proxied
-// request-body limit: the h3 tier tunnels as one streamed request, so a
-// session crossing the edge's cap would be cut mid-transfer with a bare
-// reset. 64 MiB + the pool's usual ±25% jitter stays clear with margin.
+// h3MuxByteCap stops assigning NEW streams before an edge's request cap.
+// This is not a hard request-body cap: an already active transfer may exceed
+// it while draining and an HTTP front may then reset it. Real large-transfer
+// acceptance must use the front's documented streaming limits, not this hint.
 const h3MuxByteCap = 64 << 20
 
 func defaultFactory(a *Adaptive, idx int) *Client {
@@ -320,12 +349,13 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 		tr = transport.NewWSTLS(opt)
 	}
 	opts := Options{
-		IdentityScope:  a.identityScope,
-		Token:          a.token,
-		DialTimeout:    a.dialTimeout,
-		Profile:        "balanced", // under h3/ssh, mild padding; harmless elsewhere
-		Mux:            a.mux,
-		OnAuthRejected: a.OnAuthRejected,
+		RequireChannelAuth: a.requireChannelAuth,
+		IdentityScope:      a.identityScope,
+		Token:              a.token,
+		DialTimeout:        a.dialTimeout,
+		Profile:            "balanced", // under h3/ssh, mild padding; harmless elsewhere
+		Mux:                a.mux,
+		OnAuthRejected:     a.OnAuthRejected,
 	}
 	if len(a.innerTLSPins) > 0 {
 		wrapped, err := withScopedInnerTLS(tr, a.innerTLSPins, a.identityScope)
@@ -360,6 +390,7 @@ func (a *Adaptive) UseTrustedPool(selector *PoolSelector) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.poolSelector, a.identityScope, a.token = selector, selector.profile.ID, ""
+	a.requireChannelAuth = selector.profile.RequireChannelAuth
 	a.transportBuilder = func(string) transport.Transport { return selector.Transport(a.dialTimeout) }
 	a.sshFallback, a.h3Fallback, a.carrierFallback, a.innerTLSPins, a.entries = nil, nil, nil, nil, nil
 	a.AllowHostileSSH = false
@@ -369,11 +400,20 @@ func (a *Adaptive) UseTrustedPool(selector *PoolSelector) {
 func (a *Adaptive) build(idx int) *Client {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closed {
+		return &Client{setupError: net.ErrClosed}
+	}
+	a.pruneRetiredLocked()
 	if a.clients == nil {
 		a.clients = make(map[int]*Client)
 	}
 	if cl, ok := a.clients[idx]; ok {
 		return cl
+	}
+	// Repeated pin/network changes cannot grow an unlimited set of active
+	// draining clients. Backpressure new setup rather than kill old transfers.
+	if len(a.retiredClients)+len(a.clients) >= maxRetiredTierClients {
+		return &Client{setupError: ErrMuxCapacity}
 	}
 	cl := a.factory(a, idx)
 	a.clients[idx] = cl
@@ -427,6 +467,7 @@ func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client)
 			return zero, err
 		}
 	}
+	generation := a.generation
 	start := a.idx
 	probeDown := a.auto && start > 0 && time.Since(a.lastProbe) > 10*time.Minute
 	// Probe downward early if the current tier keeps failing (e.g. the
@@ -457,7 +498,7 @@ func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client)
 	}
 	// Honor the sticky working carrier. In particular, when SSH is working,
 	// do NOT put blocked QUIC in front of it again on every browser request.
-	if hostile && auto && start < len(profileOrder) {
+	if hostile && auto && start < len(profileOrder) && total > len(profileOrder) {
 		start = len(profileOrder)
 	}
 	if !auto {
@@ -469,22 +510,49 @@ func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client)
 			}
 			order = append(order, i)
 		}
+		// A sticky carrier is tried first. Only if it fails (or is cooling)
+		// do we reconsider earlier optional carriers. An expired QUIC cooldown
+		// must not stay unreachable merely because SSH was selected earlier.
+		for idx := len(profileOrder); idx < start; idx++ {
+			order = append(order, idx)
+		}
+		if hostile && !probeDown {
+			order = append(order, 0) // the strict-TLS retry gate below bounds this
+		}
 	}
 
 	var lastErr error
 	sawPin := false
 	sawDNS := false
+	seen := map[int]bool{}
 	for _, idx := range order {
 		if err := ctx.Err(); err != nil {
 			return zero, err
 		}
-		if sawPin && idx < len(profileOrder) {
+		if seen[idx] {
+			continue
+		}
+		seen[idx] = true
+		if (sawPin || sawDNS) && idx < len(profileOrder) {
 			continue // changing padding cannot fix the identical failed pin
 		}
 		a.mu.Lock()
+		if a.closed || a.generation != generation {
+			a.mu.Unlock()
+			return zero, ErrNetworkChanged
+		}
 		allowed := idx < a.tierCount() // hostile latching may hide the SSH tier mid-call
 		sshIdx := a.sshTierIndex()
 		cooling := time.Now().Before(a.tierCooldown[idx]) || (idx == sshIdx && time.Now().Before(a.sshCooldown))
+		if idx < len(profileOrder) && a.hostile {
+			if time.Now().Before(a.tcpRetryAt) {
+				cooling = true
+			} else if allowed && !cooling {
+				// Reserve before releasing the mutex: a browser burst cannot
+				// schedule a separate failed pin probe for every destination.
+				a.tcpRetryAt = time.Now().Add(time.Minute)
+			}
+		}
 		a.mu.Unlock()
 		if cooling || !allowed {
 			continue
@@ -492,10 +560,26 @@ func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client)
 		cl := a.build(idx)
 		t0 := time.Now()
 		value, err := call(cl)
+		a.mu.Lock()
+		if a.closed || a.generation != generation {
+			a.mu.Unlock()
+			if err == nil {
+				if closer, ok := any(value).(io.Closer); ok {
+					_ = closer.Close()
+				}
+			}
+			return zero, ErrNetworkChanged
+		}
 		if err == nil {
+			a.lastFailure = ""
+			a.verifiedAt = time.Now()
+			failureName := a.tierName(idx)
+			if idx < len(profileOrder) {
+				failureName = "ws-tls"
+			}
+			delete(a.tierFailures, failureName)
 			elapsed := time.Since(t0)
 			clearedHostile := false
-			a.mu.Lock()
 			a.failStreak = 0
 			delete(a.tierCooldown, idx)
 			if idx == sshIdx {
@@ -504,6 +588,8 @@ func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client)
 			}
 			if a.hostile && idx < len(profileOrder) && cl.Transport.Name() == "ws-tls" {
 				a.hostile = false // clean ws-tls dial: network changed
+				a.tcpRetryAt = time.Time{}
+				setHostileMode(false)
 				clearedHostile = true
 			}
 			switch {
@@ -527,30 +613,44 @@ func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client)
 			}
 			a.mu.Unlock()
 			if clearedHostile {
-				a.SetHostile(false)
+				a.logger().Print("adaptive: strict TLS connection verified again; trust checks remain enforced")
 			}
 			return value, nil
 		}
 		if ctx.Err() != nil {
+			a.mu.Unlock()
 			return zero, ctx.Err()
 		}
+		a.lastFailure = runtimeFailureCategory(err)
+		if a.tierFailures == nil {
+			a.tierFailures = make(map[string]string)
+		}
+		failureName := a.tierName(idx)
+		if idx < len(profileOrder) {
+			failureName = "ws-tls"
+		}
+		a.tierFailures[failureName] = a.lastFailure
 		if fatalUpstream(err) {
+			a.mu.Unlock()
 			return zero, err
 		}
+		logPinFailure := false
 		if isPinFailure(err) {
 			sawPin = true
-			a.SetHostile(true)
+			logPinFailure = !a.hostile
+			a.setHostileLocked(true)
+			a.tcpRetryAt = time.Now().Add(time.Minute + time.Duration(rand.Int63n(int64(15*time.Second))))
 		}
 		if isDNSError(err) {
 			sawDNS = true
 		}
 		var keyRej *transport.SSHKeyRejectedError
+		var rejectionPause time.Duration
 		if errors.As(err, &keyRej) {
-			a.noteSSHReject(keyRej)
+			rejectionPause = a.noteSSHRejectLocked()
 		} else if idx >= len(profileOrder) {
 			// One failure is enough to pause a blocked carrier briefly.
 			// Periodic downward probes still detect network recovery.
-			a.mu.Lock()
 			if a.tierCooldown == nil {
 				a.tierCooldown = make(map[int]time.Time)
 			}
@@ -559,22 +659,27 @@ func adaptiveAttempt[T any](a *Adaptive, ctx context.Context, call func(*Client)
 				gap = 30 * time.Second
 			}
 			a.tierCooldown[idx] = time.Now().Add(gap + time.Duration(rand.Int63n(int64(gap)/4)))
-			a.mu.Unlock()
 		}
-		a.mu.Lock()
 		lastErr = fmt.Errorf("tier %q: %w", a.tierName(idx), err)
 		if idx == a.idx {
 			a.failStreak++
 		}
 		a.mu.Unlock()
+		if logPinFailure {
+			a.logger().Print("adaptive: TLS pin verification failed (possible interception or stale trust); pins remain enforced, retry traffic is limited")
+		}
+		if rejectionPause > 0 {
+			a.logger().Printf("adaptive: SSH rejected the device key; verify administrator approval and key reconciliation; retry paused for %s", rejectionPause.Round(time.Minute))
+		}
 	}
 	if lastErr == nil {
-		lastErr = errors.New("client: no carrier currently available; failed carriers are cooling down")
+		a.mu.Lock()
+		lastErr = a.carrierUnavailableLocked()
+		a.mu.Unlock()
 	}
 	if sawDNS {
 		// Sinkholed entry hostname: go hostile-quiet instead of storming
 		// redials at a dead name, and rotate entries when possible.
-		a.SetHostile(true)
 		a.RotateEntry("dns")
 	}
 	return zero, lastErr
@@ -608,8 +713,13 @@ func (a *Adaptive) RotateEntry(reason string) bool {
 	a.idx = 0
 	a.failStreak = 0
 	a.lastProbe = time.Time{}
+	a.tcpRetryAt = time.Time{}
+	a.hostile = false // strict pins are retried against the newly selected entry
+	a.tierCooldown = nil
+	a.sshCooldown = time.Time{}
 	a.invalidateClientsLocked()
 	addr := a.base.ServerAddr
+	setHostileMode(false)
 	a.mu.Unlock()
 	a.logger().Printf("adaptive: rotating entry (%s) -> %s", reason, addr)
 	return true
@@ -651,6 +761,8 @@ func (a *Adaptive) Reset() {
 	a.sshRejects = 0
 	a.sshCooldown = time.Time{}
 	a.tierCooldown = nil
+	a.tcpRetryAt = time.Time{}
+	a.generation++ // an old refusal cannot undo this reviewed approval reset
 	if !a.auto {
 		return
 	}
@@ -666,6 +778,24 @@ func (a *Adaptive) Reset() {
 func (a *Adaptive) SetHostile(on bool) {
 	a.mu.Lock()
 	changed := a.hostile != on
+	a.setHostileLocked(on)
+	if on && a.tcpRetryAt.IsZero() {
+		a.tcpRetryAt = time.Now().Add(time.Minute)
+	}
+	a.mu.Unlock()
+	if changed {
+		if on {
+			a.logger().Printf("adaptive: TLS pin verification failed (possible interception or stale trust); pins remain enforced, retry traffic is limited")
+		} else {
+			a.logger().Printf("adaptive: clean network - hostile mode off")
+		}
+	}
+}
+
+// Caller holds a.mu; publishing the process flag inside the same critical
+// section prevents a stale dial from racing a completed network reset.
+func (a *Adaptive) setHostileLocked(on bool) {
+	changed := a.hostile != on
 	a.hostile = on
 	if on && a.auto && a.idx < len(profileOrder)-1 {
 		a.idx = len(profileOrder) - 1 // lock stealth shaping
@@ -673,14 +803,9 @@ func (a *Adaptive) SetHostile(on bool) {
 	if on && changed {
 		a.lastProbe = time.Now()
 	}
-	a.mu.Unlock()
 	setHostileMode(on)
-	if changed {
-		if on {
-			a.logger().Printf("adaptive: hostile network (TLS interception) â€” stealth locked, beacons stretched")
-		} else {
-			a.logger().Printf("adaptive: clean network â€” hostile mode off")
-		}
+	if !on {
+		a.tcpRetryAt = time.Time{}
 	}
 }
 
@@ -691,16 +816,23 @@ func (a *Adaptive) SetHostile(on bool) {
 // server dozens of times a minute, which is exactly what a credential
 // attack looks like from its side.
 func (a *Adaptive) noteSSHReject(err *transport.SSHKeyRejectedError) {
-	now := time.Now()
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	d := a.noteSSHRejectLocked()
+	a.mu.Unlock()
+	if d > 0 {
+		a.logger().Printf("adaptive: %v - pausing the ssh tier for %s", err, d.Round(time.Minute))
+	}
+}
+
+func (a *Adaptive) noteSSHRejectLocked() time.Duration {
+	now := time.Now()
 	a.sshRejects++
 	if a.sshRejects < 2 || now.Before(a.sshCooldown) {
-		return
+		return 0
 	}
 	d := sshRejectCooldown + time.Duration(rand.Int63n(int64(sshRejectCooldown)/5))
 	a.sshCooldown = now.Add(d)
-	a.logger().Printf("adaptive: %v — pausing the ssh tier for %s", err, d.Round(time.Minute))
+	return d
 }
 
 // isPinFailure reports certificate-pin rejections (the MITM tell), as
@@ -725,9 +857,15 @@ func (a *Adaptive) Current() string {
 // CtrlExchange runs one in-band control exchange on the current tier's
 // client (see control.go).
 func (a *Adaptive) CtrlExchange(ctx context.Context, req protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
-	return adaptiveAttempt(a, ctx, func(cl *Client) (*protocol.CtrlResponse, error) {
+	response, err := adaptiveAttempt(a, ctx, func(cl *Client) (*protocol.CtrlResponse, error) {
 		return cl.CtrlExchange(ctx, req)
 	})
+	if err == nil && response != nil && response.OK && req.Op == "status" {
+		a.mu.Lock()
+		a.lastAdmission = response.Status
+		a.mu.Unlock()
+	}
+	return response, err
 }
 
 // AddPin appends a rotation pin to the base config and every entry, then
@@ -758,25 +896,88 @@ func (a *Adaptive) AddPin(fp string) bool {
 	if changed {
 		a.invalidateClientsLocked()
 		a.tierCooldown = nil
+		a.tcpRetryAt = time.Time{}
 		a.lastProbe = time.Time{} // trusted pin rotation warrants an immediate clean-path probe
 	}
 	return changed
 }
 
 func (a *Adaptive) invalidateClientsLocked() {
+	a.generation++
+	a.verifiedAt = time.Time{}
+	a.pruneRetiredLocked()
 	for _, cl := range a.clients {
 		cl.Drain()
+		a.retiredClients = append(a.retiredClients, cl)
 	}
 	a.clients = nil
+}
+
+var ErrNetworkChanged = errors.New("client: network or carrier configuration changed during setup; retry on the current network")
+
+// ConnectionVerified reports observed authenticated activity, not listener
+// readiness or a guarantee that arbitrary applications can use their proxy.
+func (a *Adaptive) ConnectionVerified() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return !a.closed && !a.verifiedAt.IsZero()
+}
+
+type CarrierUnavailableError struct {
+	RetryAt time.Time
+	Failure string
+}
+
+func (e *CarrierUnavailableError) Error() string {
+	return "client: no carrier currently available; previous failure: " + e.Failure + "; failed carriers are cooling down (strict trust checks remain enabled)"
+}
+
+func (a *Adaptive) carrierUnavailableLocked() error {
+	retry := a.tcpRetryAt
+	for _, candidate := range a.tierCooldown {
+		if candidate.After(time.Now()) && (retry.IsZero() || candidate.Before(retry)) {
+			retry = candidate
+		}
+	}
+	if a.sshCooldown.After(time.Now()) && (retry.IsZero() || a.sshCooldown.Before(retry)) {
+		retry = a.sshCooldown
+	}
+	failure := a.lastFailure
+	if failure == "" {
+		failure = "connection-or-authority"
+	}
+	return &CarrierUnavailableError{RetryAt: retry, Failure: failure}
+}
+
+func (a *Adaptive) pruneRetiredLocked() {
+	kept := a.retiredClients[:0]
+	for _, cl := range a.retiredClients {
+		if cl.DrainComplete() {
+			select {
+			case <-cl.startClose():
+				continue
+			default:
+				kept = append(kept, cl)
+			}
+		} else {
+			kept = append(kept, cl)
+		}
+	}
+	a.retiredClients = kept
 }
 
 func (a *Adaptive) Close() error {
 	a.mu.Lock()
 	a.closed = true
 	clients := a.clients
+	retired := a.retiredClients
 	a.clients = nil
+	a.retiredClients = nil
 	a.mu.Unlock()
 	for _, cl := range clients {
+		_ = cl.Close()
+	}
+	for _, cl := range retired {
 		_ = cl.Close()
 	}
 	return nil

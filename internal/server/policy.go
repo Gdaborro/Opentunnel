@@ -10,6 +10,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"opentunnel/internal/access"
+	"opentunnel/internal/authority"
 	"opentunnel/internal/serverpool"
 )
 
@@ -46,6 +47,7 @@ type relayState struct {
 	limits        map[string]*sharedLimiter
 	deviceStreams map[string]int
 	streams       chan struct{}
+	limitSweep    time.Time
 }
 
 func newRelayState() *relayState {
@@ -92,6 +94,24 @@ func (o Options) readPolicy(token string) (access.Snapshot, error) {
 		KillSwitch: o.PanelDB.KillSwitch(), KillAllowed: o.PanelDB.KillSwitchAllow(token),
 		KillReason: o.PanelDB.KillSwitchReason(), SSHMaxBps: sshMax,
 		SSHDailyBytes: sshDaily, SSHTrickleBps: sshTrickle, SSHUsedBytes: sshBudgetUsed(token)}, nil
+}
+
+func (o Options) checkBlocked(domain string) (bool, string, error) {
+	if o.PanelDB == nil {
+		return false, "", nil
+	}
+	if store, ok := o.PanelDB.(interface {
+		CheckBlocked(string) (bool, string, error)
+	}); ok {
+		return store.CheckBlocked(domain)
+	}
+	if o.PoolID != "" {
+		return true, "filtering authority unavailable", errors.New("pool filtering requires an authoritative error-returning policy store")
+	}
+	if o.PanelDB.IsBlocked(domain) {
+		return true, o.PanelDB.BlockWhy(domain), nil
+	}
+	return false, "", nil
 }
 
 func (o Options) policy(token string) (access.Snapshot, error) {
@@ -175,6 +195,9 @@ func (o Options) checkDataPolicy(p access.Snapshot, err error, peerStatus string
 	if o.sessionBound && (p.Generation != o.sessionGeneration || p.PublicKey != o.sessionPublicKey) {
 		return p, "revoked", "session identity revoked"
 	}
+	if o.sessionBound && !o.sessionChannelBound && (p.ChannelSeen || p.ChannelRequired) {
+		return p, "pending", "connection-bound authentication required; reconnect with the upgraded client"
+	}
 	if p.Status != "approved" {
 		switch p.Status {
 		case "pending", "expired", "banned", "kicked", "kicked-silent":
@@ -248,7 +271,8 @@ func (o Options) limit(token, scope string, bps int64) *rate.Limiter {
 	key := token + "|" + scope
 	o.state.mu.Lock()
 	defer o.state.mu.Unlock()
-	if len(o.state.limits) >= 8192 {
+	if len(o.state.limits) >= 8192 && time.Since(o.state.limitSweep) > time.Minute {
+		o.state.limitSweep = time.Now()
 		for key, e := range o.state.limits {
 			if time.Since(e.last) > 5*time.Minute {
 				delete(o.state.limits, key)
@@ -257,6 +281,11 @@ func (o Options) limit(token, scope string, bps int64) *rate.Limiter {
 	}
 	e := o.state.limits[key]
 	if e == nil {
+		if len(o.state.limits) >= 8192 {
+			// Backpressure capped new identities rather than drop their
+			// configured rate limit or grow an expiry-only map.
+			return rate.NewLimiter(0, 0)
+		}
 		e = &sharedLimiter{lim: rate.NewLimiter(rate.Limit(bps), trafficChunk)}
 		o.state.limits[key] = e
 	} else if e.lim.Limit() != rate.Limit(bps) {
@@ -268,6 +297,9 @@ func (o Options) limit(token, scope string, bps int64) *rate.Limiter {
 }
 
 func (o Options) pace(ctx context.Context, token, ingress string, p access.Snapshot, n int) error {
+	if store, ok := o.PanelDB.(interface{ CentralAuthority() bool }); ok && store.CentralAuthority() {
+		return nil
+	} // the durable authority grant is shared across hosts
 	if lim := o.limit(token, "device", p.MaxBps); lim != nil {
 		for remaining := n; remaining > 0; {
 			chunk := min(remaining, trafficChunk)
@@ -330,7 +362,7 @@ func (o Options) packetTraffic(ctx context.Context, token, status, ingress strin
 	if written < 0 || written > n {
 		written, err = 0, io.ErrShortWrite
 	}
-	if durable && n-written > 0 {
+	if durable && n > 0 {
 		if refundErr := store.RefundTraffic(context.WithoutCancel(ctx), token, p.Generation, ingress, down, reservation, n-written); refundErr != nil {
 			return written, refundErr
 		}
@@ -385,6 +417,9 @@ func (w *trafficConn) Write(b []byte) (int, error) {
 			reservation, err = store.ReserveTraffic(w.ctx, w.token, p.Generation, w.ingress, w.down, n)
 			if err != nil {
 				return total, err
+			}
+			if reservation.Bytes < 1 || reservation.Bytes > n {
+				return total, authority.ErrDenied
 			}
 			n = reservation.Bytes
 		}

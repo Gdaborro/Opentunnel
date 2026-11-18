@@ -1,12 +1,18 @@
 package panel
 
 import (
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
+	"opentunnel/internal/privatefile"
 )
 
 // The approve/revoke hooks can run concurrently. Serialize the complete
@@ -29,7 +35,7 @@ var authorizedKeysMu sync.Mutex
 //   - N-12 — bans and deletions never touched authorized_keys, so a
 //     revoked device kept its key forever. UpsertAuthorizedKey and
 //     RemoveAuthorizedKey make revocation real, and both rewrite the file
-//     atomically while dropping malformed lines they encounter.
+//     atomically without discarding unrelated operator entries.
 
 // SSHForcedCommand is the forced command every canonical line carries:
 // session channels (shell/exec/subsystem) run this and exit immediately;
@@ -73,10 +79,13 @@ func lineKey(line string) (string, bool) {
 }
 
 // UpsertAuthorizedKey rewrites path so exactly one canonical line exists
-// for pub. Malformed lines found along the way are dropped (legacy rows
-// could contain injected material). Missing file = created. Returns true
+// for pub. Unknown lines/comments are preserved. Missing file = created.
+// Returns true
 // when the file changed.
 func UpsertAuthorizedKey(path, pub, permitTarget string) (changed bool, err error) {
+	if err := validatePermitTarget(permitTarget); err != nil {
+		return false, err
+	}
 	authorizedKeysMu.Lock()
 	defer authorizedKeysMu.Unlock()
 	pub, ok := CanonicalSSHPubKey(pub)
@@ -87,13 +96,11 @@ func UpsertAuthorizedKey(path, pub, permitTarget string) (changed bool, err erro
 
 	var lines []string
 	matched := false
-	if raw, rerr := os.ReadFile(path); rerr == nil {
+	if raw, rerr := readAuthorizedKeys(path); rerr == nil {
 		for _, l := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
 			k, kok := lineKey(l)
 			if !kok {
-				if strings.TrimSpace(l) != "" {
-					changed = true // dropped junk
-				}
+				lines = append(lines, l)
 				continue
 			}
 			if k == pub {
@@ -133,45 +140,91 @@ func UpsertAuthorizedKey(path, pub, permitTarget string) (changed bool, err erro
 	return true, writeAuthorizedKeys(path, lines)
 }
 
-// ReconcileAuthorizedKeys adds a canonical line for every key in pubs
-// that is missing from path, preserving every existing line (legacy and
-// operator entries included). It only ever ADDS: revocation stays an
-// explicit action (RemoveAuthorizedKey). This is the startup self-heal
-// for a deployment where a rewrite, migration or crash left approved
-// devices without their line — exactly the state that left a live device
-// retrying an impossible authentication for days (2026-11-05 incident).
+// ReconcileAuthorizedKeys hardens/deduplicates each explicitly managed desired
+// key and adds missing entries. Unrelated operator/legacy lines are preserved.
+// ReconcileManagedAuthorizedKeys additionally removes explicit revoked keys;
+// absence from pubs alone is never permission to delete unknown operator work.
 func ReconcileAuthorizedKeys(path, permitTarget string, pubs []string) (added int, err error) {
+	return ReconcileManagedAuthorizedKeys(path, permitTarget, pubs, nil)
+}
+
+func ReconcileManagedAuthorizedKeys(path, permitTarget string, pubs, revoked []string) (changed int, err error) {
+	return reconcileManagedAuthorizedKeys(path, permitTarget, pubs, revoked, false)
+}
+
+func reconcileManagedAuthorizedKeys(path, permitTarget string, pubs, revoked []string, createMissing bool) (changed int, err error) {
+	if err := validatePermitTarget(permitTarget); err != nil {
+		return 0, err
+	}
 	authorizedKeysMu.Lock()
 	defer authorizedKeysMu.Unlock()
-	raw, rerr := os.ReadFile(path)
-	if rerr != nil {
+	raw, rerr := readAuthorizedKeys(path)
+	missing := os.IsNotExist(rerr)
+	if rerr != nil && !(createMissing && missing) {
 		return 0, rerr
+	}
+	desired, denied := map[string]bool{}, map[string]bool{}
+	for _, pub := range pubs {
+		if key, ok := CanonicalSSHPubKey(pub); ok {
+			desired[key] = true
+		}
+	}
+	for _, pub := range revoked {
+		if key, ok := CanonicalSSHPubKey(pub); ok {
+			denied[key] = true
+			delete(desired, key)
+		}
 	}
 	var lines []string
 	present := map[string]bool{}
-	for _, l := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
+	existing := []string{}
+	if len(raw) > 0 {
+		existing = strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	}
+	for _, l := range existing {
 		if k, ok := lineKey(l); ok {
-			present[k] = true
+			if denied[k] {
+				changed++
+				continue
+			}
+			if desired[k] {
+				if present[k] {
+					changed++
+					continue
+				}
+				present[k] = true
+				canonical := CanonicalAuthorizedKeyLine(k, permitTarget)
+				if strings.TrimSpace(l) != canonical {
+					changed++
+				}
+				lines = append(lines, canonical)
+				continue
+			}
 		}
 		lines = append(lines, l)
 	}
 	for _, pub := range pubs {
 		canon, ok := CanonicalSSHPubKey(pub)
-		if !ok || present[canon] {
+		if !ok || !desired[canon] || present[canon] {
 			continue
 		}
 		lines = append(lines, CanonicalAuthorizedKeyLine(canon, permitTarget))
 		present[canon] = true
-		added++
+		changed++
 	}
-	if added == 0 {
+	if changed == 0 && !missing {
 		return 0, nil
 	}
-	return added, writeAuthorizedKeys(path, lines)
+	return changed, writeAuthorizedKeys(path, lines)
+}
+
+func validatePermitTarget(target string) error {
+	host, port, err := net.SplitHostPort(target)
+	n, portErr := strconv.Atoi(port)
+	if err != nil || portErr != nil || n < 1 || n > 65535 || host == "" || strings.ContainsAny(target, "\"\\\r\n \t") || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+		return fmt.Errorf("SSH forwarding target must be an explicit loopback endpoint")
+	}
+	return nil
 }
 
 // sameSSHKey compares a stored authorized key with a freshly presented
@@ -195,7 +248,7 @@ func RemoveAuthorizedKey(path, pub string) (bool, error) {
 	if !ok {
 		return false, os.ErrInvalid
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := readAuthorizedKeys(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -205,12 +258,9 @@ func RemoveAuthorizedKey(path, pub string) (bool, error) {
 	var kept []string
 	removed := false
 	for _, l := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
-		if strings.TrimSpace(l) == "" {
-			continue
-		}
 		k, kok := lineKey(l)
 		if !kok {
-			removed = true // dropping malformed junk; the file changes
+			kept = append(kept, l) // unknown operator work is not ours to discard
 			continue
 		}
 		if k == pub {
@@ -225,11 +275,45 @@ func RemoveAuthorizedKey(path, pub string) (bool, error) {
 	return true, writeAuthorizedKeys(path, kept)
 }
 
+// This is operator-owned public-key inventory. Reading it must not change
+// permissions or treat an unreadable/linked file as an empty authorization set.
+func readAuthorizedKeys(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		return nil, errors.New("SSH inventory is linked or oversized")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, errors.New("SSH inventory changed while opening")
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
+	if err != nil || len(raw) > 1<<20 {
+		return nil, errors.New("SSH inventory unavailable or oversized")
+	}
+	return raw, nil
+}
+
 // writeAuthorizedKeys writes the list atomically (tmp + rename, 0600).
 func writeAuthorizedKeys(path string, lines []string) error {
 	out := ""
 	if len(lines) > 0 {
 		out = strings.Join(lines, "\n") + "\n"
+	}
+	if len(out) > 1<<20 {
+		return errors.New("SSH authorization file exceeds supported capacity")
+	}
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return errors.New("refusing to replace linked SSH inventory")
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	f, err := os.CreateTemp(filepath.Dir(path), ".authorized-keys-*")
 	if err != nil {
@@ -237,6 +321,10 @@ func writeAuthorizedKeys(path string, lines []string) error {
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
+	if err := privatefile.Protect(tmp); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if _, err := f.WriteString(out); err != nil {
 		_ = f.Close()
 		return err

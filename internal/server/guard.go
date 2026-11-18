@@ -9,15 +9,16 @@ import (
 // Guard throttles abusive clients without revealing that a proxy exists:
 // over-limit and banned peers receive the same decoy page as everyone else.
 type Guard struct {
-	mu            sync.Mutex
-	active        map[string]int // per-IP active tunnel count
-	fails         map[string]*failRecord
-	bans          map[string]time.Time // ip -> banned-until
-	maxPerIP      int
-	total         chan struct{}
-	banBase       time.Duration
-	banMax        time.Duration
-	lastCleanupNs int64
+	mu             sync.Mutex
+	active         map[string]int // per-IP active tunnel count
+	fails          map[string]*failRecord
+	bans           map[string]time.Time // ip -> banned-until
+	maxPerIP       int
+	total          chan struct{}
+	banBase        time.Duration
+	banMax         time.Duration
+	lastCleanupNs  int64
+	droppedSources uint64
 
 	// tokenActive bounds concurrent sessions per device identity for
 	// peers arriving over loopback (the ssh tier's forward path): per-IP
@@ -29,6 +30,8 @@ type Guard struct {
 // maxSessionsPerToken caps concurrent authenticated sessions per device
 // (loopback arrivals). 4 covers the mux pool's dial churn with room.
 const maxSessionsPerToken = 8
+
+const maxGuardSources = 8192
 
 type failRecord struct {
 	count    int
@@ -44,6 +47,14 @@ func DefaultGuard() *Guard {
 // and maxTotal overall; authentication failures trigger escalating bans from
 // banBase up to banMax.
 func NewGuard(maxPerIP, maxTotal int, banBase, banMax time.Duration) *Guard {
+	maxPerIP = max(1, min(maxPerIP, 1024))
+	maxTotal = max(1, min(maxTotal, 65536))
+	if banBase <= 0 {
+		banBase = time.Second
+	}
+	if banMax < banBase {
+		banMax = banBase
+	}
 	return &Guard{
 		active:        make(map[string]int),
 		fails:         make(map[string]*failRecord),
@@ -65,7 +76,7 @@ func (g *Guard) AcquireTokenSession(token string) (release func()) {
 		return func() {}
 	}
 	g.mu.Lock()
-	if g.tokenActive[token] >= maxSessionsPerToken {
+	if len(token) > 1024 || (g.tokenActive[token] == 0 && len(g.tokenActive) >= cap(g.total)) || g.tokenActive[token] >= maxSessionsPerToken {
 		g.mu.Unlock()
 		return nil
 	}
@@ -121,6 +132,10 @@ func (g *Guard) Acquire(ip string) (release func()) {
 		}
 	}
 	g.mu.Lock()
+	if ip == "" || len(ip) > 128 {
+		g.mu.Unlock()
+		return nil
+	}
 	if until, banned := g.bans[ip]; banned {
 		if time.Now().Before(until) {
 			g.mu.Unlock()
@@ -132,16 +147,16 @@ func (g *Guard) Acquire(ip string) (release func()) {
 		g.mu.Unlock()
 		return nil
 	}
-	g.active[ip]++
-	g.mu.Unlock()
-
 	select {
 	case g.total <- struct{}{}:
 	default:
-		g.releaseSlot(ip)
+		g.mu.Unlock()
 		return nil
 	}
-	return func() { g.releaseSlot(ip) }
+	g.active[ip]++
+	g.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { g.releaseSlot(ip) }) }
 }
 
 func (g *Guard) releaseSlot(ip string) {
@@ -150,56 +165,78 @@ func (g *Guard) releaseSlot(ip string) {
 	default:
 	}
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.active[ip]--
 	if g.active[ip] <= 0 {
 		delete(g.active, ip)
 	}
-	g.mu.Unlock()
 }
 
 // BanIP applies an explicit temporary ban (sentinel L2 response). Banned
 // peers see the decoy page like everyone else — the ban stays invisible.
 func (g *Guard) BanIP(ip string, d time.Duration) {
-	if ip == "" || isLoopbackIP(ip) {
+	if ip == "" || len(ip) > 128 || d <= 0 || isLoopbackIP(ip) {
 		return
 	}
 	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cleanupLocked(time.Now())
+	if _, exists := g.bans[ip]; !exists && len(g.bans) >= maxGuardSources {
+		g.droppedSources++
+		return
+	}
 	until := time.Now().Add(d)
 	if cur, ok := g.bans[ip]; !ok || cur.Before(until) {
 		g.bans[ip] = until
 	}
-	g.mu.Unlock()
 }
 
 // Punish records a failed handshake and escalates the peer's ban.
 func (g *Guard) Punish(ip string) {
-	if isLoopbackIP(ip) {
+	if ip == "" || len(ip) > 128 || isLoopbackIP(ip) {
 		return
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	now := time.Now()
+	g.cleanupLocked(now)
 	rec := g.fails[ip]
 	if rec == nil || now.Sub(rec.lastFail) > g.banMax {
+		if rec == nil && len(g.fails) >= maxGuardSources {
+			g.droppedSources++
+			return
+		}
 		rec = &failRecord{}
 		g.fails[ip] = rec
 	}
-	rec.count++
+	rec.count = min(rec.count+1, 23)
 	rec.lastFail = now
 
 	// Three strikes before any ban: one or two typos must not lock out a
 	// legitimate user sharing the IP.
 	const strikeThreshold = 3
 	if rec.count >= strikeThreshold {
-		d := g.banBase << uint(minInt(rec.count-strikeThreshold, 20)) // 30s, 60s, 120s … capped
-		if d > g.banMax {
-			d = g.banMax
+		d := g.banBase
+		for step := 0; step < minInt(rec.count-strikeThreshold, 20); step++ {
+			if d >= g.banMax || d > g.banMax/2 {
+				d = g.banMax
+				break
+			}
+			d *= 2
 		}
-		g.bans[ip] = now.Add(d)
+		if _, exists := g.bans[ip]; exists || len(g.bans) < maxGuardSources {
+			g.bans[ip] = now.Add(d)
+		}
 	}
 
-	// Opportunistic cleanup roughly every ban cycle.
-	if now.UnixNano()-g.lastCleanupNs > int64(g.banMax) {
+}
+
+func (g *Guard) DroppedSources() uint64 { g.mu.Lock(); defer g.mu.Unlock(); return g.droppedSources }
+
+// One bounded sweep per minute, not a full-map scan per overflowing source.
+// Admission is already capped globally; overflow cannot allocate more state.
+func (g *Guard) cleanupLocked(now time.Time) {
+	if now.UnixNano()-g.lastCleanupNs > int64(min(g.banMax, time.Minute)) {
 		for k, t := range g.bans {
 			if now.After(t) {
 				delete(g.bans, k)

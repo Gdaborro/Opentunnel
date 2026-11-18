@@ -84,11 +84,22 @@ func plainHTTPClient() *http.Client {
 }
 
 func RegisterWithPanel(cfg *config.ClientConf, device *deviceFile) {
+	RegisterWithPanelContext(context.Background(), cfg, device)
+}
+
+func RegisterWithPanelContext(parent context.Context, cfg *config.ClientConf, device *deviceFile) {
 	// Fire-and-forget initial registration; retry a few times
+	var finalErr error
 	for i := 0; i < 3; i++ {
-		err := doRegister(cfg, device)
+		ctx, cancel := context.WithTimeout(parent, 20*time.Second)
+		err := doRegisterContext(ctx, cfg, device)
+		cancel()
 		if err == nil {
-			break
+			return
+		}
+		finalErr = err
+		if parent.Err() != nil {
+			return
 		}
 		if errors.Is(err, errRegistrationIdentityConflict) {
 			log.Printf("registration: stored device identity differs; verify the public key in the panel SSH-key recovery page")
@@ -98,13 +109,27 @@ func RegisterWithPanel(cfg *config.ClientConf, device *deviceFile) {
 			log.Printf("registration: selected pool requires enrollment login; restart in a terminal (no credentials saved or automatically retried)")
 			return
 		}
-		time.Sleep(2 * time.Second)
+		if !updateWait(parent, 2*time.Second) {
+			return
+		}
+	}
+	if finalErr != nil {
+		log.Print("registration: no verified enrollment channel available; existing identity retained. Check TLS trust and administrator-assisted enrollment before expecting approval.")
 	}
 }
 
 func doRegister(cfg *config.ClientConf, device *deviceFile) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return doRegisterContext(ctx, cfg, device)
+}
+
+func doRegisterContext(parent context.Context, cfg *config.ClientConf, device *deviceFile) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	if cfg.Pool != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 		defer cancel()
 		return EnrollPool(ctx, cfg, device, nil)
 	}
@@ -119,11 +144,19 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 	body, _ := json.Marshal(map[string]string{
 		"token": device.Token, "fingerprint": device.Fingerprint, "device_name": device.DeviceName, "ssh_pubkey": pub,
 	})
+	post := func(cl *http.Client, url string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(parent, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return cl.Do(req)
+	}
 	// Bootstrap identity substitution remains possible through system-trusted
 	// intercepted TLS, even before the token is approved. Production defaults
 	// therefore require pinned TLS or an explicitly managed authenticated carrier.
 	if cl, base, err := panelHTTP(cfg); err == nil {
-		if resp, perr := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body)); perr == nil {
+		if resp, perr := post(cl, base+"/api/token/request"); perr == nil {
 			defer resp.Body.Close()
 			return registrationResponse(resp)
 		}
@@ -134,7 +167,7 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 			return err
 		}
 		defer cl.CloseIdleConnections()
-		resp, err := cl.Post(base+"/api/token/request", "application/json", bytes.NewReader(body))
+		resp, err := post(cl, base+"/api/token/request")
 		if err != nil {
 			return err
 		}
@@ -145,7 +178,7 @@ func doRegister(cfg *config.ClientConf, device *deviceFile) error {
 		return errors.New("registration requires a verified channel; use pinned TLS, a managed authenticated carrier or administrator-assisted enrollment")
 	}
 	log.Printf("WARNING: untrusted bootstrap explicitly enabled; administrator must independently verify this device's public key")
-	resp, err := plainHTTPClient().Post("https://"+cfg.SNIHost()+"/api/token/request", "application/json", bytes.NewReader(body))
+	resp, err := post(plainHTTPClient(), "https://"+cfg.SNIHost()+"/api/token/request")
 	if err != nil {
 		return err
 	}
@@ -157,7 +190,7 @@ var errRegistrationIdentityConflict = errors.New("registration identity conflict
 
 func registrationResponse(resp *http.Response) error {
 	switch resp.StatusCode {
-	case http.StatusOK:
+	case http.StatusOK, http.StatusAccepted:
 		return nil
 	case http.StatusConflict:
 		return errRegistrationIdentityConflict
@@ -186,20 +219,35 @@ func TokenStatus(cfg *config.ClientConf, token string) (status, kickReason, banR
 // transitions back to approved so a pending grace shutdown can be cancelled
 // (nil onApproved is fine).
 func PollTokenStatus(cfg *config.ClientConf, device *deviceFile, stop func(), onBan func(reason string), onApproved func()) {
+	PollTokenStatusContext(context.Background(), cfg, device, stop, onBan, onApproved)
+}
+
+func PollTokenStatusContext(ctx context.Context, cfg *config.ClientConf, device *deviceFile, stop func(), onBan func(string), onApproved func()) {
 	// Give the fire-and-forget registration a moment to land, then check
 	// immediately so a fresh device sees its pending notice right away.
 	// Afterwards the cadence is jittered (metronomic beacons to one host
 	// are correlatable); hostile networks stretch it further.
-	time.Sleep(3 * time.Second)
+	if !updateWait(ctx, 3*time.Second) {
+		return
+	}
 	last := ""
-	checkOnce(cfg, device, stop, onBan, onApproved, &last)
+	checkOnceContext(ctx, cfg, device, stop, onBan, onApproved, &last)
 	for {
-		time.Sleep(jittered(15 * time.Second))
-		checkOnce(cfg, device, stop, onBan, onApproved, &last)
+		if !updateWait(ctx, jittered(15*time.Second)) {
+			return
+		}
+		checkOnceContext(ctx, cfg, device, stop, onBan, onApproved, &last)
 	}
 }
 
 func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan func(reason string), onApproved func(), last *string) {
+	checkOnceContext(context.Background(), cfg, device, stop, onBan, onApproved, last)
+}
+
+func checkOnceContext(ctx context.Context, cfg *config.ClientConf, device *deviceFile, stop func(), onBan func(string), onApproved func(), last *string) {
+	if ctx.Err() != nil {
+		return
+	}
 	// Bootstrap states may ride the system-trusted fallback (fresh and
 	// pending devices behind TLS interception have no pinned channel and
 	// no tunnel yet, and their token grants nothing until approved). An
@@ -213,16 +261,21 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 	if ts, terr := NewPoolTokenStore(cfg.IdentityScope()); terr == nil {
 		everApproved = ts.EverApproved(device.Fingerprint)
 	}
-	bootstrap := !everApproved && (*last == "" || *last == "pending" || *last == "expired")
+	previousStatus := strings.TrimSuffix(*last, ":unverified")
+	bootstrap := !everApproved && (previousStatus == "" || previousStatus == "pending" || previousStatus == "expired")
 	bootstrap = bootstrap && cfg.AllowUntrustedBootstrap
-	status, kickReason, banReason, kickExpires, trusted, err := checkTokenStatus(cfg, device.Token, bootstrap)
-	if err != nil {
+	status, kickReason, banReason, kickExpires, trusted, err := checkTokenStatusContext(ctx, cfg, device.Token, bootstrap)
+	if err != nil || ctx.Err() != nil {
 		return // transient network error — keep the last known state
 	}
-	if status == *last {
+	decision := status
+	if !trusted {
+		decision += ":unverified"
+	}
+	if decision == *last && status != "" {
 		return
 	}
-	*last = status
+	*last = decision // a later trusted approval must not be hidden by an unverified one
 	if ts, terr := NewPoolTokenStore(cfg.IdentityScope()); terr == nil {
 		// Durable approval marker (fingerprint-keyed): from now on this
 		// device's token never crosses a system-trusted channel again,
@@ -239,7 +292,11 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 	}
 	switch status {
 	case "approved":
-		fmt.Println("[+] Access granted — this device is online.")
+		if trusted {
+			fmt.Println("[+] Administrator approval verified. Tunnel transport and browser-policy checks still apply.")
+		} else {
+			fmt.Println("[!] Unverified bootstrap response reports approval; not proof of a working or trusted tunnel.")
+		}
 		// An unban that landed while we carry stale local markers (or a
 		// pending grace shutdown) takes effect immediately. Cleared only
 		// on a trusted verdict (1.0.1, N-2): an intercepting middlebox
@@ -249,7 +306,7 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 				ts.ClearBan()
 			}
 		}
-		if onApproved != nil {
+		if trusted && onApproved != nil {
 			onApproved()
 		}
 	case "pending":
@@ -278,12 +335,12 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 		}
 	case "expired":
 		fmt.Println("[*] Registration expired — re-registering for approval...")
-		_ = doRegister(cfg, device)
+		_ = doRegisterContext(ctx, cfg, device)
 	case "":
 		// Panel no longer knows this token (purged after inactivity):
 		// re-register and wait for re-approval.
 		fmt.Println("[*] Device no longer registered — re-registering for approval...")
-		_ = doRegister(cfg, device)
+		_ = doRegisterContext(ctx, cfg, device)
 	}
 }
 
@@ -292,6 +349,13 @@ func checkOnce(cfg *config.ClientConf, device *deviceFile, stop func(), onBan fu
 // (in-band session or pinned HTTPS): only those may drive DURABLE local
 // state — plain bootstrap answers are display-only (1.0.1, N-2).
 func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback bool) (status, kickReason, banReason, kickExpires string, trusted bool, err error) {
+	return checkTokenStatusContext(context.Background(), cfg, token, allowPlainFallback)
+}
+
+func checkTokenStatusContext(parent context.Context, cfg *config.ClientConf, token string, allowPlainFallback bool) (status, kickReason, banReason, kickExpires string, trusted bool, err error) {
+	if err := parent.Err(); err != nil {
+		return "", "", "", "", false, err
+	}
 	if cfg.Pool != nil {
 		if err := cfg.Pool.Verify(time.Now()); err != nil {
 			return "", "", "", "", false, err
@@ -305,16 +369,19 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 	// path everywhere else too. Servers predating v0.9.23 close the
 	// stream, the exchange errors, and we fall through to HTTPS.
 	if fn := currentPoolCtrl(cfg.IdentityScope()); fn != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), ctrlTimeout)
+		ctx, cancel := context.WithTimeout(parent, ctrlTimeout)
 		resp, cerr := fn(ctx, protocol.CtrlRequest{Op: "status", Token: token})
 		cancel()
 		if cerr == nil && resp != nil && resp.OK {
 			return resp.Status, resp.KickReason, resp.BanReason, resp.KickExpires, true, nil
 		}
 	}
+	if err := parent.Err(); err != nil {
+		return "", "", "", "", false, err
+	}
 	var pinnedErr error
 	if cl, base, perr := panelHTTP(cfg); perr == nil {
-		st, kr, br, ke, ferr := fetchStatusScoped(cl, base, token, cfg.Pool == nil, cfg.IdentityScope())
+		st, kr, br, ke, ferr := fetchStatusScopedContext(parent, cl, base, token, cfg.Pool == nil, cfg.IdentityScope())
 		if ferr == nil {
 			return st, kr, br, ke, true, nil
 		}
@@ -326,7 +393,7 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 		cl, base, cerr := carrierHTTP(cfg)
 		if cerr == nil {
 			defer cl.CloseIdleConnections()
-			st, kr, br, ke, err := fetchStatus(cl, base, token, false)
+			st, kr, br, ke, err := fetchStatusScopedContext(parent, cl, base, token, false, "")
 			if err == nil {
 				return st, kr, br, ke, true, nil
 			}
@@ -341,7 +408,7 @@ func checkTokenStatus(cfg *config.ClientConf, token string, allowPlainFallback b
 		// networks. The token is not yet a live credential here — and
 		// the legacy query-GET form is never used on this path (the
 		// token would ride the URL line straight into proxy logs).
-		st, kr, br, ke, ferr := fetchStatus(plainHTTPClient(), "https://"+cfg.SNIHost(), token, false)
+		st, kr, br, ke, ferr := fetchStatusScopedContext(parent, plainHTTPClient(), "https://"+cfg.SNIHost(), token, false, "")
 		return st, kr, br, ke, false, ferr
 	}
 	return "", "", "", "", false, pinnedErr
@@ -356,8 +423,15 @@ func fetchStatus(cl *http.Client, base, token string, allowLegacyGet bool) (stat
 }
 
 func fetchStatusScoped(cl *http.Client, base, token string, allowLegacyGet bool, scope string) (status, kickReason, banReason, kickExpires string, err error) {
+	return fetchStatusScopedContext(context.Background(), cl, base, token, allowLegacyGet, scope)
+}
+
+func fetchStatusScopedContext(parent context.Context, cl *http.Client, base, token string, allowLegacyGet bool, scope string) (status, kickReason, banReason, kickExpires string, err error) {
+	if err := parent.Err(); err != nil {
+		return "", "", "", "", err
+	}
 	payload, _ := json.Marshal(map[string]string{"token": token})
-	req, err := http.NewRequest(http.MethodPost, base+"/api/token/status", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(parent, http.MethodPost, base+"/api/token/status", bytes.NewReader(payload))
 	if err != nil {
 		return "", "", "", "", err
 	}
@@ -374,7 +448,11 @@ func fetchStatusScoped(cl *http.Client, base, token string, allowLegacyGet bool,
 		// read the token from the query only). Legacy-GET fallback; the
 		// query form survives there until the server is updated.
 		_ = resp.Body.Close()
-		resp, err = cl.Get(base + "/api/token/status?token=" + token)
+		legacy, reqErr := http.NewRequestWithContext(parent, http.MethodGet, base+"/api/token/status?token="+token, nil)
+		if reqErr != nil {
+			return "", "", "", "", reqErr
+		}
+		resp, err = cl.Do(legacy)
 	}
 	if err != nil {
 		return "", "", "", "", err

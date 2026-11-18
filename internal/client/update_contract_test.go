@@ -75,7 +75,7 @@ func TestSelfUpdateRefusesReleasesWithoutManifest(t *testing.T) {
 		Name string `json:"name"`
 		URL  string `json:"browser_download_url"`
 		Size int64  `json:"size"`
-	}{Name: "otu-client-windows-amd64.exe", URL: "https://invalid.example/x"})
+	}{Name: windowsUpdateAsset(rel.TagName), URL: "https://invalid.example/x"})
 
 	err := SelfUpdate(context.Background(), rel, "")
 	if err == nil {

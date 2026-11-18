@@ -195,6 +195,17 @@ func importLegacy(s *snapshot) {
 			s.Values[regKeyPath]["ProxyServer"] = registryValue{}
 			s.Values[regKeyPath]["ProxyOverride"] = registryValue{}
 		}
+		for path, policy := range s.Policies {
+			// Only validated imported legacy bundles with the EXACT recorded
+			// applied address and fixed mode are contaminated originals. Keep
+			// the archived original bytes and current applied ownership; never
+			// guess from a port or clear unrelated loopback policy.
+			if policy.Server.Exists && policy.Server.Data == s.OtuAppliedServer && policy.Mode.Exists && policy.Mode.Data == "fixed_servers" {
+				s.Values[path][polMode] = registryValue{}
+				s.Values[path][polServer] = registryValue{}
+				s.Values[path][polBypass] = registryValue{}
+			}
+		}
 	}
 	s.Touched = make(map[string]bool)
 	for path := range s.Values {

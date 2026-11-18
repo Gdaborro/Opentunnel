@@ -68,6 +68,9 @@ func (s *TokenStore) BanPath() string        { return filepath.Join(s.Dir, "ban.
 func (s *TokenStore) SSHPrivatePath() string { return filepath.Join(s.Dir, "device_ssh") }
 func (s *TokenStore) SSHPublicPath() string  { return filepath.Join(s.Dir, "device_ssh.pub") }
 func (s *TokenStore) approvedPath() string   { return filepath.Join(s.Dir, "approved.flag") }
+func (s *TokenStore) keyEstablishedPath() string {
+	return filepath.Join(s.Dir, "device-key-established.flag")
+}
 
 // MarkApproved records that this device identity has been approved by the
 // panel at least once, keyed on the device FINGERPRINT (not the token):
@@ -200,6 +203,13 @@ func (s *TokenStore) EnsureSSHKey() (string, error) {
 		}
 	}
 	if os.IsNotExist(err) {
+		for _, marker := range []string{s.keyEstablishedPath(), s.approvedPath()} {
+			if _, markerErr := os.Lstat(marker); markerErr == nil {
+				return "", fmt.Errorf("established device private key missing; administrator-assisted recovery required")
+			} else if !os.IsNotExist(markerErr) {
+				return "", markerErr
+			}
+		}
 		// A surviving public key means a private key was lost, not that a
 		// fresh identity should be minted under an already-approved token.
 		if _, perr := os.Stat(pubPath); perr == nil {
@@ -231,6 +241,13 @@ func (s *TokenStore) EnsureSSHKey() (string, error) {
 	signer, err := ssh.ParsePrivateKey(keyRaw)
 	if err != nil || signer.PublicKey().Type() != ssh.KeyAlgoED25519 {
 		return "", fmt.Errorf("device private key is invalid; refusing to replace it")
+	}
+	if _, err := os.Lstat(s.keyEstablishedPath()); os.IsNotExist(err) {
+		if err := privatefile.WriteNew(s.keyEstablishedPath(), []byte("established\n")); err != nil && !os.IsExist(err) {
+			return "", fmt.Errorf("persist device-key ownership: %w", err)
+		}
+	} else if err != nil {
+		return "", err
 	}
 	// The public file is a cache, not the identity. Recover it from the
 	// private key if missing, stale, or corrupted; never regenerate the key.

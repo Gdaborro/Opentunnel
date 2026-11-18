@@ -7,6 +7,7 @@ package client
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -21,14 +22,15 @@ import (
 )
 
 type Options struct {
-	IdentityScope string
-	Token         string
-	DialTimeout   time.Duration // per-connection budget for handshake+target
-	Profile       string        // fast | balanced | stealth (shaping on our writes)
-	Mux           bool          // multiplex targets over pooled sessions
+	RequireChannelAuth bool // independent TLS exporter-bound v6; no legacy fallback
+	IdentityScope      string
+	Token              string
+	DialTimeout        time.Duration // per-connection budget for handshake+target
+	Profile            string        // fast | balanced | stealth (shaping on our writes)
+	Mux                bool          // multiplex targets over pooled sessions
 	// MuxByteCap overrides the per-session rotation byte cap (0 = default
-	// 160 MiB). The h3 tier sets this below Cloudflare's 100 MB proxied
-	// request-body limit so sessions rotate before the edge cuts them.
+	// 160 MiB). Rotation stops new streams; active downloads can outlive the hint
+	// and remain subject to the external front's request limits.
 	MuxByteCap  int64
 	MuxSessions int // warm-session cap; zero uses the general default
 	// OnAuthRejected is invoked when the server rejects the device token
@@ -37,14 +39,28 @@ type Options struct {
 }
 
 type Client struct {
-	Transport transport.Transport
-	opts      Options
+	Transport  transport.Transport
+	opts       Options
+	setupError error // capacity/closed sentinel; never opens identity or transport
 
-	poolOnce sync.Once
-	pool     *MuxPool
-	mu       sync.RWMutex
-	banInfo  string // last "banned:reason" or "kicked:reason" from token check
-	banAt    time.Time
+	poolOnce           sync.Once
+	poolMu             sync.Mutex
+	pool               *MuxPool
+	transportCloseOnce sync.Once
+	transportCloseErr  error
+	lifecycleMu        sync.Mutex
+	closed             bool
+	draining           bool
+	drainOnce          sync.Once
+	shutdownOnce       sync.Once
+	shutdownDone       chan struct{}
+	shutdownErr        error
+	setupCtx           context.Context
+	cancelSetups       context.CancelFunc
+	connections        map[*clientOwnedConn]struct{} // mux and nonmux carriers stay owned through drain/shutdown
+	mu                 sync.RWMutex
+	banInfo            string // last "banned:reason" or "kicked:reason" from token check
+	banAt              time.Time
 }
 
 // banRefreshInterval bounds how long a cached banned/kicked verdict sticks
@@ -98,6 +114,10 @@ func (c *Client) authCandidates() []string {
 // when no usable key exists (fresh/pending identity): the dial then falls
 // back to the unsigned v4 handshake.
 func (c *Client) signHandshake(token string, salt []byte) ([]byte, bool) {
+	return c.signDeviceMessage(protocol.HandshakeMsg(token, salt))
+}
+
+func (c *Client) signDeviceMessage(msg []byte) ([]byte, bool) {
 	ts, err := NewPoolTokenStore(c.opts.IdentityScope)
 	if err != nil {
 		return nil, false
@@ -124,7 +144,7 @@ func (c *Client) signHandshake(token string, salt []byte) ([]byte, bool) {
 	default:
 		return nil, false
 	}
-	return ed25519.Sign(ed, protocol.HandshakeMsg(token, salt)), true
+	return ed25519.Sign(ed, msg), true
 }
 
 // dialAndAuth opens one transport connection and runs the handshake with
@@ -132,16 +152,85 @@ func (c *Client) signHandshake(token string, salt []byte) ([]byte, bool) {
 // means it was carried (and is already replayed-protected) inside a v5
 // handshake; nil means the caller writes it as usual (v4 flow).
 func (c *Client) dialAndAuth(ctx context.Context, authTok string, timeout time.Duration) (net.Conn, []byte, error) {
+	setup, finish, err := c.beginSetup(ctx, timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer finish()
+	return c.dialAndAuthSetup(setup, ctx, authTok)
+}
+
+func (c *Client) dialAndAuthSetup(ctx, lifetime context.Context, authTok string) (net.Conn, []byte, error) {
 	salt := protocol.RandomSalt()
 	sig, signed := c.signHandshake(authTok, salt)
-	if !signed && c.opts.IdentityScope != "" {
+	if !signed && (c.opts.IdentityScope != "" || c.opts.RequireChannelAuth) {
 		return nil, nil, errors.New("client: trusted pool requires the scoped Ed25519 device key; unsigned downgrade refused")
 	}
-	raw, err := c.Transport.Dial(ctx)
+	carrier, cancelCarrier, err := dialSetupCarrier(c.Transport, ctx, lifetime)
 	if err != nil {
 		return nil, nil, fmt.Errorf("client: transport dial: %w", err)
 	}
-	_ = raw.SetDeadline(time.Now().Add(timeout))
+	raw, err := c.adoptConnectionWithCancel(carrier, cancelCarrier)
+	if err != nil {
+		return nil, nil, err
+	}
+	finishIO, err := bindSetupIO(ctx, raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			transport.AbortSetup(raw)
+		}
+	}()
+	ready := func() (net.Conn, []byte, error) {
+		if err := finishIO(); err != nil {
+			return nil, nil, err
+		}
+		succeeded = true
+		return raw, salt, nil
+	}
+	if c.opts.RequireChannelAuth {
+		inner, ok := carrier.(*tls.Conn)
+		if !ok {
+			transport.AbortSetup(raw)
+			return nil, nil, errors.New("connection-bound session requires independent TLS; no token sent")
+		}
+		binding, err := protocol.ChannelBinding(inner.ConnectionState())
+		if err != nil {
+			transport.AbortSetup(raw)
+			return nil, nil, err
+		}
+		msg, err := protocol.ChannelHandshakeMsg(authTok, salt, binding)
+		if err != nil {
+			transport.AbortSetup(raw)
+			return nil, nil, err
+		}
+		sig, ok := c.signDeviceMessage(msg)
+		if !ok {
+			transport.AbortSetup(raw)
+			return nil, nil, errors.New("connection-bound device key unavailable")
+		}
+		if err := protocol.WriteChannelHandshake(raw, authTok, salt, sig); err != nil {
+			transport.AbortSetup(raw)
+			return nil, nil, err
+		}
+		ver, status, err := protocol.ReadHandshakeStatus(raw)
+		if err != nil {
+			transport.AbortSetup(raw)
+			return nil, nil, err
+		}
+		if ver != protocol.ChannelVersion {
+			transport.AbortSetup(raw)
+			return nil, nil, errors.New("connection-bound version refused; no legacy downgrade")
+		}
+		if status != protocol.StatusOK {
+			transport.AbortSetup(raw)
+			return nil, nil, &protocol.AuthError{Status: status}
+		}
+		return ready()
+	}
 
 	if signed {
 		if err := protocol.WriteHandshakeV5(raw, authTok, salt, sig); err != nil {
@@ -176,7 +265,7 @@ func (c *Client) dialAndAuth(ctx context.Context, authTok string, timeout time.D
 			raw.Close()
 			return nil, nil, &protocol.AuthError{Status: st}
 		}
-		return raw, salt, nil
+		return ready()
 	}
 
 	// No device key (fresh identity): the legacy unsigned handshake.
@@ -188,19 +277,38 @@ func (c *Client) dialAndAuth(ctx context.Context, authTok string, timeout time.D
 		raw.Close()
 		return nil, nil, err
 	}
-	return raw, nil, nil
+	salt = nil
+	return ready()
 }
 
 // dialAuthenticated tries each auth candidate on a fresh connection until
 // one is accepted; a bad-token rejection falls through to the next candidate.
 // Returns the already-sent session salt when the v5 handshake carried it.
 func (c *Client) dialAuthenticated(ctx context.Context, timeout time.Duration) (net.Conn, string, []byte, error) {
+	setup, finish, err := c.beginSetup(ctx, timeout)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	defer finish()
+	return c.dialAuthenticatedSetup(setup, ctx)
+}
+
+func (c *Client) dialAuthenticatedSetup(ctx, lifetime context.Context) (net.Conn, string, []byte, error) {
+	if c.setupError != nil {
+		return nil, "", nil, c.setupError
+	}
+	c.lifecycleMu.Lock()
+	unavailable := c.closed || c.draining
+	c.lifecycleMu.Unlock()
+	if unavailable {
+		return nil, "", nil, net.ErrClosed
+	}
 	candidates := c.authCandidates()
 	if len(candidates) == 0 {
 		return nil, "", nil, errors.New("client: no auth token available")
 	}
 	for i, tok := range candidates {
-		raw, salt, err := c.dialAndAuth(ctx, tok, timeout)
+		raw, salt, err := c.dialAndAuthSetup(ctx, lifetime, tok)
 		if err == nil {
 			return raw, tok, salt, nil
 		}
@@ -284,15 +392,25 @@ func (e *PendingError) Error() string {
 // the resulting secure stream into mux mode; the returned conn is handed to
 // smux.Client.
 func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
-	timeout := c.opts.DialTimeout
-	if timeout <= 0 {
-		timeout = 15 * time.Second
-	}
-	raw, authTok, salt, err := c.dialAuthenticated(ctx, timeout)
+	setup, finish, err := c.beginSetup(ctx, c.setupBudget())
 	if err != nil {
 		return nil, err
 	}
-	_ = raw.SetDeadline(time.Now().Add(timeout))
+	defer finish()
+	raw, authTok, salt, err := c.dialAuthenticatedSetup(setup, ctx)
+	if err != nil {
+		return nil, err
+	}
+	finishIO, err := bindSetupIO(setup, raw)
+	if err != nil {
+		return nil, err
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			transport.AbortSetup(raw)
+		}
+	}()
 
 	if salt == nil {
 		// v4 flow: the salt travels right after the handshake.
@@ -346,34 +464,240 @@ func (c *Client) muxSessionFactory(ctx context.Context) (net.Conn, error) {
 		sec.Close()
 		return nil, fmt.Errorf("client: mode write: %w", err)
 	}
-	_ = sec.SetDeadline(time.Time{})
+	if err := finishIO(); err != nil {
+		return nil, err
+	}
+	succeeded = true
 	return sec, nil
 }
 
 func (c *Client) getPool() *MuxPool {
 	c.poolOnce.Do(func() {
+		c.poolMu.Lock()
+		defer c.poolMu.Unlock()
 		maxSessions := c.opts.MuxSessions
 		if maxSessions <= 0 {
-			maxSessions = 8
+			maxSessions = 4 // four warm + four draining fit the relay's eight-session identity budget
 		}
 		c.pool = newMuxPool(c.muxSessionFactory, maxSessions, c.opts.DialTimeout)
 		if c.opts.MuxByteCap > 0 {
 			c.pool.maxBytes = c.opts.MuxByteCap
 		}
-		if closer, ok := c.Transport.(interface{ Close() error }); ok {
-			context.AfterFunc(c.pool.ctx, func() { _ = closer.Close() })
-		}
+		context.AfterFunc(c.pool.ctx, func() { _ = c.closeTransportIfIdle() })
 	})
 	return c.pool
 }
 
-func (c *Client) Drain() { c.getPool().Drain() }
+// DrainComplete is read without creating a new pool. The adaptive owner must
+// keep retired clients until their active transfers finish or explicit close.
+func (c *Client) DrainComplete() bool {
+	c.poolMu.Lock()
+	pool := c.pool
+	c.poolMu.Unlock()
+	if pool != nil {
+		pool.mu.Lock()
+		dead := pool.retireLocked(time.Now())
+		finished := pool.closed && !pool.dialing && len(pool.sessions) == 0
+		pool.mu.Unlock()
+		if len(dead) > 0 || finished {
+			c.startDrainWorker(pool, dead)
+		}
+	}
+	c.lifecycleMu.Lock()
+	active := len(c.connections)
+	c.lifecycleMu.Unlock()
+	if active > 0 {
+		return false
+	}
+	if pool == nil {
+		return true
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	return pool.closed && !pool.dialing && len(pool.sessions) == 0
+}
 
-func (c *Client) Close() error { return c.getPool().Close() }
+func (c *Client) Drain() {
+	if c.setupError != nil {
+		return
+	}
+	c.lifecycleMu.Lock()
+	c.draining = true
+	if c.cancelSetups != nil {
+		c.cancelSetups()
+	}
+	c.lifecycleMu.Unlock()
+	pool := c.getPool()
+	pool.beginDrain()
+	c.startDrainWorker(pool, nil)
+}
+
+func (c *Client) startDrainWorker(pool *MuxPool, initial []*muxEntry) {
+	// Initial closes may be discovered by a status read after the worker ran.
+	// Let the pool own that bounded set; never close it synchronously under a.mu.
+	if len(initial) > 0 {
+		go func() {
+			for _, entry := range initial {
+				_ = entry.sess.Close()
+			}
+		}()
+	}
+	c.drainOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				pool.retire()
+				_ = c.closeTransportIfIdle()
+				pool.mu.Lock()
+				finished := pool.closed && !pool.dialing && len(pool.sessions) == 0
+				pool.mu.Unlock()
+				if finished {
+					return
+				}
+				select {
+				case <-pool.ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	})
+}
+
+func (c *Client) closeTransport() error {
+	c.transportCloseOnce.Do(func() {
+		if closer, ok := c.Transport.(interface{ Close() error }); ok {
+			c.transportCloseErr = closer.Close()
+		}
+	})
+	return c.transportCloseErr
+}
+
+func (c *Client) Close() error {
+	done := c.startClose()
+	<-done
+	return c.shutdownErr
+}
+
+// A retired client remains owned until this completion signal closes. Adaptive
+// bookkeeping must not wait for network teardown while holding its mutex.
+func (c *Client) startClose() <-chan struct{} {
+	c.lifecycleMu.Lock()
+	if c.shutdownDone == nil {
+		c.shutdownDone = make(chan struct{})
+	}
+	done := c.shutdownDone
+	c.closed = true
+	if c.cancelSetups != nil {
+		c.cancelSetups()
+	}
+	c.lifecycleMu.Unlock()
+	c.shutdownOnce.Do(func() {
+		go func() { c.shutdownErr = c.closeNow(); close(done) }()
+	})
+	return done
+}
+
+func (c *Client) closeNow() error {
+	if c.setupError != nil {
+		return nil
+	}
+	c.lifecycleMu.Lock()
+	connections := make([]*clientOwnedConn, 0, len(c.connections))
+	for conn := range c.connections {
+		connections = append(connections, conn)
+	}
+	c.lifecycleMu.Unlock()
+	err := c.getPool().Close()
+	for _, conn := range connections {
+		err = errors.Join(err, conn.CloseNow())
+	}
+	return errors.Join(err, c.closeTransport())
+}
+
+type clientOwnedConn struct {
+	net.Conn
+	owner    *Client
+	once     sync.Once
+	closeErr error
+	cancel   context.CancelFunc
+}
+
+func (c *Client) adoptConnection(raw net.Conn) (net.Conn, error) {
+	return c.adoptConnectionWithCancel(raw, nil)
+}
+
+func (c *Client) adoptConnectionWithCancel(raw net.Conn, cancel context.CancelFunc) (net.Conn, error) {
+	c.lifecycleMu.Lock()
+	if c.closed || c.draining {
+		c.lifecycleMu.Unlock()
+		transport.AbortSetup(raw)
+		if cancel != nil {
+			cancel()
+		}
+		return nil, net.ErrClosed
+	}
+	owned := &clientOwnedConn{Conn: raw, owner: c, cancel: cancel}
+	if c.connections == nil {
+		c.connections = map[*clientOwnedConn]struct{}{}
+	}
+	c.connections[owned] = struct{}{}
+	c.lifecycleMu.Unlock()
+	return owned, nil
+}
+func (c *clientOwnedConn) Close() error {
+	return c.close(false)
+}
+
+func (c *clientOwnedConn) CloseNow() error {
+	return c.close(true)
+}
+
+func (c *clientOwnedConn) close(immediate bool) error {
+	c.once.Do(func() {
+		if immediate {
+			_ = c.Conn.SetDeadline(time.Now())
+			if closer, ok := c.Conn.(interface{ CloseNow() error }); ok {
+				c.closeErr = closer.CloseNow()
+			} else {
+				c.closeErr = c.Conn.Close()
+			}
+		} else {
+			c.closeErr = c.Conn.Close()
+		}
+		if c.cancel != nil {
+			c.cancel()
+		}
+		c.owner.lifecycleMu.Lock()
+		delete(c.owner.connections, c)
+		c.owner.lifecycleMu.Unlock()
+		_ = c.owner.closeTransportIfIdle()
+	})
+	return c.closeErr
+}
+func (c *clientOwnedConn) CloseWrite() error {
+	if conn, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return c.Close()
+}
+func (c *Client) closeTransportIfIdle() error {
+	c.lifecycleMu.Lock()
+	idle := (c.closed || c.draining) && len(c.connections) == 0
+	c.lifecycleMu.Unlock()
+	if idle {
+		return c.closeTransport()
+	}
+	return nil
+}
 
 // DialTunnel returns an AEAD-secured stream connected to target via the
 // server. It implements proxy.Dialer.
 func (c *Client) DialTunnel(ctx context.Context, target *protocol.Address) (net.Conn, error) {
+	if c.setupError != nil {
+		return nil, c.setupError
+	}
 	// ISP-level ban/kick: if peer is banned/kicked, show block page for any site and schedule 10min kick
 	c.mu.RLock()
 	ban := c.banInfo
@@ -403,27 +727,37 @@ func (c *Client) DialTunnel(ctx context.Context, target *protocol.Address) (net.
 			}
 		}
 	}
-	timeout := c.opts.DialTimeout
-	if timeout <= 0 {
-		timeout = 15 * time.Second
+	setup, finish, err := c.beginSetup(ctx, c.setupBudget())
+	if err != nil {
+		return nil, err
 	}
+	defer finish()
 
 	var rw net.Conn
 	if c.opts.Mux {
-		stream, err := c.getPool().Open(ctx)
+		stream, err := c.getPool().Open(setup)
 		if err != nil {
 			return nil, fmt.Errorf("client: mux open: %w", err)
 		}
 		rw = stream
 	} else {
-		raw, err := c.legacyConnect(ctx)
+		raw, err := c.legacyConnectSetup(setup, ctx)
 		if err != nil {
 			return nil, err
 		}
 		rw = raw
 	}
 
-	_ = rw.SetDeadline(time.Now().Add(timeout))
+	finishIO, err := bindSetupIO(setup, rw)
+	if err != nil {
+		return nil, err
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			transport.AbortSetup(rw)
+		}
+	}()
 	if err := protocol.WriteTarget(rw, target); err != nil {
 		rw.Close()
 		return nil, fmt.Errorf("client: target write: %w", err)
@@ -475,22 +809,39 @@ func (c *Client) DialTunnel(ctx context.Context, target *protocol.Address) (net.
 		rw.Close()
 		return nil, fmt.Errorf("client: connect %s: %w", target, err)
 	}
-	_ = rw.SetDeadline(time.Time{})
+	if err := finishIO(); err != nil {
+		return nil, err
+	}
+	succeeded = true
 	return rw, nil
 }
 
 // legacyConnect runs the v1-style flow: one transport connection per target;
 // the ATYP byte of the target request doubles as the implicit mode marker.
 func (c *Client) legacyConnect(ctx context.Context) (*protocol.SecureStream, error) {
-	timeout := c.opts.DialTimeout
-	if timeout <= 0 {
-		timeout = 15 * time.Second
-	}
-	raw, authTok, salt, err := c.dialAuthenticated(ctx, timeout)
+	setup, finish, err := c.beginSetup(ctx, c.setupBudget())
 	if err != nil {
 		return nil, err
 	}
-	_ = raw.SetDeadline(time.Now().Add(timeout))
+	defer finish()
+	return c.legacyConnectSetup(setup, ctx)
+}
+
+func (c *Client) legacyConnectSetup(ctx, lifetime context.Context) (*protocol.SecureStream, error) {
+	raw, authTok, salt, err := c.dialAuthenticatedSetup(ctx, lifetime)
+	if err != nil {
+		return nil, err
+	}
+	finishIO, err := bindSetupIO(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			transport.AbortSetup(raw)
+		}
+	}()
 
 	if salt == nil {
 		// v4 flow: the salt travels right after the handshake.
@@ -521,6 +872,7 @@ func (c *Client) legacyConnect(ctx context.Context) (*protocol.SecureStream, err
 		if len(resp) >= 7 && (resp[:7] == "banned:" || resp[:7] == "kicked:") {
 			c.mu.Lock()
 			c.banInfo = resp
+			c.banAt = time.Now()
 			c.mu.Unlock()
 		} else {
 			sec.Close()
@@ -532,6 +884,10 @@ func (c *Client) legacyConnect(ctx context.Context) (*protocol.SecureStream, err
 		c.mu.Unlock()
 		c.markEverApproved()
 	}
+	if err := finishIO(); err != nil {
+		return nil, err
+	}
+	succeeded = true
 	return sec, nil
 }
 
@@ -553,16 +909,31 @@ func (c *Client) markEverApproved() {
 // OpenUDPRelay returns a stream speaking the framed UDP relay protocol
 // ([u16][ATYP addr port][payload] per datagram). Requires Mux.
 func (c *Client) OpenUDPRelay(ctx context.Context) (net.Conn, error) {
+	if c.setupError != nil {
+		return nil, c.setupError
+	}
 	if !c.opts.Mux {
 		return nil, fmt.Errorf("client: udp relay requires mux = true")
 	}
-	stream, err := c.getPool().Open(ctx)
+	setup, finish, err := c.beginSetup(ctx, c.setupBudget())
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	stream, err := c.getPool().Open(setup)
+	if err != nil {
+		return nil, err
+	}
+	finishIO, err := bindSetupIO(setup, stream)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := stream.Write([]byte{protocol.UdpMarker}); err != nil {
 		stream.Close()
 		return nil, fmt.Errorf("client: udp mode write: %w", err)
+	}
+	if err := finishIO(); err != nil {
+		return nil, err
 	}
 	return stream, nil
 }

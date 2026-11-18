@@ -112,7 +112,7 @@ func ReadHandshake(r io.Reader) (*Handshake, error) {
 	if _, err := io.ReadFull(r, ver); err != nil {
 		return nil, err
 	}
-	if ver[0] != ProtoVersion && ver[0] != ProtoVersionLegacy {
+	if ver[0] != ProtoVersion && ver[0] != ProtoVersionLegacy && ver[0] != ChannelVersion {
 		return nil, ErrVersionMismatch
 	}
 	lenb := make([]byte, 2)
@@ -128,7 +128,7 @@ func ReadHandshake(r io.Reader) (*Handshake, error) {
 		return nil, err
 	}
 	hs := &Handshake{Version: ver[0], Token: string(tok)}
-	if ver[0] == ProtoVersion {
+	if ver[0] == ProtoVersion || ver[0] == ChannelVersion {
 		hs.Salt = make([]byte, SaltSize)
 		if _, err := io.ReadFull(r, hs.Salt); err != nil {
 			return nil, err
@@ -164,7 +164,7 @@ func ReadAuthResponse(r io.Reader) error {
 	if _, err := io.ReadFull(r, resp); err != nil {
 		return err
 	}
-	if resp[0] != ProtoVersion && resp[0] != ProtoVersionLegacy {
+	if resp[0] != ProtoVersion && resp[0] != ProtoVersionLegacy && resp[0] != ChannelVersion {
 		return ErrVersionMismatch
 	}
 	switch resp[1] {
@@ -203,6 +203,9 @@ func ReadAndVerifyHandshake(r io.Reader, w io.Writer, verify func(token string) 
 		}
 		return st, "", herr
 	}
+	if hs.Version == ChannelVersion {
+		return StatusBadToken, "", errors.New("connection-bound handshake requires independent TLS verification")
+	}
 	st := verify(hs.Token)
 	_ = writeStatus(w, hs.Version, st)
 	if st == StatusBadToken {
@@ -240,7 +243,7 @@ func ReadTargetResponse(r io.Reader) error {
 	if _, err := io.ReadFull(r, resp); err != nil {
 		return err
 	}
-	if resp[0] != ProtoVersion && resp[0] != ProtoVersionLegacy {
+	if resp[0] != ProtoVersion && resp[0] != ProtoVersionLegacy && resp[0] != ChannelVersion {
 		return ErrVersionMismatch
 	}
 	if resp[1] != StatusOK {

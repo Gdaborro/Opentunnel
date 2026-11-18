@@ -22,10 +22,22 @@ const ctrlTimeout = 20 * time.Second
 // DialControl opens a control stream on the client's mux pool: one smux
 // stream whose first byte marks it as a control channel.
 func (c *Client) DialControl(ctx context.Context) (net.Conn, error) {
+	if c.setupError != nil {
+		return nil, c.setupError
+	}
 	if !c.opts.Mux {
 		return nil, errors.New("client: control channel requires mux")
 	}
-	stream, err := c.getPool().Open(ctx)
+	setup, finish, err := c.beginSetup(ctx, c.setupBudget())
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	stream, err := c.getPool().Open(setup)
+	if err != nil {
+		return nil, err
+	}
+	finishIO, err := bindSetupIO(setup, stream)
 	if err != nil {
 		return nil, err
 	}
@@ -33,22 +45,36 @@ func (c *Client) DialControl(ctx context.Context) (net.Conn, error) {
 		_ = stream.Close()
 		return nil, err
 	}
+	if err := finishIO(); err != nil {
+		return nil, err
+	}
 	return stream, nil
 }
 
 // CtrlExchange sends one control request and reads the response.
 func (c *Client) CtrlExchange(ctx context.Context, req protocol.CtrlRequest) (*protocol.CtrlResponse, error) {
-	conn, err := c.DialControl(ctx)
+	setup, finish, err := c.beginSetup(ctx, ctrlTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	conn, err := c.DialControl(setup)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(ctrlTimeout))
+	finishIO, err := bindSetupIO(setup, conn)
+	if err != nil {
+		return nil, err
+	}
 	if err := protocol.WriteCtrlMessage(conn, req); err != nil {
 		return nil, err
 	}
 	var resp protocol.CtrlResponse
 	if err := protocol.ReadCtrlMessage(conn, &resp); err != nil {
+		return nil, err
+	}
+	if err := finishIO(); err != nil {
 		return nil, err
 	}
 	return &resp, nil

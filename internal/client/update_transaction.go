@@ -26,18 +26,21 @@ const updateJournalName = "update-transaction.json"
 var errReplacementStillRunning = errors.New("replacement termination could not be confirmed; recovery evidence retained")
 
 type updateTransaction struct {
-	Version        int      `json:"version"`
-	Executable     string   `json:"executable"`
-	Staged         string   `json:"staged"`
-	Backup         string   `json:"backup"`
-	SHA256         string   `json:"sha256"`
-	PreviousSHA256 string   `json:"previous_sha256"`
-	Parent         int      `json:"parent"`
-	Helper         int      `json:"helper"`
-	Token          string   `json:"token"`
-	Args           []string `json:"args"`
-	ReadyFile      string   `json:"ready_file"`
-	StartedAt      int64    `json:"started_at"`
+	Version            int      `json:"version"`
+	Executable         string   `json:"executable"`
+	Staged             string   `json:"staged"`
+	Backup             string   `json:"backup"`
+	SHA256             string   `json:"sha256"`
+	PreviousSHA256     string   `json:"previous_sha256"`
+	Parent             int      `json:"parent"`
+	Helper             int      `json:"helper"`
+	Token              string   `json:"token"`
+	Args               []string `json:"args"`
+	ReadyFile          string   `json:"ready_file"`
+	StartedAt          int64    `json:"started_at"`
+	Phase              string   `json:"phase,omitempty"`
+	Replacement        int      `json:"replacement,omitempty"`
+	ReplacementCreated uint64   `json:"replacement_created,omitempty"`
 }
 
 // armReplacement leaves the running executable untouched until a separate
@@ -133,8 +136,22 @@ func readUpdateTransaction(path string) (updateTransaction, error) {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return tx, errors.New("trailing update journal data")
 	}
-	if tx.Version != 1 || tx.Parent <= 0 || tx.Helper < 0 || len(tx.Token) != 43 || len(tx.Args) > 64 || tx.StartedAt <= 0 || tx.StartedAt > time.Now().Unix()+120 {
+	if (tx.Version != 1 && tx.Version != 2) || tx.Parent <= 0 || tx.Helper < 0 || tx.Replacement < 0 || len(tx.Token) != 43 || len(tx.Args) > 64 || tx.StartedAt <= 0 || tx.StartedAt > time.Now().Unix()+120 {
 		return tx, errors.New("invalid or expired update transaction")
+	}
+	if tx.Version == 2 {
+		switch tx.Phase {
+		case "replacing", "launching":
+			if tx.Replacement != 0 || tx.ReplacementCreated != 0 {
+				return tx, errors.New("ambiguous replacement launch state; journal retained")
+			}
+		case "replacement-started":
+			if tx.Replacement <= 0 || tx.ReplacementCreated == 0 {
+				return tx, errors.New("replacement process identity missing; journal retained")
+			}
+		default:
+			return tx, errors.New("unknown replacement transaction phase; journal retained")
+		}
 	}
 	if nonce, err := base64.RawURLEncoding.DecodeString(tx.Token); err != nil || len(nonce) != 32 {
 		return tx, errors.New("invalid update readiness token")
@@ -179,6 +196,11 @@ func RunUpdateHelper(args []string) (bool, error) {
 	if len(args) != 2 {
 		return true, errors.New("invalid update helper arguments")
 	}
+	unlock, err := privatefile.TryLock(filepath.Join(filepath.Dir(args[1]), "update-supervision.lock"))
+	if err != nil {
+		return true, ErrUpdateInProgress
+	}
+	defer unlock()
 	tx, err := readUpdateTransaction(args[1])
 	if err != nil {
 		return true, err
@@ -226,9 +248,18 @@ func verifyStagedUpdate(tx updateTransaction) error {
 		return err
 	}
 	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return errors.New("staged update changed while opening")
+	}
 	h := sha256.New()
-	if _, err := io.Copy(h, io.LimitReader(f, 64<<20+1)); err != nil {
+	n, err := io.Copy(h, io.LimitReader(f, 64<<20+1))
+	if err != nil {
 		return err
+	}
+	after, err := f.Stat()
+	if err != nil || n != info.Size() || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+		return errors.New("staged update changed during verification")
 	}
 	if !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), tx.SHA256) {
 		return errors.New("staged update changed after signature verification")
@@ -244,19 +275,36 @@ func executeUpdateTransaction(journal string, tx updateTransaction) error {
 	if err := verifyStagedUpdate(tx); err != nil {
 		return err
 	}
+	tx.Version, tx.Phase, tx.Replacement, tx.ReplacementCreated = 2, "replacing", 0, 0
+	if err := saveUpdateTransaction(journal, tx); err != nil {
+		return err
+	}
 	err = replaceExecutable(tx.Executable, tx.Staged, tx.Backup, func() error {
 		installed, err := fileDigest(tx.Executable)
 		if err != nil || !strings.EqualFold(installed, tx.SHA256) {
 			return errors.New("installed replacement digest changed before launch")
 		}
+		tx.Phase = "launching"
+		if err := saveUpdateTransaction(journal, tx); err != nil {
+			return err
+		}
 		cmd := exec.Command(tx.Executable, tx.Args...)
 		prepareUpdateHelper(cmd)
-		cmd.Env = append(withoutUpdateEnvironment(os.Environ()), "OTU_UPDATE_PARENT_PID="+fmt.Sprint(tx.Parent), "OTU_UPDATE_READY_FILE="+tx.ReadyFile, "OTU_UPDATE_READY_TOKEN="+tx.Token)
+		cmd.Env = append(withoutUpdateEnvironment(os.Environ()), "OTU_UPDATE_PARENT_PID="+fmt.Sprint(tx.Parent), "OTU_UPDATE_READY_FILE="+tx.ReadyFile, "OTU_UPDATE_READY_TOKEN="+tx.Token, "OTU_UPDATE_JOURNAL="+journal)
 		if err := cmd.Start(); err != nil {
 			return err
 		}
 		exited := make(chan error, 1)
 		go func() { defer close(exited); exited <- cmd.Wait() }()
+		tx.Replacement = cmd.Process.Pid
+		created, err := updateProcessCreated(tx.Replacement)
+		if err != nil {
+			return errors.Join(errors.New("replacement process identity unavailable"), stopReplacement(cmd, exited))
+		}
+		tx.ReplacementCreated, tx.Phase = created, "replacement-started"
+		if err := saveUpdateTransaction(journal, tx); err != nil {
+			return errors.Join(err, stopReplacement(cmd, exited))
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		if err := waitReplacementReady(ctx, tx.ReadyFile, tx.Token, exited); err != nil {
@@ -294,6 +342,55 @@ func executeUpdateTransaction(journal string, tx updateTransaction) error {
 	return err
 }
 
+func saveUpdateTransaction(path string, tx updateTransaction) error {
+	raw, err := json.Marshal(tx)
+	if err != nil {
+		return err
+	}
+	return privatefile.Write(path, raw)
+}
+
+// New replacements wait BEFORE identity, settings or logging side effects until
+// the helper durably records their PID and creation identity. If it dies in the
+// ambiguous launch window, startup and automatic rollback both remain refused.
+func WaitForReplacementAuthorization() error {
+	journal := os.Getenv("OTU_UPDATE_JOURNAL")
+	if journal == "" {
+		return nil
+	} // released legacy handoff remains compatible
+	if !filepath.IsAbs(journal) || filepath.Clean(journal) != journal || filepath.Base(journal) != updateJournalName {
+		return errors.New("invalid replacement authorization path")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	created, err := updateProcessCreated(os.Getpid())
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		tx, err := readUpdateTransaction(journal)
+		if err != nil {
+			return errors.New("replacement authorization unavailable; startup refused")
+		}
+		if tx.Version != 2 || !sameExecutablePath(tx.Executable, exe) || tx.Token != os.Getenv("OTU_UPDATE_READY_TOKEN") || !sameExecutablePath(tx.ReadyFile, os.Getenv("OTU_UPDATE_READY_FILE")) {
+			return errors.New("replacement authorization mismatch")
+		}
+		if tx.Phase == "replacement-started" {
+			if tx.Replacement != os.Getpid() || tx.ReplacementCreated != created {
+				return errors.New("replacement process identity differs from its transaction")
+			}
+			return nil
+		}
+		if tx.Phase != "launching" || time.Now().After(deadline) {
+			return errors.New("replacement launch not durably authorized; startup refused")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func stopReplacement(cmd *exec.Cmd, exited <-chan error) error {
 	select {
 	case <-exited:
@@ -319,9 +416,18 @@ func fileDigest(path string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return "", errors.New("executable changed while opening")
+	}
 	h := sha256.New()
-	if _, err := io.Copy(h, io.LimitReader(f, 64<<20+1)); err != nil {
+	n, err := io.Copy(h, io.LimitReader(f, 64<<20+1))
+	if err != nil {
 		return "", err
+	}
+	after, err := f.Stat()
+	if err != nil || n != info.Size() || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+		return "", errors.New("executable changed during hashing")
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -358,9 +464,13 @@ func waitReplacementReady(ctx context.Context, file, token string, exited <-chan
 }
 
 func ReportUpdateReady() error {
+	if err := WaitForReplacementAuthorization(); err != nil {
+		return err
+	}
 	file, token := os.Getenv("OTU_UPDATE_READY_FILE"), os.Getenv("OTU_UPDATE_READY_TOKEN")
 	_ = os.Unsetenv("OTU_UPDATE_READY_FILE")
 	_ = os.Unsetenv("OTU_UPDATE_READY_TOKEN")
+	_ = os.Unsetenv("OTU_UPDATE_JOURNAL")
 	if file == "" && token == "" {
 		return nil
 	}
@@ -380,11 +490,16 @@ func RecoverPendingUpdate() (restarted bool, err error) {
 		return false, err
 	}
 	journal := filepath.Join(store.Dir, "updates", updateJournalName)
-	if _, err := os.Stat(journal); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(journal); errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
+	unlock, err := privatefile.TryLock(filepath.Join(filepath.Dir(journal), "update-supervision.lock"))
+	if err != nil {
+		return false, ErrUpdateInProgress
+	}
+	defer unlock()
 	tx, err := readUpdateTransaction(journal)
 	if err != nil {
 		return false, err
@@ -395,6 +510,27 @@ func RecoverPendingUpdate() (restarted bool, err error) {
 	}
 	if !sameExecutablePath(exe, tx.Executable) {
 		return false, errors.New("pending update belongs to a different install; journal retained")
+	}
+	if alive, err := anotherUpdateImageAlive(tx.Executable, tx.Backup, tx.Staged); err != nil {
+		return false, err
+	} else if alive {
+		return false, ErrUpdateInProgress
+	}
+	if tx.Version == 2 && tx.Phase == "launching" {
+		return false, errors.New("replacement launch was interrupted before process identity was durable; manual recovery required, journal retained")
+	}
+	if tx.Replacement > 0 {
+		if alive, err := updateProcessAlive(tx.Replacement, tx.Executable, tx.Backup); err != nil {
+			return false, err
+		} else if alive {
+			created, err := updateProcessCreated(tx.Replacement)
+			if err != nil {
+				return false, err
+			}
+			if created == tx.ReplacementCreated {
+				return false, ErrUpdateInProgress
+			}
+		}
 	}
 	for _, pid := range []int{tx.Helper, tx.Parent} {
 		if pid <= 0 || pid == os.Getpid() {
@@ -424,11 +560,11 @@ func RecoverPendingUpdate() (restarted bool, err error) {
 		return false, errors.New("pending update has no verified rollback executable; manual recovery required")
 	}
 	failed := tx.Executable + ".failed-" + fmt.Sprint(time.Now().UnixNano())
-	if err := os.Rename(exe, failed); err != nil {
+	if err := moveUpdateNoReplace(exe, failed); err != nil {
 		return false, err
 	}
-	if err := os.Rename(tx.Backup, exe); err != nil {
-		return false, errors.Join(err, os.Rename(failed, exe))
+	if err := moveUpdateNoReplace(tx.Backup, exe); err != nil {
+		return false, errors.Join(err, moveUpdateNoReplace(failed, exe))
 	}
 	if restored, err := fileDigest(exe); err != nil || !strings.EqualFold(restored, tx.PreviousSHA256) {
 		return false, errors.New("restored executable did not match the verified rollback digest; journal retained")

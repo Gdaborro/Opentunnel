@@ -84,7 +84,7 @@ func TestV5HandshakeSignatureEnforcement(t *testing.T) {
 
 	const tok = "v5-token-1234567890abcdef"
 	var alerts []string
-	opt := Options{Token: "master", PanelDB: v5Stub{token: tok, pubkey: authKey, alerts: &alerts}}
+	opt := Options{Token: "master", PanelDB: v5Stub{token: tok, pubkey: authKey, alerts: &alerts, v5: &atomic.Bool{}}}
 
 	run := func(sig []byte) (byte, error) {
 		c1, c2 := net.Pipe()
@@ -127,10 +127,14 @@ func TestV5HandshakeSignatureEnforcement(t *testing.T) {
 		t.Fatalf("unexpected alert: %q", got)
 	}
 
-	// Legacy v4 handshake still accepted during the migration window.
+	// A different never-upgraded fixture remains compatible during migration.
+	// This test's successful v5 peer now has a checked latch, so it must not
+	// pretend persistence succeeded while accepting an unsigned downgrade.
+	legacyOpt := opt
+	legacyOpt.PanelDB = v5Stub{token: tok, pubkey: authKey, v5: &atomic.Bool{}}
 	c1, c2 := net.Pipe()
 	defer c1.Close()
-	go handleSession(c2, opt, "203.0.113.9", "")
+	go handleSession(c2, legacyOpt, "203.0.113.9", "")
 	if err := protocol.WriteHandshake(c1, tok); err != nil {
 		t.Fatal(err)
 	}
