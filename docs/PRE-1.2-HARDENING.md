@@ -5,6 +5,9 @@ This is a work/acceptance ledger, **not a completed-release claim**. Existing
 published releases, device identities, operational policy and system settings
 are not automatically changed by implementation work.
 
+The [2026-11-18 readiness report](HARDENING-READINESS-REPORT-2026-11-18.md)
+records the automated-work outcome and the current **NO-GO** publication decision.
+
 ## Agreed product scope
 
 - Windows/Linux application proxy first. System-wide VPN/TUN integration,
@@ -136,6 +139,22 @@ or fleet migration is performed merely by editing this ledger.
   reproductions were corrected. Its signing commands remain disabled pending
   trusted frozen-build authorization, durable history and full release contracts;
   no real release key was decrypted and no signing ceremony took place.
+- The source commit `6c5fbcc523851e46ce66ad9bec7e679f3e1b2e06` completed Windows
+  and Ubuntu Go/companion CI successfully. Overall CI failed the frontend audit;
+  its build job was correctly skipped. Native process fixtures in Ubuntu CI are
+  not proof of independent-host permissions or a real device/carrier pilot.
+- Continued local release-contract work added bounded PE/ELF inline buildinfo,
+  exact Git source archive generation/comparison, source dependency/checksum
+  binding and exact module/SBOM/companion notice consistency. Targeted race/vet
+  and real fixture-directory checks passed. Synthetic `v1.1.99` recipe builds are
+  test data, not the selected release. No scoped real all-artifact signing ran.
+- A same-host repeat produced 21 matching binary hashes, but a subsequent strict
+  input check found Windows line-ending transformations hidden by Git's clean
+  verdict. Only 15/21 filtered vs unfiltered artifact hashes matched. Those
+  transformed-checkout builds are invalid release input; the builder now checks
+  raw file bytes and excludes ignored inputs. The unfiltered source/build/archive
+  consistency smoke passed separately. Neither is independent reproducibility
+  authorization or a substitute for the final frozen signed artifact ceremony.
 - Requested local packages contain a preconfigured `cdn.aborro.dev` Windows
   client plus a separate confirmed identity-reset tool, and a generic Windows
   client requiring its own endpoint/public TLS pin. Generic credentials/update

@@ -151,56 +151,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # preserve exact VCS module/tag identity for recipe checks
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: "go.mod"
-      - name: repro metadata
+      - name: fixed clean-source recipe (unsigned CI artifacts, not release promotion)
         run: |
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-      - name: cross-compile release binaries
-        run: |
-          LDFLAGS="-s -w"
-          mkdir -p dist
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-client-windows-amd64.exe ./cmd/otu-client
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags=genericclient -trimpath -ldflags="$LDFLAGS" -o dist/otu-client-generic-windows-amd64.exe ./cmd/otu-client
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-server-linux-amd64 ./cmd/otu-server
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-server-linux-arm64 ./cmd/otu-server
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-panel-linux-amd64 ./cmd/otu-panel
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-panel-linux-arm64 ./cmd/otu-panel
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -tags=genericclient -trimpath -ldflags="$LDFLAGS" -o dist/otu-client-linux-amd64 ./cmd/otu-client
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-windows-amd64.exe ./cmd/otu-reality
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-linux-amd64 ./cmd/otu-reality
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-reality-linux-arm64 ./cmd/otu-reality
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-pool-windows-amd64.exe ./cmd/otu-pool
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-pool-linux-amd64 ./cmd/otu-pool
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-pool-linux-arm64 ./cmd/otu-pool
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-migrate-windows-amd64.exe ./cmd/otu-migrate
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-migrate-linux-amd64 ./cmd/otu-migrate
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/otu-migrate-linux-arm64 ./cmd/otu-migrate
-      - name: reproducible restricted companion cross-builds
-        working-directory: companions/xray
-        run: |
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o ../../dist/otu-xray-windows-amd64.exe .
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o ../../dist/otu-xray-linux-amd64 .
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o ../../dist/otu-xray-linux-arm64 .
-          cp README.md ../../dist/SOURCE-AND-LICENSE-NOTICE-XRAY.md
+          CGO_ENABLED=0 go build -buildvcs=false -trimpath -o "$RUNNER_TEMP/otu-buildcandidate" ./tools/buildcandidate
+          CGO_ENABLED=0 go build -buildvcs=false -trimpath -o "$RUNNER_TEMP/otu-releasebundle" ./tools/releasebundle
+          COMMIT="$(git rev-parse HEAD)"
+          TAG="$(sed -n 's/^var Version = "\([^"]*\)"/v\1/p' internal/version/version.go)"
+          TOOLCHAIN="$(go version | awk '{print $3}')"
+          "$RUNNER_TEMP/otu-buildcandidate" --go-executable "$(go env GOROOT)/bin/go" --source-directory "$GITHUB_WORKSPACE" --source-commit "$COMMIT" --directory "$RUNNER_TEMP/otu-candidate-dist" --tag "$TAG" --toolchain "$TOOLCHAIN"
+          "$RUNNER_TEMP/otu-releasebundle" --prepare-metadata --source-directory "$GITHUB_WORKSPACE" --source-commit "$COMMIT" --directory "$RUNNER_TEMP/otu-candidate-dist" --tag "$TAG" --toolchain "$TOOLCHAIN" --sequence 1 --minimum-version v1.1.10 --rollout 0
+          "$RUNNER_TEMP/otu-releasebundle" --source-directory "$GITHUB_WORKSPACE" --source-commit "$COMMIT" --directory "$RUNNER_TEMP/otu-candidate-dist" --tag "$TAG" --toolchain "$TOOLCHAIN" --sequence 1 --minimum-version v1.1.10 --rollout 0
       - name: companion artifact vulnerability gate
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary dist/otu-xray-linux-amd64
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "$RUNNER_TEMP/otu-candidate-dist/otu-xray-linux-amd64"
       - name: host artifact vulnerability gate
         run: |
-          for asset in dist/otu-client-windows-amd64.exe dist/otu-client-generic-windows-amd64.exe dist/otu-server-linux-amd64 dist/otu-panel-linux-amd64; do
+          for asset in "$RUNNER_TEMP/otu-candidate-dist"/otu-client-windows-amd64.exe "$RUNNER_TEMP/otu-candidate-dist"/otu-client-generic-windows-amd64.exe "$RUNNER_TEMP/otu-candidate-dist"/otu-server-linux-amd64 "$RUNNER_TEMP/otu-candidate-dist"/otu-panel-linux-amd64; do
             go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "$asset"
           done
       - name: isolated native release executable smoke
         run: |
           CGO_ENABLED=0 go build -buildvcs=false -trimpath -o "$RUNNER_TEMP/otu-rollout-smoke" ./tools/rolloutsmoke
-          "$RUNNER_TEMP/otu-rollout-smoke" -binary-dir "$GITHUB_WORKSPACE/dist"
-      - name: SBOM (module inventory)
-        run: |
-          go version -m dist/otu-client-windows-amd64.exe | sed 's/\t/ /g' > dist/SBOM-otu-client.txt
-          go version -m dist/otu-server-linux-amd64 | sed 's/\t/ /g' > dist/SBOM-otu-server.txt
-          go version -m dist/otu-panel-linux-amd64 | sed 's/\t/ /g' > dist/SBOM-otu-panel.txt
+          "$RUNNER_TEMP/otu-rollout-smoke" -binary-dir "$RUNNER_TEMP/otu-candidate-dist"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: opentunnel-binaries
-          path: dist/
+          name: opentunnel-unsigned-ci-consistency-artifacts
+          path: ${{ runner.temp }}/otu-candidate-dist/

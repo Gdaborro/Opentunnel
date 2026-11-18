@@ -75,14 +75,23 @@ func syntheticInventory(t *testing.T) (string, protocol.ReleaseBundle, protocol.
 
 func TestVerifierUsesRotatedRootThresholdEnvelopeAndExactPayloadSet(t *testing.T) {
 	dir, bundle, root := syntheticInventory(t)
-	if err := verifyDirectoryWithRoot(dir, bundle.Tag, root); err != nil {
+	if _, err := verifyInventoryWithRoot(dir, bundle.Tag, root); err != nil {
 		t.Fatal("synthetic threshold/inventory boundary rejected", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "otu-pool-linux-amd64"), []byte("unbound extra synthetic payload"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyDirectoryWithRoot(dir, bundle.Tag, root); err == nil {
+	if _, err := verifyInventoryWithRoot(dir, bundle.Tag, root); err == nil {
 		t.Fatal("unbound allowlisted helper ignored")
+	}
+}
+
+func TestFullVerifierRefusesSignatureOnlyPayloadDeclarations(t *testing.T) {
+	dir, bundle, root := syntheticInventory(t)
+	// A pure threshold/inventory fixture is not executable/source evidence.
+	// The real CLI verifier cannot stop at its matching signature/hashes.
+	if err := verifyDirectoryWithRoot(dir, bundle.Tag, root); err == nil {
+		t.Fatal("correct synthetic signer/hash declarations authorized malformed binaries/source")
 	}
 }
 

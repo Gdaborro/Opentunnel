@@ -26,6 +26,12 @@ Keep institution/network observations, device identity and recovery logs private
   supplied separately as `OTU_TEST_GENERIC_CLIENT_BINARY`. Test blank/invalid
   server configuration refusal, edition update-target separation, credential
   isolation and shared network-only recovery lease ownership.
+- Release-contract regressions: `go test -race ./internal/releasebuild
+  ./tools/buildcandidate ./tools/releasebundle ./tools/verifyrelease`. Include
+  actual separately built Windows/Linux amd64/arm64 fixture metadata, malformed
+  binary tables/pointers, archive traversal/links/expansion, mismatched source
+  module versions/sums/SBOMs and ignored/line-ending-transformed checkout input.
+  Artifact buildinfo is not proof of linker stamps or authenticated reproduction.
 
 As of the 2026-11-18 pre-push check, `npm audit --audit-level=low` reports the
 high-severity picomatch ReDoS advisory GHSA-fc5q-39xc-vjpf through the frontend

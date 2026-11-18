@@ -3,7 +3,7 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -23,6 +22,7 @@ import (
 	"opentunnel/internal/client"
 	"opentunnel/internal/privatefile"
 	"opentunnel/internal/protocol"
+	"opentunnel/internal/releasebuild"
 	"opentunnel/internal/serverpool"
 )
 
@@ -44,6 +44,7 @@ func run(args []string) error {
 	minimum := fs.String("minimum-version", "", "reviewed minimum compatible update version")
 	expires := fs.Duration("valid-for", 30*24*time.Hour, "signed freshness duration (maximum 90 days)")
 	verify := fs.Bool("verify", false, "verify all local artifacts against an already signed bundle")
+	prepare := fs.Bool("prepare-metadata", false, "new-only exact Git source archive, executable module SBOMs and build consistency document; never signs")
 	rootChain := fs.String("root-chain", "", "bounded reviewed public root-rotation chain; never reads runtime trust state")
 	sourceDirectory := fs.String("source-directory", ".", "clean frozen source checkout; HEAD must match source-commit")
 	if err := fs.Parse(args); err != nil {
@@ -52,12 +53,15 @@ func run(args []string) error {
 	if fs.NArg() != 0 || *dir == "" || *tag == "" {
 		return errors.New("supply --directory and --tag; generation also needs sequence/source/toolchain/minimum")
 	}
+	if *verify && *prepare {
+		return errors.New("metadata preparation cannot be combined with signed verification")
+	}
 	root, err := reviewedRoot(*rootChain)
 	if err != nil {
 		return err
 	}
 	if *verify {
-		return verifyDirectoryWithRoot(*dir, *tag, root)
+		return verifyDirectoryWithSource(*dir, *tag, root, *sourceDirectory)
 	}
 	entries, err := boundedInventory(*dir)
 	if err != nil {
@@ -68,6 +72,18 @@ func run(args []string) error {
 	}
 	now := time.Now().UTC()
 	b := protocol.ReleaseBundle{Version: 1, Tag: *tag, Channel: *channel, Sequence: *sequence, RolloutPercent: *rollout, SourceCommit: *source, Toolchain: *toolchain, BuildRecipe: "otu-repro-v1", MinimumVersion: *minimum, RootVersion: root.Version, IssuedAt: now.Unix(), ExpiresAt: now.Add(*expires).Unix()}
+	if *prepare {
+		if err := verifyFrozenSource(*sourceDirectory, b.SourceCommit, b.Toolchain); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := releasebuild.PrepareMetadata(ctx, *dir, *sourceDirectory, b); err != nil {
+			return err
+		}
+		fmt.Println("Prepared exact source/module/SBOM/build consistency payloads only. No signature, reproducible-build authorization, publication or readiness claim.")
+		return nil
+	}
 	for _, entry := range entries {
 		name := entry.Name()
 		if _, allowed := protocol.ReleaseEnvelopePolicy(name); allowed {
@@ -96,7 +112,9 @@ func run(args []string) error {
 	if err := verifyFrozenSource(*sourceDirectory, b.SourceCommit, b.Toolchain); err != nil {
 		return err
 	}
-	if err := verifyBuildConsistencyDocument(*dir, b); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := releasebuild.VerifyPayloads(ctx, *dir, b, *sourceDirectory); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(b, "", "  ")
@@ -149,31 +167,50 @@ func verifyDirectory(dir, tag string) error {
 }
 
 func verifyDirectoryWithRoot(dir, tag string, root protocol.ReleaseRoot) error {
-	raw, err := privatefile.ReadOnly(filepath.Join(dir, protocol.ReleaseBundleName), protocol.MaxBundleBytes)
+	return verifyDirectoryWithSource(dir, tag, root, "")
+}
+
+func verifyDirectoryWithSource(dir, tag string, root protocol.ReleaseRoot, sourceDirectory string) error {
+	bundle, err := verifyInventoryWithRoot(dir, tag, root)
 	if err != nil {
 		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := releasebuild.VerifyPayloads(ctx, dir, bundle, sourceDirectory); err != nil {
+		return err
+	}
+	fmt.Printf("Verified %s: exact %d-payload threshold-signed inventory and source/module/build-recipe/SBOM consistency; independent reproducibility and release acceptance are separate.\n", bundle.Tag, len(bundle.Artifacts))
+	return nil
+}
+
+func verifyInventoryWithRoot(dir, tag string, root protocol.ReleaseRoot) (protocol.ReleaseBundle, error) {
+	var empty protocol.ReleaseBundle
+	raw, err := privatefile.ReadOnly(filepath.Join(dir, protocol.ReleaseBundleName), protocol.MaxBundleBytes)
+	if err != nil {
+		return empty, err
 	}
 	sigRaw, err := privatefile.ReadOnly(filepath.Join(dir, protocol.ReleaseBundleSignature), 16<<10)
 	if err != nil {
-		return err
+		return empty, err
 	}
 	signatures, err := protocol.ParseBundleSignatures(sigRaw, root, true)
 	if err != nil {
-		return err
+		return empty, err
 	}
 	bundle, err := protocol.VerifyBundleWithRoot(raw, signatures, root, time.Now())
 	if err != nil {
-		return err
+		return empty, err
 	}
 	if bundle.Tag != tag {
-		return errors.New("release bundle tag/root mismatch")
+		return empty, errors.New("release bundle tag/root mismatch")
 	}
 	if err := protocol.ValidateCoordinatedReleaseInventory(bundle); err != nil {
-		return err
+		return empty, err
 	}
 	entries, err := boundedInventory(dir)
 	if err != nil {
-		return err
+		return empty, err
 	}
 	seen := map[string]bool{}
 	for _, artifact := range bundle.Artifacts {
@@ -185,27 +222,26 @@ func verifyDirectoryWithRoot(dir, tag string, root protocol.ReleaseRoot) error {
 		}
 		limit, allowed := protocol.ReleaseEnvelopePolicy(entry.Name())
 		if !allowed {
-			return errors.New("unbound extra publication artifact")
+			return empty, errors.New("unbound extra publication artifact")
 		}
 		if _, _, err := artifactDigestBounded(filepath.Join(dir, entry.Name()), limit, -1); err != nil {
-			return err
+			return empty, err
 		}
 	}
 	for _, artifact := range bundle.Artifacts {
 		_, limit, _ := protocol.ReleaseArtifactPolicy(artifact.Name)
 		digest, size, err := artifactDigestBounded(filepath.Join(dir, artifact.Name), limit, artifact.Bytes)
 		if err != nil {
-			return err
+			return empty, err
 		}
 		if digest != artifact.SHA256 || size != artifact.Bytes {
-			return fmt.Errorf("artifact %s does not match signed payload inventory", artifact.Name)
+			return empty, fmt.Errorf("artifact %s does not match signed payload inventory", artifact.Name)
 		}
 	}
 	if err := verifyBuildConsistencyDocument(dir, bundle); err != nil {
-		return err
+		return empty, err
 	}
-	fmt.Printf("Verified %s: exact %d-payload inventory and threshold signature, channel=%s, sequence=%d, rollout=%d%%, declared source=%s. Authenticated/reproducible-build provenance and release acceptance remain separate.\n", bundle.Tag, len(bundle.Artifacts), bundle.Channel, bundle.Sequence, bundle.RolloutPercent, bundle.SourceCommit)
-	return nil
+	return bundle, nil
 }
 
 func boundedInventory(dir string) ([]os.DirEntry, error) {
@@ -266,52 +302,17 @@ func verifyFrozenSource(dir, commit, toolchain string) error {
 	if runtime.Version() != toolchain {
 		return errors.New("builder toolchain differs from explicit source/build declaration")
 	}
-	head := exec.Command("git", "-C", dir, "rev-parse", "HEAD")
-	out, err := head.Output()
-	if err != nil || strings.TrimSpace(string(out)) != commit {
-		return errors.New("source HEAD does not match explicit frozen source commit")
-	}
-	status := exec.Command("git", "-C", dir, "status", "--porcelain", "--untracked-files=normal")
-	out, err = status.Output()
-	if err != nil || len(bytes.TrimSpace(out)) != 0 {
-		return errors.New("source checkout is not a frozen clean revision; provenance generation refused")
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	return releasebuild.CheckFrozenSource(ctx, dir, commit)
 }
 
-type buildConsistency struct {
-	Version        int                        `json:"version"`
-	Tag            string                     `json:"tag"`
-	SourceCommit   string                     `json:"source_commit"`
-	Toolchain      string                     `json:"toolchain"`
-	BuildRecipe    string                     `json:"build_recipe"`
-	MinimumVersion string                     `json:"minimum_version"`
-	Artifacts      []protocol.ReleaseArtifact `json:"artifacts"`
-}
+type buildConsistency = releasebuild.BuildConsistency
 
 func verifyBuildConsistencyDocument(dir string, bundle protocol.ReleaseBundle) error {
 	raw, err := privatefile.ReadOnly(filepath.Join(dir, protocol.BuildProvenanceName), 256<<10)
 	if err != nil {
 		return errors.New("build consistency document unavailable")
 	}
-	var record buildConsistency
-	if serverpool.DecodeStrict(raw, &record) != nil || protocol.RequireJSONFields(raw, "version", "tag", "source_commit", "toolchain", "build_recipe", "minimum_version", "artifacts") != nil || record.Version != 1 || record.Tag != bundle.Tag || record.SourceCommit != bundle.SourceCommit || record.Toolchain != bundle.Toolchain || record.BuildRecipe != bundle.BuildRecipe || record.MinimumVersion != bundle.MinimumVersion {
-		return errors.New("build consistency document differs from bundle (not trusted provenance)")
-	}
-	expected := map[string]protocol.ReleaseArtifact{}
-	for _, a := range bundle.Artifacts {
-		if a.Name != protocol.BuildProvenanceName {
-			expected[a.Name] = a
-		}
-	}
-	if len(expected) != len(record.Artifacts) {
-		return errors.New("build consistency document inventory incomplete")
-	}
-	for _, a := range record.Artifacts {
-		if expected[a.Name] != a {
-			return errors.New("build consistency artifact mismatch")
-		}
-		delete(expected, a.Name)
-	}
-	return nil
+	return releasebuild.VerifyBuildDocument(raw, bundle)
 }

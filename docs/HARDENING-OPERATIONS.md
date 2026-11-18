@@ -105,6 +105,26 @@ stream. Multi-host remote SSH inventory is not replicated by this API.
   Extend/review the scoped in-process signing
   broker for `otu-release-bundle-v1\0` before real release signing; never export
   raw release keys or use a generic unrestricted command workaround.
+- `tools/buildcandidate` performs the fixed core/companion build recipe into a
+  **new external** directory with an explicit exact native Go executable. It
+  disables local GOENV/workspace/CGO/flag injection, sets readonly modules and
+  validates pristine source before/after builds. Git status is not sufficient:
+  raw checkout bytes must match Git objects, with no ignored build inputs.
+  Windows line-ending conversions are refused; create an unfiltered checkout
+  rather than rewriting an everyday development tree.
+- `tools/releasebundle --prepare-metadata` writes a bounded deterministic
+  USTAR/gzip source archive from exact regular Git blobs, per-product module
+  inventories and `BUILD-PROVENANCE.json`. Generation and full verification
+  check platform/package/edition/toolchain/VCS identity, dependency versions and
+  sums against archived source, and exact SBOM bytes. Source archive paths,
+  expansion, tables/buildinfo strings and text reads are bounded and new-only.
+  The full verifier rejects a valid synthetic signature over arbitrary fake
+  binaries/source; the compatibility verifier refuses post-v1.1.10 use.
+- Go omits linker flags under `-trimpath` and omits off-PGO metadata. Buildinfo
+  therefore cannot prove version/floor/linker recipe stamps. Those checks and
+  same-host hash repetition are **not signing authorization**; independent
+  authenticated reproduction plus a scoped signing ceremony remain required.
+  CI output is explicitly unsigned consistency evidence, never an auto-release.
 - Root rotation needs both old and new threshold signatures and an explicit
   local ceremony. Chains/checkpoints are persisted, bounded and fail closed on
   corruption. Actual root rotation/recovery is not complete until the operator

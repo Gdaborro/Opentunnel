@@ -10,13 +10,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"opentunnel/internal/client"
+	"opentunnel/internal/privatefile"
 	"opentunnel/internal/protocol"
 )
 
@@ -35,22 +35,17 @@ func main() {
 }
 
 func bounded(path string, max int64) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, max+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > max {
-		return nil, errors.New("oversized release verification input")
-	}
-	return data, nil
+	return privatefile.ReadOnly(path, max)
 }
 
 func verify(dir, tag string) error {
+	order, err := protocol.CompareReleaseVersions(tag, "v1.1.10")
+	if err != nil {
+		return err
+	}
+	if order > 0 {
+		return errors.New("post-v1.1.10 releases require the full signed bundle/source/build inventory verifier in tools/releasebundle; compatibility signatures alone do not verify the release")
+	}
 	pub, err := base64.StdEncoding.DecodeString(client.ReleasePubKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return errors.New("invalid embedded signing key")
