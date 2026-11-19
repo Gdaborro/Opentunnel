@@ -32,7 +32,8 @@ jobs:
           git config core.autocrlf false
           git config core.eol lf
           git checkout-index --force --all
-          cmd /c "git show HEAD:.gitattributes > .gitattributes"
+          git update-index --refresh
+          git status --short
           if ($LASTEXITCODE -ne 0) { throw 'unfiltered source checkout failed' }
           $env:CGO_ENABLED = '0'
           $builder = Join-Path $env:RUNNER_TEMP 'otu-buildcandidate.exe'
