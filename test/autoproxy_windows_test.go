@@ -376,14 +376,16 @@ func TestFixtureClientAutomaticProxyStartupAndLegacyRecovery(t *testing.T) {
 			hc := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
 			defer hc.CloseIdleConnections()
 			_, originPort, _ := net.SplitHostPort(origin.Listener.Addr().String())
+			transferStarted := time.Now()
 			resp, err := hc.Get("http://localhost:" + originPort + "/")
 			if err != nil {
-				t.Fatal("automatic-proxy client startup did not remain functional", err)
+				t.Fatalf("automatic-proxy client startup did not remain functional after %s: %v", time.Since(transferStarted), err)
 			}
 			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			transferElapsed := time.Since(transferStarted)
 			if err != nil || !bytes.Equal(body, bulk) {
-				t.Fatal("automatic-proxy fixture lost bulk payload", err)
+				t.Fatalf("automatic-proxy fixture lost bulk payload after %s: received=%d want=%d: %v", transferElapsed, len(body), len(bulk), err)
 			}
 			policy, err := db.AccessPolicy(device.Token)
 			if err != nil || policy.UsedBytes < int64(len(bulk)) {
@@ -456,7 +458,7 @@ func TestFixtureClientAutomaticProxyStartupAndLegacyRecovery(t *testing.T) {
 			if scenario == "read-only-at-start" && !strings.Contains(string(logs), "browser-policy bundles were skipped") {
 				t.Fatal("read-only startup did not expose a nonfatal browser warning")
 			}
-			t.Logf("%s: actual --auto-proxy startup, %d authenticated payload bytes and fixture-only journal recovery passed; HKCU unavailable in this build", scenario, len(bulk))
+			t.Logf("%s: actual --auto-proxy startup, %d authenticated payload bytes in %s and fixture-only journal recovery passed; HKCU unavailable in this build", scenario, len(bulk), transferElapsed)
 		})
 	}
 }

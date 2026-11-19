@@ -9,7 +9,7 @@ server_addr = "cdn.aborro.dev:443"
 # Optional independently provisioned origin IP; SNI and TLS pins stay on the hostname.
 # server_ip = ""
 # server_fallbacks = []
-fingerprint = "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"
+fingerprint = "20687078735870a4c74ea153d8ea81115b4478d8da921a3beeeef6ffbc77a322"
 # fingerprints = [] # explicit public pins for a reviewed certificate rotation
 insecure = false
 allow_untrusted_bootstrap = false

@@ -51,7 +51,7 @@ func main() {
 		ServerAddr:  dialAddr,
 		ServerName:  "cdn.aborro.dev",
 		Path:        "/api/v1/stream",
-		Fingerprint: "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1",
+		Fingerprint: "20687078735870a4c74ea153d8ea81115b4478d8da921a3beeeef6ffbc77a322",
 		DialTimeout: 15 * time.Second,
 	})
 	conn, err := tr.Dial(context.Background())

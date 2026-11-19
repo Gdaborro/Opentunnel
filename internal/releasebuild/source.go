@@ -213,6 +213,36 @@ type gitSourceFile struct {
 	Mode   int64
 }
 
+func sourceRootMatches(reportedRoot, requestedRoot string) bool {
+	if reportedRoot == "" || requestedRoot == "" {
+		return false
+	}
+	// Git for Windows can report the same directory with slash/drive/MSYS
+	// spellings that filepath.Abs does not canonicalize identically. Compare
+	// the actual directories, while refusing a linked checkout root.
+	if runtime.GOOS == "windows" && len(reportedRoot) >= 2 && reportedRoot[0] == '/' {
+		letter := reportedRoot[1]
+		if (letter >= 'a' && letter <= 'z') || (letter >= 'A' && letter <= 'Z') {
+			if len(reportedRoot) == 2 || reportedRoot[2] == '/' {
+				remainder := ""
+				if len(reportedRoot) > 2 {
+					remainder = reportedRoot[3:]
+				}
+				reportedRoot = strings.ToUpper(reportedRoot[1:2]) + ":\\" + filepath.FromSlash(remainder)
+			}
+		}
+	}
+	for _, path := range []string{reportedRoot, requestedRoot} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+	}
+	reported, err := os.Stat(reportedRoot)
+	requested, err := os.Stat(requestedRoot)
+	return err == nil && os.SameFile(reported, requested)
+}
+
 func frozenGitFiles(ctx context.Context, dir, commit string) ([]gitSourceFile, error) {
 	if len(commit) != 40 {
 		return nil, errors.New("exact Git source commit required")
@@ -239,9 +269,8 @@ func frozenGitFiles(ctx context.Context, dir, commit string) ([]gitSourceFile, e
 	if err != nil {
 		return nil, err
 	}
-	actual, err := filepath.Abs(strings.TrimSpace(string(root)))
-	want, wantErr := filepath.Abs(dir)
-	if err != nil || wantErr != nil || (filepath.Clean(actual) != filepath.Clean(want) && !(runtime.GOOS == "windows" && strings.EqualFold(filepath.Clean(actual), filepath.Clean(want)))) {
+	actual := strings.TrimSpace(string(root))
+	if err != nil || !sourceRootMatches(actual, dir) {
 		return nil, errors.New("source directory must be the exact checkout root")
 	}
 	raw, err := gitOutput(ctx, dir, 8<<20, "ls-tree", "-r", "-z", "--full-tree", commit)

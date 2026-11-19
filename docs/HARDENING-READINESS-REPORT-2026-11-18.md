@@ -59,6 +59,37 @@ repaired**. Their identity resets, separate enrollment approvals and actual
 permitted-network transfers have not been verified. No shared credential or
 weakened TLS/SSH check is used to force connectivity.
 
+### 2026-11-19 connectivity and CI follow-up
+
+Read-only public checks found the current `cdn.aborro.dev` leaf is a hostname-
+valid Let's Encrypt certificate (issuer YE2, valid 2026-10-26 through
+2027-01-24) with SHA-256 leaf fingerprint
+`20687078735870a4c74ea153d8ea81115b4478d8da921a3beeeef6ffbc77a322`.
+Independent connections from the VPS and the Windows engineering host, both
+using normal system-chain and hostname validation, resolved the same public
+service and matched that leaf. It differs from the historical first-run pin.
+The relay's generated origin certificate is a different trust layer and was not
+substituted for the public edge identity. The review branch's hosted first-run
+default and H3 diagnostic therefore use the verified current leaf; installed
+configs, production services and released downloads were not changed. Existing
+approved clients still need an authenticated pin-learning/SSH recovery path.
+
+The production panel currently has no pending device rows and no duplicate
+public-key or machine-fingerprint groups among its seven approved rows. This
+does **not** verify either affected PC's reset or approval. No identity, ban,
+approval, authorized-key or production configuration mutation was performed.
+
+Follow-up CI run 44297855037 failed a Windows Git checkout-root spelling check
+and intermittently timed out one denied-cleanup bulk transfer. Checkout roots
+are now compared by actual directory identity, with MSYS/drive-root regression
+coverage. The follow-up working tree passed the complete four-CPU Windows race
+suite; the denied-cleanup case also passed 20 consecutive race runs during
+concurrent client/panel/relay tests, with 3,014,656-byte transfers taking about
+0.82-0.93 seconds. The original 15-second acceptance deadline and all payload,
+accounting and recovery assertions remain unchanged; failure diagnostics now
+record elapsed time and exact received bytes. These local results do not prove
+the intermittent hosted-CI failure is resolved and do not make overall CI green.
+
 ### Two client editions
 
 - The hosted edition preserves the existing identity directory and historical
@@ -123,28 +154,32 @@ consent, preserved bans/accounting, pending SSH notices, unavailable reads and
 failed mutation visibility, with no uncaught SPA exceptions. That is not proof
 of real corporate browser policies or logoff/sleep/shutdown behavior.
 
-## Blocking dependency advisory
+## Frontend advisory status update
 
-The fresh frontend audit reports four high-severity dependency findings for
+Earlier audits reported four high-severity findings for
 [GHSA-fc5q-39xc-vjpf / CVE-2026-112366](https://github.com/advisories/GHSA-fc5q-39xc-vjpf),
-picomatch ReDoS through Vite/fdir/tinyglobby. The advisory was reviewed on
-2026-11-17; the latest published npm version inspected is 4.0.7, with no patched
-version listed. The referenced open upstream PR explicitly does not fix the
-single-branch repeated-extglob problem generally.
+picomatch ReDoS through Vite/fdir/tinyglobby. GitHub withdrew the advisory at
+2026-11-18 15:38:56 UTC. The linked maintainer rationale says globs are regular
+expressions, arbitrary pathological patterns cannot all be predicted, and
+untrusted users must not define them; the proposed PR was closed unmerged.
 
-This Node build/dev dependency is not executed by the static SPA or Go EXEs, but
-it is still a release-tooling gate. No forced Vite downgrade, unreviewed upstream
-PR override, audit suppression or vulnerable-version exception is applied. The
-audit remains enabled and failing. Earlier Go artifact scans reporting no known
-vulnerabilities are not a frontend audit pass or security certification.
+On 2026-11-19, Node 26.13.0 `npm audit --audit-level=low` and an explicit
+lockfile/development-dependency JSON audit both reported zero vulnerabilities
+across 279 dependencies, including 149 development dependencies. The latest
+published picomatch remains 4.0.7 with no patched release listed. No manifest,
+lockfile, dependency override, Vite version or audit suppression was changed.
+This removes that specific registry-audit blocker; it does not certify every
+possible glob or permit untrusted build patterns. The audit remains enabled,
+and exact-source hosted CI must confirm it. Zero audit findings are not a
+security certification.
 
 ## What autonomous work cannot truthfully replace
 
 Before public downloads, final signing and rollout, the following need actual
 authorized resources/evidence, not another synthetic test:
 
-1. A reviewed dependency remedy and green exact-source Windows/Linux/frontend/
-   companion CI, with a final frozen complete artifact inventory.
+1. Green exact-source Windows/Linux/frontend/companion CI, with a final frozen
+   complete artifact inventory.
 2. Trusted independent binary reproduction and durable scoped signing history,
    real threshold signatures/root ceremony and all-artifact verification.
 3. Disposable Windows managed-policy/ACL/logoff/shutdown/sleep tests and verified

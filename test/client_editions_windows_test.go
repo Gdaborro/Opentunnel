@@ -108,7 +108,7 @@ func TestGenericEditionHasNoHostedDefaultsAndRefusesUnconfiguredFirstRun(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, hosted := range []string{"cdn.aborro.dev", "git.aborro.dev", "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"} {
+	for _, hosted := range []string{"cdn.aborro.dev", "git.aborro.dev", "20687078735870a4c74ea153d8ea81115b4478d8da921a3beeeef6ffbc77a322"} {
 		if bytes.Contains(raw, []byte(hosted)) {
 			t.Fatal("generic executable contains hosted bootstrap trust/routing")
 		}

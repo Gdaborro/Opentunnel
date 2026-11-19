@@ -29,6 +29,9 @@ func TestWriteDefaultClientConfigRoundtrip(t *testing.T) {
 	if c.ServerAddr == "" || c.Fingerprint == "" {
 		t.Fatalf("default config incomplete: %+v", c)
 	}
+	if pins := c.FingerprintSet(); len(pins) != 1 || pins[0] != "20687078735870a4c74ea153d8ea81115b4478d8da921a3beeeef6ffbc77a322" {
+		t.Fatalf("hosted default pins differ from the independently verified 2026-11-19 public leaf: %q", pins)
+	}
 	if c.Token != "" {
 		t.Fatal("default config must NOT embed a shared token (per-device auth)")
 	}

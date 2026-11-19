@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -93,6 +94,26 @@ func testGit(t *testing.T, dir string, args ...string) string {
 		t.Fatal("synthetic Git fixture failed", err)
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+func TestSourceRootComparisonUsesDirectoryIdentity(t *testing.T) {
+	dir := t.TempDir()
+	if !sourceRootMatches(filepath.Join(dir, "."), dir) || !sourceRootMatches(filepath.ToSlash(dir), dir) {
+		t.Fatal("the same repository was rejected for an equivalent local path")
+	}
+	if sourceRootMatches(filepath.Dir(dir), dir) {
+		t.Fatal("a parent directory was accepted as the repository root")
+	}
+	if runtime.GOOS == "windows" {
+		msys := "/" + strings.ToLower(dir[:1]) + filepath.ToSlash(dir[2:])
+		if !sourceRootMatches(msys, dir) {
+			t.Fatal("Git for Windows MSYS drive spelling was rejected", msys)
+		}
+		root := filepath.VolumeName(dir) + `\`
+		if !sourceRootMatches("/"+strings.ToLower(root[:1]), root) {
+			t.Fatal("Git for Windows MSYS drive-root spelling was rejected")
+		}
+	}
 }
 
 func TestSourceArchiveDeterministicGitObjectsNewOnlyAndDirtySourceRefusal(t *testing.T) {
