@@ -4,7 +4,7 @@
 package version
 
 // Version defaults to the next planned release; release builds stamp the tag.
-var Version = "1.1.10"
+var Version = "1.1.11"
 
 // LocalPreview identifies an explicitly unreleased development package. Signed
 // release builds leave this empty; previews cannot authorize automatic updates.
