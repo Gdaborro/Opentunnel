@@ -4,6 +4,8 @@ permissions:
   contents: read
 
 on:
+  push:
+    branches: ["acceptance/real-windows-*"]
   workflow_dispatch:
     inputs:
       confirm:
@@ -13,7 +15,7 @@ on:
 
 jobs:
   real-registry:
-    if: github.event.inputs.confirm == 'disposable-real-registry'
+    if: (github.event_name == 'push' && startsWith(github.ref_name, 'acceptance/real-windows-')) || github.event.inputs.confirm == 'disposable-real-registry'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:

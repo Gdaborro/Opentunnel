@@ -72,10 +72,11 @@ deny work under load must be measured—not concealed as unlimited performance.
 
 ## Real disposable Windows runner
 
-`.github/workflows/windows-acceptance.yml` is manual-only and requires the exact
-`disposable-real-registry` confirmation. It builds the fixed non-fixture candidate
-on a fresh GitHub Windows VM, then runs `TestRealWindows*` against that VM's real
-HKCU WinINET/browser-policy keys. The test refuses to execute without both the
+`.github/workflows/windows-acceptance.yml` runs only on a dedicated
+`acceptance/real-windows-*` branch, or by manual dispatch with the exact
+`disposable-real-registry` confirmation after the workflow reaches the default
+branch. It builds the fixed non-fixture candidate on a fresh GitHub Windows VM,
+then runs `TestRealWindows*` against that VM's real HKCU WinINET/browser-policy keys. The test refuses to execute without both the
 explicit flag and the GitHub runner environment, and also refuses a
 `netenvfixture` binary. Current cases cover graceful Ctrl+Break, forced process
 termination and guardian recovery, an external competing proxy change that must
