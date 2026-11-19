@@ -30,12 +30,16 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:CGO_ENABLED = '0'
-          go build -buildvcs=false -trimpath -o "$env:RUNNER_TEMP/otu-buildcandidate.exe" ./tools/buildcandidate
+          $builder = Join-Path $env:RUNNER_TEMP 'otu-buildcandidate.exe'
+          go build -buildvcs=false -trimpath -o $builder ./tools/buildcandidate
           if ($LASTEXITCODE -ne 0) { throw 'build tool compilation failed' }
           $commit = git rev-parse HEAD
           $tag = 'v' + (Select-String -Path internal/version/version.go -Pattern '^var Version = "([^"]+)"').Matches.Groups[1].Value
           $toolchain = (go version).Split(' ')[2]
-          & "$env:RUNNER_TEMP/otu-buildcandidate.exe" --go-executable "$(go env GOROOT)/bin/go.exe" --source-directory "$env:GITHUB_WORKSPACE" --source-commit "$commit" --directory "$env:RUNNER_TEMP/otu-real-candidate" --tag "$tag" --toolchain "$toolchain"
+          $source = (Resolve-Path .).Path
+          $output = Join-Path $env:RUNNER_TEMP 'otu-real-candidate'
+          $goexe = Join-Path (go env GOROOT) 'bin\go.exe'
+          & $builder --go-executable $goexe --source-directory $source --source-commit "$commit" --directory $output --tag "$tag" --toolchain "$toolchain"
           if ($LASTEXITCODE -ne 0) { throw 'fixed candidate build failed' }
       - name: real HKCU proxy and browser-policy acceptance
         shell: pwsh
