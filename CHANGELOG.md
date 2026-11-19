@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased - pre-1.2 hardening
+
+- Stamp the fixed release recipe's display version without the canonical `v`
+  tag prefix while keeping `v` on the update tag and compatibility floor. The
+  previous stamp made staged `--version` smoke output inconsistent and blocked
+  the release build job.
+- Normalize checkout roots before the link check, so a trailing separator or
+  final `/.` cannot make `Lstat` follow a linked repository root. Added symlink
+  and junction regressions.
+- Keep explicit `--restore`/`--restore-from` recovery retrying the settings
+  lease for a bounded interval after `stop-otu.bat` force-stops the client.
+- Keep a double-click console open when startup or a pre-proxy command fails,
+  instead of disappearing before the reason can be read.
+- Describe a saved-device-name mismatch as a likely copied identity and direct
+  the operator to the separate identity-reset package; never reset credentials
+  automatically.
+
 ## v1.1.10 - trusted server pools and enrollment accounts
 
 - Add explicitly imported, Ed25519-signed, credential-free self-hosted profiles

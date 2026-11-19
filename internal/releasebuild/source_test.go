@@ -116,6 +116,44 @@ func TestSourceRootComparisonUsesDirectoryIdentity(t *testing.T) {
 	}
 }
 
+func TestSourceRootComparisonRefusesLinkedCheckoutRoots(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0700); err != nil {
+		t.Fatal(err)
+	}
+	var links []string
+	symlink := filepath.Join(base, "symlink")
+	if err := os.Symlink(real, symlink); err == nil {
+		links = append(links, symlink)
+	} else if runtime.GOOS != "windows" {
+		t.Fatal("could not create the synthetic directory symlink", err)
+	}
+	if runtime.GOOS == "windows" {
+		junction := filepath.Join(base, "junction")
+		if err := exec.Command("cmd", "/c", "mklink", "/J", junction, real).Run(); err == nil {
+			links = append(links, junction)
+		}
+	}
+	if len(links) == 0 {
+		t.Skip("this machine cannot create a directory symlink or junction")
+	}
+	for _, link := range links {
+		variants := []string{link, link + string(os.PathSeparator), filepath.Join(link, "."), filepath.ToSlash(link)}
+		for _, requested := range variants {
+			if sourceRootMatches(link, requested) {
+				t.Fatalf("linked checkout root accepted: reported=%q requested=%q", link, requested)
+			}
+			if sourceRootMatches(requested, link) {
+				t.Fatalf("linked checkout root accepted in requested position: reported=%q requested=%q", requested, link)
+			}
+		}
+		if sourceRootMatches(real, link) || sourceRootMatches(link, real) {
+			t.Fatalf("linked and real checkout roots compared equal: %q %q", link, real)
+		}
+	}
+}
+
 func TestSourceArchiveDeterministicGitObjectsNewOnlyAndDirtySourceRefusal(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("Git is required for frozen source acceptance")

@@ -233,13 +233,20 @@ func sourceRootMatches(reportedRoot, requestedRoot string) bool {
 		}
 	}
 	for _, path := range []string{reportedRoot, requestedRoot} {
+		// Normalize before inspecting the final component. Without Clean, a
+		// trailing separator or "/." makes the OS resolve the last link during
+		// traversal, so Lstat would inspect the target instead of the link.
+		path = filepath.Clean(path)
+		if !filepath.IsAbs(path) {
+			return false
+		}
 		info, err := os.Lstat(path)
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return false
 		}
 	}
-	reported, err := os.Stat(reportedRoot)
-	requested, err := os.Stat(requestedRoot)
+	reported, err := os.Stat(filepath.Clean(reportedRoot))
+	requested, err := os.Stat(filepath.Clean(requestedRoot))
 	return err == nil && os.SameFile(reported, requested)
 }
 

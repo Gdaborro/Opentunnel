@@ -7,6 +7,32 @@ import (
 	"opentunnel/internal/protocol"
 )
 
+func TestLinkerFlagsSeparateDisplayVersionFromUpdateTag(t *testing.T) {
+	flags, err := LinkerFlags("v1.1.99", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(flags, "version.Version=v") {
+		t.Fatalf("display version kept the canonical tag prefix: %s", flags)
+	}
+	for _, want := range []string{
+		"-X opentunnel/internal/version.Version=1.1.99",
+		"-X opentunnel/internal/client.MinUpdateTag=v1.1.99",
+		"-X opentunnel/internal/client.ReleaseBundleFloor=v1.1.99",
+	} {
+		if !strings.Contains(flags, want) {
+			t.Fatalf("linker flags missing %q: %s", want, flags)
+		}
+	}
+	companion, err := LinkerFlags("v1.1.99", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(companion, "version.Version=") {
+		t.Fatalf("companion binary received a display version stamp: %s", companion)
+	}
+}
+
 func TestFixedRecipeContainsBothClientEditionsAndEveryRequiredExecutable(t *testing.T) {
 	seen := map[string]Target{}
 	for _, target := range RecipeTargets() {

@@ -33,7 +33,10 @@ func LinkerFlags(tag string, companion bool) (string, error) {
 	}
 	flags := "-s -w -buildid="
 	if !companion {
-		flags += " -X opentunnel/internal/version.Version=" + tag +
+		// The tag carries the v prefix; the user-facing version and the
+		// protocol's update floor deliberately do not share a spelling.
+		displayVersion := strings.TrimPrefix(tag, "v")
+		flags += " -X opentunnel/internal/version.Version=" + displayVersion +
 			" -X opentunnel/internal/client.MinUpdateTag=" + tag +
 			" -X opentunnel/internal/client.ReleaseBundleFloor=" + tag
 	}

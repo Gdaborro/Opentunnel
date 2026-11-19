@@ -79,6 +79,20 @@ public-key or machine-fingerprint groups among its seven approved rows. This
 does **not** verify either affected PC's reset or approval. No identity, ban,
 approval, authorized-key or production configuration mutation was performed.
 
+Hosted CI run 44474741210 failed only its isolated native release smoke: the new
+fixed build recipe stamped `internal/version.Version` with the canonical
+`v1.1.10` tag spelling, while the server/panel display path deliberately prints
+`1.1.10`. The recipe now strips the `v` only for the display value; the update
+tag and compatibility floor keep the canonical prefix, with a regression test.
+The user-supplied v1.1.10 logs did not contain a process crash. They showed the
+console hiding after eight seconds even when no carrier was verified, followed
+by TLS-interception, cloned-identity SSH-key refusal and managed-browser policy
+denial. The review branch instead keeps the console visible until authenticated
+activity is observed, retries an explicit restore across the forced-stop lease
+window, and keeps double-click failures readable. These changes do not weaken
+TLS/SSH checks, override browser policy, restore a copied PC's identity or prove
+that any affected device can now reach the relay.
+
 Follow-up CI run 44297855037 failed a Windows Git checkout-root spelling check
 and intermittently timed out one denied-cleanup bulk transfer. Checkout roots
 are now compared by actual directory identity, with MSYS/drive-root regression

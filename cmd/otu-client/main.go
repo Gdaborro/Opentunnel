@@ -247,6 +247,41 @@ func startupRefused(operation string, failure error) {
 	}
 }
 
+// fatalVisible replaces log.Fatal on startup and command paths that run before
+// a new proxy journal is installed. A double-click console stays open so users
+// can read the refusal instead of reporting an instant crash. Recovery
+// evidence is never deleted here.
+func fatalVisible(operation string, failure error) {
+	log.Printf("%s: %v", operation, failure)
+	fmt.Printf("[!] %s failed. Existing identities and recovery evidence were preserved.\n", operation)
+	if len(os.Args) == 1 {
+		fmt.Println("Press Enter to close...")
+		_, _ = fmt.Scanln()
+	}
+	os.Exit(1)
+}
+
+// restoreWithRetry tolerates the short interval between a forced client stop
+// and release of the settings lease. Without it, stop-otu.bat can report a
+// false recovery failure while the dead process's lease is still closing, and
+// the dead proxy remains configured until the next attempt. A genuinely live
+// owner still fails promptly; the bounded window only covers process teardown.
+func restoreWithRetry(mgr *netenv.Manager, from string) error {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var err error
+		if from != "" {
+			err = mgr.RestoreFrom(from)
+		} else {
+			err = mgr.Restore()
+		}
+		if !errors.Is(err, netenv.ErrAlreadyRunning) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
 func clientVersionText() string {
 	text := "opentunnel client " + version.Version
 	if version.LocalPreview != "" {
@@ -351,7 +386,7 @@ func run() {
 
 	mgr, mgrErr := netenv.NewManager()
 	if mgrErr != nil && (*autoProxy || *restoreOnly || *restoreFrom != "") {
-		log.Fatalf("settings manager: %v", mgrErr)
+		fatalVisible("settings manager", mgrErr)
 	}
 
 	// Always attempt orphan recovery: a previous session may have been
@@ -359,13 +394,13 @@ func run() {
 	// live-owner conflict is tolerated (that owner restores on its own exit).
 	if mgr != nil {
 		if err := recoverNetwork(mgr); err != nil && *autoProxy {
-			log.Fatalf("%v", err)
+			fatalVisible("settings recovery", err)
 		}
 	}
 
 	if *restoreOnly {
-		if err := mgr.Restore(); err != nil {
-			log.Fatalf("restore: %v", err)
+		if err := restoreWithRetry(mgr, ""); err != nil {
+			fatalVisible("restore", err)
 		}
 		if reportNetworkWarnings(mgr, "restore") {
 			fmt.Println("system proxy restored; browser-policy cleanup remains pending. Retry --restore when policy access is available.")
@@ -376,8 +411,8 @@ func run() {
 	}
 
 	if *restoreFrom != "" {
-		if err := mgr.RestoreFrom(*restoreFrom); err != nil {
-			log.Fatalf("restore-from: %v", err)
+		if err := restoreWithRetry(mgr, *restoreFrom); err != nil {
+			fatalVisible("restore-from", err)
 		}
 		if reportNetworkWarnings(mgr, "restore-from") {
 			fmt.Println("system proxy restored from backup; browser-policy cleanup remains pending.")
@@ -441,7 +476,7 @@ func run() {
 	// extended inactivity (re-register → re-approve).
 	tokenStore, err := client.NewPoolTokenStore(cfg.IdentityScope())
 	if err != nil {
-		log.Fatalf("token store: %v", err)
+		fatalVisible("token store", err)
 	}
 	device, err := tokenStore.LoadOrCreate()
 	if err != nil {
@@ -450,8 +485,9 @@ func run() {
 	}
 	fmt.Printf("[i] device: %s\n", device.DeviceName)
 	if current, err := os.Hostname(); err == nil && cfg.Pool == nil && current != "" && !strings.EqualFold(current, device.DeviceName) {
-		fmt.Println("[!] Saved device name differs from this PC's current name. A PC rename or copied identity backup may explain this.")
-		fmt.Println("    Credentials have NOT been reset. Ask the OpenTunnel administrator to verify the device's public-key fingerprint.")
+		fmt.Println("[!] Saved device name differs from this PC's current name. This usually means the identity was copied from another PC.")
+		fmt.Println("    Re-approval alone cannot give a copied PC its own identity; use the administrator's identity-reset package instead.")
+		fmt.Println("    Credentials have NOT been reset automatically.")
 	}
 
 	// Graceful stop path: signals (Ctrl+C / window close) or panel decisions
@@ -593,13 +629,13 @@ func run() {
 			UDP:         boolPtr(cfg.UDPEnabled()),
 		})
 		if lerr != nil {
-			log.Fatalf("share: %v", lerr)
+			fatalVisible("share link", lerr)
 		}
 		fmt.Println(link)
 		fmt.Println("\nWARNING: this link contains your secret token — share only with people you trust.")
 		if *qrOut != "" {
 			if werr := share.QRPNGFile(link, *qrOut, 512); werr != nil {
-				log.Fatalf("qr: %v", werr)
+				fatalVisible("QR code", werr)
 			}
 			fmt.Printf("QR code written to %s\n", *qrOut)
 		} else if txt, terr := share.QRText(link); terr == nil {
@@ -756,7 +792,7 @@ func run() {
 			}
 			key := cfg.SSHKey
 			if key == "" {
-				log.Fatal("transport=ssh requires ssh_key in config")
+				fatalVisible("ssh transport", errors.New("transport=ssh requires ssh_key in config"))
 			}
 			dialer.UseTransportBuilder(func(profile string) transport.Transport {
 				return transport.NewSSH(transport.SSHOptions{

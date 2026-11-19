@@ -1,5 +1,6 @@
 // Package version carries the release version for both binaries, stamped at
-// build time via -ldflags "-X opentunnel/internal/version.Version=vX.Y.Z".
+// build time via -ldflags "-X opentunnel/internal/version.Version=X.Y.Z".
+// Canonical release tags keep the v prefix; this display value does not.
 package version
 
 // Version defaults to the next planned release; release builds stamp the tag.
