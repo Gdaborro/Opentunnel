@@ -76,8 +76,10 @@ approved clients still need an authenticated pin-learning/SSH recovery path.
 
 The production panel currently has no pending device rows and no duplicate
 public-key or machine-fingerprint groups among its seven approved rows. This
-does **not** verify either affected PC's reset or approval. No identity, ban,
-approval, authorized-key or production configuration mutation was performed.
+does **not** verify either affected PC's reset or approval. At the time of that
+read-only check no identity, ban, approval, authorized-key or production
+configuration mutation had been performed. A later explicitly confirmed fleet
+wipe is recorded below.
 
 Hosted CI run 44474741210 failed only its isolated native release smoke: the new
 fixed build recipe stamped `internal/version.Version` with the canonical
@@ -93,6 +95,30 @@ window, and keeps double-click failures readable. These changes do not weaken
 TLS/SSH checks, override browser policy, restore a copied PC's identity or prove
 that any affected device can now reach the relay.
 
+### 2026-11-19 confirmed fleet re-enrollment wipe
+
+After explicit operator confirmation, the production panel was reset to require
+fresh enrollment and separate approval for every device. The operation stopped
+both services, verified an exact preflight scope, wrote a consistent private
+SQLite backup and authorized-key copy with integrity and digest checks, deleted
+only `peers`, `peer_enrollments`, `fingerprints_banned` and `pubkeys_banned`,
+atomically emptied the managed SSH authorization input, and restarted both
+services. It retained the two administrator accounts plus all 62 daily-usage,
+12 ingress-usage, 195 event and 500 alert rows.
+
+Verified result: zero peer rows, zero fingerprint bans, zero public-key bans,
+zero managed SSH key lines, database integrity `ok`, and both `opentunnel` and
+`otu-panel` active. The rollback evidence is
+`/var/lib/opentunnel/fleet-reset-backups/20261119T081222Z-de59de2c612d0908`
+(mode 0700; `panel.db`, `authorized_keys` and `reset-status.json` at 0600), with
+manifest status `completed`, database SHA-256
+`1c31024d7a1e4725e5a0ba6f12ff91a2a2990967c6c1bab63b01e4481541824a` and
+authorized-key SHA-256
+`93f00965eab822ff0407e881d290ef99122e33c96bb7aa04b24d47045f3fc0f3`.
+The cleared bans were an explicit operator decision, not an automatic unban.
+This server-side wipe does **not** reset either copied PC's local identity,
+prove their separate approvals or establish permitted-network connectivity.
+
 Follow-up CI run 44297855037 failed a Windows Git checkout-root spelling check
 and intermittently timed out one denied-cleanup bulk transfer. Checkout roots
 are now compared by actual directory identity, with MSYS/drive-root regression
@@ -101,8 +127,15 @@ suite; the denied-cleanup case also passed 20 consecutive race runs during
 concurrent client/panel/relay tests, with 3,014,656-byte transfers taking about
 0.82-0.93 seconds. The original 15-second acceptance deadline and all payload,
 accounting and recovery assertions remain unchanged; failure diagnostics now
-record elapsed time and exact received bytes. These local results do not prove
-the intermittent hosted-CI failure is resolved and do not make overall CI green.
+record elapsed time and exact received bytes.
+
+The subsequent hosted CI run 44485530268 passed every job on commit
+`7e0689d3acdc5c512f257b97d3f49fe2ddabd4bc`: frontend, both companion jobs,
+both test jobs, and the previously failing `build` job, including its fixed
+recipe checks and isolated native release smoke. Locally staged
+`otu-panel`/`otu-server` binaries built with the fixed recipe also printed
+`1.1.10` from `--version`. This closes that specific CI regression; it is not a
+signed release, independent reproduction or publication authorization.
 
 ### Two client editions
 
@@ -210,11 +243,43 @@ authorized resources/evidence, not another synthetic test:
 No external review was purchased or fabricated, no real credentials/root were
 rotated, and no test on an everyday PC is substituted for those device/host gates.
 
+### 2026-11-19 reset-utility publication
+
+Two credential-free reset packages were published after the targeted and
+generalized synthetic suites passed 12 and 14 checks respectively. The
+generalized package is a public GitHub prerelease asset:
+`copied-identity-reset-20261119`, file
+`OpenTunnel-Copied-Identity-Reset-20261119.zip`, 8,114 bytes, SHA-256
+`2e8fdb81251eb519c8b9bad7c1e51430f6fad57915882abfab4c5d3ac66c549f`.
+Downloading it back from the public URL reproduced that hash, and
+`releases/latest` still resolves to `v1.1.10`. The generalized script contains
+no private device name, supports both hosted and generic state directories,
+refuses ambiguous selection and a saved name that matches the actual PC, and
+archives/digest-verifies the five identity files before deletion. It preserves
+bans, journals, policies, configs and other operator identities, and requires
+typing `RESET <actual PC name>`.
+
+The server-specific package, which intentionally names the known copied device,
+was published only at an unlisted, unauthenticated HTTPS route on
+`cdn.aborro.dev:8445`; the exact path is retained in private evidence rather
+than in this public report. **The unlisted URL is not access control.** Downloads
+from the VPS and the Windows host over normal certificate and hostname
+validation matched SHA-256
+`07656015b5c33e49a91784e6eaffbcde82a1843b02fb89f5623a6982d140f4fe`.
+Wrong paths and the route root return 404, and `https://cdn.aborro.dev/` still
+returns 200. The Caddyfile was backed up to
+`/var/backups/caddy/Caddyfile.pre-reset-20261119` (SHA-256
+`a3163b194ee1e5109167e74018d0a49055349e60cf68acd0134947f1b4ef0585`) before
+reload; `caddy`, `opentunnel` and `otu-panel` remained active. No relay or panel
+binary changed. This publication does not reset either affected PC, approve a
+device or authorize a client release.
+
 ## Publication outcome
 
-**NO-GO.** Source changes and this report may be published on the review branch.
-That is not a final software release. Website download links, stable releases,
-the original installed client and production services remain unchanged. The
+**NO-GO for a client release.** Source changes and this report may be published
+on the review branch. The reset utility above is an unsigned, scope-limited
+script package, not a client release. No client EXE, website download link,
+stable release, installed client or relay/panel binary was published by it. The
 operator's “only if ready” condition takes precedence over completing an upload.
-The final release and website publication must remain on hold until every
+The final client release and website publication must remain on hold until every
 remaining acceptance item above has honest evidence.

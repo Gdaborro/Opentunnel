@@ -162,8 +162,12 @@ or fleet migration is performed merely by editing this ledger.
   Released clients retain the historical hosted update asset name; generic
   updates use a distinct name. Preview auto-updates are disabled at build time.
   The reset never runs automatically, never clears bans and needs separate
-  approval afterward. Twelve synthetic reset checks passed; actual affected-PC
-  resets/enrollment are not verified. Nothing was published or deployed.
+  approval afterward. Twelve targeted and fourteen generalized synthetic reset
+  checks passed; actual affected-PC resets/enrollment are not verified. An
+  unsigned generalized script package was published as a public GitHub
+  prerelease asset. The server-specific package was published only at an
+  unlisted, unauthenticated `cdn.aborro.dev:8445` route; unlisted is not access
+  control. No client EXE or stable release was published.
 
 Remaining stable-release blockers: exact source/asset freeze, trusted reproducible
 build authorization, durable scoped signing history and full artifact verification,
