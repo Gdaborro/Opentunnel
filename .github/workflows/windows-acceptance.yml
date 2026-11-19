@@ -19,30 +19,26 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: go.mod
+          go-version: "1.27.4"
       - name: build exact non-fixture candidate
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          git config core.autocrlf false
-          git config core.eol lf
-          git checkout-index --force --all
-          git update-index --refresh
-          git status --short
-          if ($LASTEXITCODE -ne 0) { throw 'unfiltered source checkout failed' }
+          $commit = '${{ github.sha }}'
+          $source = Join-Path $env:RUNNER_TEMP 'otu-source'
+          git clone -c core.autocrlf=false --no-checkout https://github.com/Gdaborro/Opentunnel.git $source
+          if ($LASTEXITCODE -ne 0) { throw 'source clone failed' }
+          git -C $source checkout --detach $commit
+          if ($LASTEXITCODE -ne 0) { throw 'source checkout failed' }
+          Set-Location $source
           $env:CGO_ENABLED = '0'
           $builder = Join-Path $env:RUNNER_TEMP 'otu-buildcandidate.exe'
           go build -buildvcs=false -trimpath -o $builder ./tools/buildcandidate
           if ($LASTEXITCODE -ne 0) { throw 'build tool compilation failed' }
-          $commit = git rev-parse HEAD
           $tag = 'v' + (Select-String -Path internal/version/version.go -Pattern '^var Version = "([^"]+)"').Matches.Groups[1].Value
           $toolchain = (go version).Split(' ')[2]
-          $source = (Resolve-Path .).Path
           $output = Join-Path $env:RUNNER_TEMP 'otu-real-candidate'
           $goexe = Join-Path (go env GOROOT) 'bin\go.exe'
           & $builder --go-executable $goexe --source-directory $source --source-commit "$commit" --directory $output --tag "$tag" --toolchain "$toolchain"
