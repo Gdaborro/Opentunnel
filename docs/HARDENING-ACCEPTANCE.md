@@ -33,12 +33,13 @@ Keep institution/network observations, device identity and recovery logs private
   module versions/sums/SBOMs and ignored/line-ending-transformed checkout input.
   Artifact buildinfo is not proof of linker stamps or authenticated reproduction.
 
-As of the 2026-11-18 pre-push check, `npm audit --audit-level=low` reports the
-high-severity picomatch ReDoS advisory GHSA-fc5q-39xc-vjpf through the frontend
-build/dev dependency graph. No patched npm version is listed. Keep the audit
-gate failing until a reviewed fix is available; neither a forced Vite downgrade
-nor disabling the audit is release acceptance. The static SPA/Go artifacts do
-not execute this Node dependency, but the build/dev tooling still needs repair.
+GitHub withdrew the picomatch advisory GHSA-fc5q-39xc-vjpf at
+2026-11-18T15:38:56Z after maintainer review. On 2026-11-19, Node 26.13.0
+`npm audit --audit-level=low` and an explicit lockfile/development-dependency
+audit both reported zero vulnerabilities across 279 dependencies. No package,
+lockfile, Vite version, override or audit suppression was changed. Keep the
+audit enabled for future findings; a withdrawn advisory or zero current findings
+is not a security certification.
 
 ## Soak harness
 
@@ -68,6 +69,24 @@ including intended relay/authority latency, quota loads, expiry/revocation, larg
 in-progress transfers and network changes. Collect bounded-resource measurements,
 payload digests and failure/rollback evidence. Resource/cardinality limits that
 deny work under load must be measured—not concealed as unlimited performance.
+
+## Real disposable Windows runner
+
+`.github/workflows/windows-acceptance.yml` is manual-only and requires the exact
+`disposable-real-registry` confirmation. It builds the fixed non-fixture candidate
+on a fresh GitHub Windows VM, then runs `TestRealWindows*` against that VM's real
+HKCU WinINET/browser-policy keys. The test refuses to execute without both the
+explicit flag and the GitHub runner environment, and also refuses a
+`netenvfixture` binary. Current cases cover graceful Ctrl+Break, forced process
+termination and guardian recovery, an external competing proxy change that must
+not be overwritten, read-only registry ACLs, exact-value restoration and
+authenticated payload/accounting. The candidate executable is copied to private
+lab state before launch; release artifacts are not mutated.
+
+This is genuine disposable-VM registry evidence, not coverage of logoff,
+shutdown, sleep, power loss, mandatory administrator policy, every competing
+proxy product or update handoff. Those scenarios still require an authorized
+device/lab and must never be run on the everyday operator PC.
 
 ## Mandatory non-fixture gates
 

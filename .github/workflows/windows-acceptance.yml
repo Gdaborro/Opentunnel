@@ -1,0 +1,46 @@
+name: windows-real-acceptance
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type disposable-real-registry to mutate only this fresh runner's HKCU proxy state"
+        required: true
+        type: string
+
+jobs:
+  real-registry:
+    if: github.event.inputs.confirm == 'disposable-real-registry'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - name: build exact non-fixture candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CGO_ENABLED = '0'
+          go build -buildvcs=false -trimpath -o "$env:RUNNER_TEMP/otu-buildcandidate.exe" ./tools/buildcandidate
+          if ($LASTEXITCODE -ne 0) { throw 'build tool compilation failed' }
+          $commit = git rev-parse HEAD
+          $tag = 'v' + (Select-String -Path internal/version/version.go -Pattern '^var Version = "([^"]+)"').Matches.Groups[1].Value
+          $toolchain = (go version).Split(' ')[2]
+          & "$env:RUNNER_TEMP/otu-buildcandidate.exe" --go-executable "$(go env GOROOT)/bin/go.exe" --source-directory "$env:GITHUB_WORKSPACE" --source-commit "$commit" --directory "$env:RUNNER_TEMP/otu-real-candidate" --tag "$tag" --toolchain "$toolchain"
+          if ($LASTEXITCODE -ne 0) { throw 'fixed candidate build failed' }
+      - name: real HKCU proxy and browser-policy acceptance
+        shell: pwsh
+        env:
+          OTU_REAL_WINDOWS_ACCEPTANCE: disposable-runner
+          OTU_REAL_WINDOWS_CLIENT: ${{ runner.temp }}/otu-real-candidate/otu-client-windows-amd64.exe
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go test -race -count=1 -v -timeout 180s -run '^TestRealWindows' ./test
+          if ($LASTEXITCODE -ne 0) { throw 'real Windows registry acceptance failed' }
