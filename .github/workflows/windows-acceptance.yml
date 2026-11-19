@@ -50,5 +50,6 @@ jobs:
           OTU_REAL_WINDOWS_CLIENT: ${{ runner.temp }}/otu-real-candidate/otu-client-windows-amd64.exe
         run: |
           $ErrorActionPreference = 'Stop'
+          Set-Location (Join-Path $env:RUNNER_TEMP 'otu-source')
           go test -race -count=1 -v -timeout 180s -run '^TestRealWindows' ./test
           if ($LASTEXITCODE -ne 0) { throw 'real Windows registry acceptance failed' }
