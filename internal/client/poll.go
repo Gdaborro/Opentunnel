@@ -174,7 +174,7 @@ func doRegisterContext(parent context.Context, cfg *config.ClientConf, device *d
 		defer resp.Body.Close()
 		return registrationResponse(resp)
 	}
-	if !cfg.AllowUntrustedBootstrap || ts.EverApproved(device.Fingerprint) {
+	if !plainBootstrapAllowed(cfg, device, ts) {
 		return errors.New("registration requires a verified channel; use pinned TLS, a managed authenticated carrier or administrator-assisted enrollment")
 	}
 	log.Printf("WARNING: untrusted bootstrap explicitly enabled; administrator must independently verify this device's public key")
@@ -184,6 +184,13 @@ func doRegisterContext(parent context.Context, cfg *config.ClientConf, device *d
 	}
 	defer resp.Body.Close()
 	return registrationResponse(resp)
+}
+
+// plainBootstrapAllowed limits system-trusted token registration to the same
+// process that minted an identity. Existing device state, including an
+// unreadable approval marker, must use pinned or in-band verification instead.
+func plainBootstrapAllowed(cfg *config.ClientConf, device *deviceFile, ts *TokenStore) bool {
+	return cfg.AllowUntrustedBootstrap && device.Created && !ts.EverApproved(device.Fingerprint)
 }
 
 var errRegistrationIdentityConflict = errors.New("registration identity conflict")
@@ -262,7 +269,7 @@ func checkOnceContext(ctx context.Context, cfg *config.ClientConf, device *devic
 		everApproved = ts.EverApproved(device.Fingerprint)
 	}
 	previousStatus := strings.TrimSuffix(*last, ":unverified")
-	bootstrap := !everApproved && (previousStatus == "" || previousStatus == "pending" || previousStatus == "expired")
+	bootstrap := device.Created && !everApproved && (previousStatus == "" || previousStatus == "pending" || previousStatus == "expired")
 	bootstrap = bootstrap && cfg.AllowUntrustedBootstrap
 	status, kickReason, banReason, kickExpires, trusted, err := checkTokenStatusContext(ctx, cfg, device.Token, bootstrap)
 	if err != nil || ctx.Err() != nil {
@@ -287,7 +294,13 @@ func checkOnceContext(ctx context.Context, cfg *config.ClientConf, device *devic
 		// and strand onboarding, and a forged "banned" must not persist
 		// a hard ban across restarts.
 		if status == "approved" && trusted {
-			ts.MarkApproved(device.Fingerprint)
+			if err := ts.MarkApproved(device.Fingerprint); err != nil {
+				// This device now has an existing identity on the next start.
+				// Close plain bootstrap immediately and for every later run;
+				// an approval-marker write failure must never reopen it.
+				device.Created = false
+				log.Printf("approval marker persistence failed; plain bootstrap disabled: %v", err)
+			}
 		}
 	}
 	switch status {

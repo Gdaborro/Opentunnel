@@ -2,6 +2,18 @@
 
 ## v1.1.11 - pre-1.2 hardening
 
+- Add explicit `transport = "h3"` selection using the existing pinned HTTP/3
+  transport and stream-rotation bounds. UDP-blocked networks still fail over to
+  WS-TLS/SSH rather than weakening certificate or host-key checks.
+- Fix signed-update display-version preflight, restrict the update helper to the
+  exact private journal before any ACL/lock work, and recover the crash window
+  where the old executable was moved but the staged one was not installed.
+- Parse recovery arguments by actual flag semantics, make plain bootstrap a
+  first-run-only operation with fail-closed approval state, and replace global
+  image-name termination with PID/creation/path-verified `--stop` recovery.
+- Reject root rotations issued after predecessor expiry, off-recipe ARM64 client
+  artifacts and malformed legacy freshness timestamps; fail closed for unknown
+  sources when anti-abuse source maps saturate instead of discarding punishment.
 - Fail closed on stale/failed policy, authority and accounting reads; bind usage
   to authenticated identities and complete managed SSH desired-state
   reconciliation without deleting unrelated administrator keys.

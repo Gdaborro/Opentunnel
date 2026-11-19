@@ -104,6 +104,9 @@ func VerifyRootRotation(raw []byte, previous ReleaseRoot, now time.Time) (Releas
 	if rotation.Root.Version != previous.Version+1 || rotation.Root.IssuedAt < previous.IssuedAt || rotation.Root.Validate(now) != nil || len(rotation.Signatures) > 16 {
 		return ReleaseRoot{}, errors.New("release root rollback or invalid validity window")
 	}
+	if err := previous.Validate(time.Unix(rotation.Root.IssuedAt, 0)); err != nil {
+		return ReleaseRoot{}, errors.New("release root predecessor was invalid at rotation issuance")
+	}
 	msg, err := ReleaseRootMessage(rotation.Root)
 	if err != nil {
 		return ReleaseRoot{}, err

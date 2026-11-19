@@ -46,6 +46,15 @@ func TestWriteDefaultClientConfigRoundtrip(t *testing.T) {
 	}
 }
 
+func TestTransportKindIncludesExplicitH3(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{{"", "wstls"}, {"wstls", "wstls"}, {"h3", "h3"}, {"ssh", "ssh"}, {"carrier", "carrier"}} {
+		c := &ClientConf{Transport: tc.input}
+		if got := c.TransportKind(); got != tc.want {
+			t.Errorf("TransportKind(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
 func TestAllowHostileSSHDefaultsOn(t *testing.T) {
 	c := &ClientConf{}
 	if !c.AllowHostileSSH() {

@@ -9,16 +9,18 @@ import (
 // Guard throttles abusive clients without revealing that a proxy exists:
 // over-limit and banned peers receive the same decoy page as everyone else.
 type Guard struct {
-	mu             sync.Mutex
-	active         map[string]int // per-IP active tunnel count
-	fails          map[string]*failRecord
-	bans           map[string]time.Time // ip -> banned-until
-	maxPerIP       int
-	total          chan struct{}
-	banBase        time.Duration
-	banMax         time.Duration
-	lastCleanupNs  int64
-	droppedSources uint64
+	mu              sync.Mutex
+	active          map[string]int // per-IP active tunnel count
+	fails           map[string]*failRecord
+	bans            map[string]time.Time // ip -> banned-until
+	maxPerIP        int
+	total           chan struct{}
+	banBase         time.Duration
+	banMax          time.Duration
+	lastCleanupNs   int64
+	droppedSources  uint64
+	overflowUntil   time.Time
+	overflowStrikes int
 
 	// tokenActive bounds concurrent sessions per device identity for
 	// peers arriving over loopback (the ssh tier's forward path): per-IP
@@ -136,6 +138,15 @@ func (g *Guard) Acquire(ip string) (release func()) {
 		g.mu.Unlock()
 		return nil
 	}
+	now := time.Now()
+	g.cleanupLocked(now)
+	_, trackedBan := g.bans[ip]
+	if g.overflowUntil.After(now) && g.active[ip] == 0 && g.fails[ip] == nil && !trackedBan {
+		// Source-map saturation must fail closed for otherwise unknown
+		// sources; active and recently tracked sources are unaffected.
+		g.mu.Unlock()
+		return nil
+	}
 	if until, banned := g.bans[ip]; banned {
 		if time.Now().Before(until) {
 			g.mu.Unlock()
@@ -182,7 +193,7 @@ func (g *Guard) BanIP(ip string, d time.Duration) {
 	defer g.mu.Unlock()
 	g.cleanupLocked(time.Now())
 	if _, exists := g.bans[ip]; !exists && len(g.bans) >= maxGuardSources {
-		g.droppedSources++
+		g.noteOverflowLocked(time.Now(), d)
 		return
 	}
 	until := time.Now().Add(d)
@@ -203,7 +214,7 @@ func (g *Guard) Punish(ip string) {
 	rec := g.fails[ip]
 	if rec == nil || now.Sub(rec.lastFail) > g.banMax {
 		if rec == nil && len(g.fails) >= maxGuardSources {
-			g.droppedSources++
+			g.noteOverflowLocked(now, g.banBase)
 			return
 		}
 		rec = &failRecord{}
@@ -226,9 +237,23 @@ func (g *Guard) Punish(ip string) {
 		}
 		if _, exists := g.bans[ip]; exists || len(g.bans) < maxGuardSources {
 			g.bans[ip] = now.Add(d)
+		} else {
+			g.noteOverflowLocked(now, d)
 		}
 	}
 
+}
+
+func (g *Guard) noteOverflowLocked(now time.Time, d time.Duration) {
+	if d <= 0 {
+		d = g.banBase
+	}
+	g.droppedSources++
+	g.overflowStrikes = min(g.overflowStrikes+1, 23)
+	until := now.Add(d)
+	if g.overflowUntil.Before(until) {
+		g.overflowUntil = until
+	}
 }
 
 func (g *Guard) DroppedSources() uint64 { g.mu.Lock(); defer g.mu.Unlock(); return g.droppedSources }
@@ -236,6 +261,9 @@ func (g *Guard) DroppedSources() uint64 { g.mu.Lock(); defer g.mu.Unlock(); retu
 // One bounded sweep per minute, not a full-map scan per overflowing source.
 // Admission is already capped globally; overflow cannot allocate more state.
 func (g *Guard) cleanupLocked(now time.Time) {
+	if !g.overflowUntil.IsZero() && !now.Before(g.overflowUntil) {
+		g.overflowStrikes = 0
+	}
 	if now.UnixNano()-g.lastCleanupNs > int64(min(g.banMax, time.Minute)) {
 		for k, t := range g.bans {
 			if now.After(t) {

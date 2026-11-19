@@ -67,6 +67,42 @@ func TestAbuseStateIsBoundedForRecentSourcesAndSingleSource(t *testing.T) {
 	}
 }
 
+func TestGuardSaturationFailsClosedForUnknownSources(t *testing.T) {
+	g := NewGuard(16, 65536, time.Second, time.Minute)
+	now := time.Now()
+	for i := 0; i < maxGuardSources; i++ {
+		ip := fmt.Sprintf("192.0.%d.%d", i/256, i%256)
+		g.fails[ip] = &failRecord{count: 1, lastFail: now}
+		g.bans[ip] = now.Add(time.Hour)
+	}
+	for range 3 {
+		g.Punish("203.0.113.1")
+	}
+	if release := g.Acquire("203.0.113.1"); release != nil {
+		release()
+		t.Fatal("saturated guard allowed a repeatedly punished unknown source")
+	}
+	g.BanIP("203.0.113.2", time.Minute)
+	if release := g.Acquire("203.0.113.2"); release != nil {
+		release()
+		t.Fatal("saturated guard discarded an explicit new-source ban")
+	}
+	if release := g.Acquire("192.0.0.1"); release != nil {
+		release()
+		t.Fatal("overflow backoff removed an existing source's ban state")
+	}
+	g.active["192.0.0.1"] = 1
+	delete(g.bans, "192.0.0.1")
+	if release := g.Acquire("192.0.0.1"); release == nil {
+		t.Fatal("overflow backoff denied an existing active source")
+	} else {
+		release()
+	}
+	if len(g.fails) > maxGuardSources || len(g.bans) > maxGuardSources || g.DroppedSources() == 0 {
+		t.Fatal("saturation telemetry or source bounds regressed")
+	}
+}
+
 func TestLimiterSourceCardinalityFailsClosedAtCapacity(t *testing.T) {
 	opt := Options{state: newRelayState()}
 	for i := range 10000 {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -296,6 +297,7 @@ func run() {
 	autoProxy := flag.Bool("auto-proxy", false, "configure the Windows user-level system proxy automatically (restored on exit)")
 	restoreOnly := flag.Bool("restore", false, "restore previously saved network settings and exit")
 	restoreFrom := flag.String("restore-from", "", "restore network settings from a backup file (settings-backup) and exit")
+	stopClient := flag.Bool("stop", false, "stop only the verified owner process and recover its network settings")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	shareLink := flag.Bool("share-link", false, "print an otu:// share link for this config and exit")
 	qrOut := flag.String("qr", "", "with -share-link: also write a PNG QR code to this path")
@@ -317,6 +319,20 @@ func run() {
 
 	if *showVersion {
 		fmt.Println(clientVersionText())
+		return
+	}
+	if *stopClient {
+		mgr, err := netenv.NewManager()
+		if err != nil {
+			fatalVisible("settings manager", err)
+		}
+		if err := netenv.StopClient(); err != nil {
+			fatalVisible("checked client stop", err)
+		}
+		if err := restoreWithRetry(mgr, ""); err != nil {
+			fatalVisible("post-stop settings recovery", err)
+		}
+		fmt.Println("otu stopped; journaled settings recovery completed.")
 		return
 	}
 
@@ -352,22 +368,6 @@ func run() {
 			return
 		}
 		fmt.Printf("[i] no config found — wrote default settings to %s\n", *cfgPath)
-		// Also drop a stop helper next to the exe: the double-click console
-		// hides itself, so recipients need an obvious off switch. It kills
-		// the client then runs its own --restore to put network settings
-		// back immediately (no admin needed).
-		if exe, eerr := os.Executable(); eerr == nil {
-			stop := filepath.Join(filepath.Dir(exe), version.StopHelper)
-			if _, serr := os.Stat(stop); os.IsNotExist(serr) {
-				image := filepath.Base(exe)
-				bat := "@echo off\r\n" +
-					"taskkill /IM " + image + " /F >nul 2>&1\r\n" +
-					"\"%~dp0" + image + "\" --restore\r\n" +
-					"if errorlevel 1 (echo Recovery incomplete - keep the journal and retry.) else (echo otu stopped - review any pending-policy warnings above.)\r\n" +
-					"pause\r\n"
-				_ = os.WriteFile(stop, []byte(bat), 0o755)
-			}
-		}
 	}
 
 	var cfg *config.ClientConf
@@ -438,7 +438,16 @@ func run() {
 	// and exit quietly — never look like a crash loop.
 	if singleInstance(mgr, cfg.SOCKSAddr, cfg.HTTPAddr) {
 		return
-	} // Relative ssh_key paths are resolved against the config file's
+	}
+	if err := netenv.RecordProcessOwner(); err != nil {
+		fatalVisible("client ownership record", err)
+	}
+	if exe, err := os.Executable(); err == nil {
+		if err := writeStopHelper(exe); err != nil {
+			log.Printf("stop helper could not be refreshed: %v", err)
+		}
+	}
+	// Relative ssh_key paths are resolved against the config file's
 	// directory, so a key dropped next to the exe/config just works.
 	if cfg.SSHKey != "" && !filepath.IsAbs(cfg.SSHKey) {
 		cfg.SSHKey = filepath.Join(filepath.Dir(*cfgPath), cfg.SSHKey)
@@ -578,7 +587,7 @@ func run() {
 		// token to the middlebox at every start (audit round three, N-1
 		// Window A). The re-register paths that matter (purged token →
 		// OnAuthRejected) still fire on demand.
-		if cfg.Pool == nil && !tokenStore.EverApproved(device.Fingerprint) {
+		if cfg.Pool == nil && device.Created && !tokenStore.EverApproved(device.Fingerprint) {
 			safeGo("register", func() { client.RegisterWithPanelContext(ctx, cfg, device) })
 		}
 		// A mid-session ban switches to notice mode (ban page everywhere)
@@ -781,6 +790,20 @@ func run() {
 		switch cfg.TransportKind() {
 		case "carrier":
 			fmt.Println("[i] transport: managed fixed-target carrier")
+		case "h3":
+			fmt.Println("[i] transport: pinned HTTP/3 (QUIC)")
+			dialer.UseTransportBuilder(func(string) transport.Transport {
+				return transport.NewH3(transport.H3Options{
+					ServerAddr:    baseOpts.ServerAddr,
+					ServerName:    baseOpts.ServerName,
+					HTTPAuthority: baseOpts.HTTPAuthority,
+					Path:          baseOpts.WSPath,
+					Fingerprint:   baseOpts.Fingerprint,
+					Fingerprints:  append([]string(nil), baseOpts.Fingerprints...),
+					Insecure:      baseOpts.Insecure,
+					DialTimeout:   15 * time.Second,
+				})
+			})
 		case "ssh":
 			internal := cfg.SSHInternal
 			if internal == "" {
@@ -1111,6 +1134,37 @@ func sshDialHost(cfg *config.ClientConf) string {
 	return cfg.SSHDialHost()
 }
 
+func stopHelperContents(image string) (string, bool) {
+	if image == "" || filepath.Base(image) != image {
+		return "", false
+	}
+	for _, r := range image {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return "", false
+	}
+	return "@echo off\r\n\"%~dp0" + image + "\" --stop\r\n" +
+		"if errorlevel 1 (echo Stop or recovery refused - read the message and keep the journal.) else (echo otu stopped - review any pending-policy warnings above.)\r\n" +
+		"pause\r\n", true
+}
+
+func writeStopHelper(exe string) error {
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	image := filepath.Base(exe)
+	contents, ok := stopHelperContents(image)
+	if !ok {
+		return errors.New("executable name is not safe for a batch helper")
+	}
+	path := filepath.Join(filepath.Dir(exe), version.StopHelper)
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == contents {
+		return nil
+	}
+	return os.WriteFile(path, []byte(contents), 0o755)
+}
+
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a
@@ -1122,11 +1176,31 @@ func firstNonEmpty(a, b string) string {
 // corrupt/stale update journal must not prevent an ordinary user from restoring
 // journal-owned proxy settings. The networking manager still checks ownership.
 func networkRecoveryRequested(args []string) bool {
-	for _, arg := range args {
-		name, _, _ := strings.Cut(arg, "=")
+	stringFlags := map[string]bool{"c": true, "pool": true, "qr": true, "release-root-import": true}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		name, value, hasValue := strings.Cut(arg, "=")
+		name = strings.TrimLeft(name, "-")
 		switch name {
-		case "-restore", "--restore", "-restore-from", "--restore-from":
+		case "restore":
+			if !hasValue {
+				return true
+			}
+			parsed, err := strconv.ParseBool(value)
+			return err == nil && parsed
+		case "restore-from":
+			if hasValue {
+				return value != ""
+			}
+			return i+1 < len(args) && args[i+1] != ""
+		case "stop":
 			return true
+		}
+		if !hasValue && stringFlags[name] {
+			i++ // a string flag's value is not a recovery switch
 		}
 	}
 	return false

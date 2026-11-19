@@ -1,15 +1,18 @@
 package client
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
 
@@ -32,6 +35,10 @@ type deviceFile struct {
 	Token       string `json:"token"`
 	Fingerprint string `json:"fingerprint"`
 	DeviceName  string `json:"device_name"`
+	// Created is true only for the process that minted this identity. Plain
+	// bootstrap is restricted to that first run; an existing device whose
+	// approval marker is missing or unreadable must use a verified channel.
+	Created bool `json:"-"`
 }
 
 // DeviceIdentity is the persistent per-operator device identity, never an
@@ -77,21 +84,34 @@ func (s *TokenStore) keyEstablishedPath() string {
 // a forced token rotation or re-registration cannot reset the marker, so
 // a middleman-forged "you are a fresh device" state cannot re-open the
 // bootstrap channels for a device the panel already trusts.
-func (s *TokenStore) MarkApproved(fingerprint string) {
+func (s *TokenStore) MarkApproved(fingerprint string) error {
 	if fingerprint == "" {
-		return
+		return nil
 	}
-	_ = privatefile.Write(s.approvedPath(), []byte(fingerprint))
+	return privatefile.Write(s.approvedPath(), []byte(fingerprint))
 }
 
 // EverApproved reports whether an approval verdict ever arrived over a
 // trusted channel (pinned HTTPS or in-band) for this device fingerprint.
 func (s *TokenStore) EverApproved(fingerprint string) bool {
 	data, err := privatefile.Read(s.approvedPath(), 256)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	return string(data) == fingerprint && fingerprint != ""
+	if err != nil {
+		// Approval state is unreadable, not evidence that this device was
+		// never approved. Fail closed instead of reopening plain bootstrap.
+		return fingerprint != ""
+	}
+	if fingerprint == "" {
+		return false
+	}
+	if string(data) == fingerprint {
+		return true
+	}
+	// A valid marker for another fingerprint is not this identity's approval.
+	// Malformed content is instead approval-unknown and closes plain bootstrap.
+	return len(data) == 0 || len(data) > 128 || !utf8.Valid(data) || bytes.ContainsAny(data, "\x00\r\n")
 }
 
 func (s *TokenStore) LoadOrCreate() (*deviceFile, error) {
@@ -127,6 +147,7 @@ func (s *TokenStore) LoadOrCreate() (*deviceFile, error) {
 	df := &deviceFile{
 		Token:      base64.RawURLEncoding.EncodeToString(tok),
 		DeviceName: hostname(),
+		Created:    true,
 	}
 	if s.Scope != "" {
 		// An independent random enrollment fingerprint avoids sharing the

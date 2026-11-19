@@ -41,6 +41,17 @@ func TestCoordinatedReleaseInventoryRequiresEveryPayloadAndExactPlatform(t *test
 	}
 }
 
+func TestOffRecipeClientARM64Rejected(t *testing.T) {
+	if _, _, ok := ReleaseArtifactPolicy("otu-client-linux-arm64"); ok {
+		t.Fatal("off-recipe ARM64 client admitted by payload policy")
+	}
+	b := syntheticBundle(time.Now())
+	b.Artifacts = append(b.Artifacts, ReleaseArtifact{Name: "otu-client-linux-arm64", Platform: "linux/arm64", SHA256: strings.Repeat("a", 64), Bytes: 4096})
+	if err := ValidateCoordinatedReleaseInventory(b); err == nil {
+		t.Fatal("off-recipe ARM64 client accepted by coordinated inventory")
+	}
+}
+
 func TestReleaseBundleRequiresExplicitSignedZeroFieldsAndCheckedVersionOrder(t *testing.T) {
 	b := syntheticBundle(time.Now())
 	raw, err := json.Marshal(b)

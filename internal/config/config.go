@@ -119,7 +119,7 @@ type ClientConf struct {
 	Fingerprints            []string       `toml:"fingerprints"`
 	Insecure                bool           `toml:"insecure"` // dev only
 	WSPath                  string         `toml:"ws_path"`
-	Transport               string         `toml:"transport"`      // wstls (default) | ssh
+	Transport               string         `toml:"transport"`      // wstls (default) | h3 | ssh | carrier
 	CarrierSOCKS            string         `toml:"carrier_socks"`  // external managed companion, loopback only
 	CarrierTarget           string         `toml:"carrier_target"` // fixed remote loopback ingress
 	Reality                 *RealityClient `toml:"reality"`
@@ -224,15 +224,14 @@ func (c *ClientConf) SSHHostOnly() string {
 	return c.ServerAddr
 }
 
-// TransportKind returns "wstls" unless explicitly set to "ssh".
+// TransportKind returns "wstls" unless a supported transport is explicit.
 func (c *ClientConf) TransportKind() string {
-	if c.Transport == "carrier" {
-		return "carrier"
+	switch c.Transport {
+	case "carrier", "ssh", "h3":
+		return c.Transport
+	default:
+		return "wstls"
 	}
-	if c.Transport == "ssh" {
-		return "ssh"
-	}
-	return "wstls"
 }
 
 // MuxEnabled reports the effective multiplexing setting (default true).
@@ -468,7 +467,7 @@ func LoadClient(path string) (*ClientConf, error) {
 		return nil, fmt.Errorf("config: SOCKS and HTTP listeners must use different ports")
 	}
 	switch c.Transport {
-	case "", "wstls", "ssh", "carrier":
+	case "", "wstls", "h3", "ssh", "carrier":
 	default:
 		return nil, fmt.Errorf("config: unknown transport %q", c.Transport)
 	}

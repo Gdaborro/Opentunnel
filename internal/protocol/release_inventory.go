@@ -12,6 +12,11 @@ const MaxReleaseInventoryBytes int64 = 768 << 20
 // Publication helpers and the private broker must use this same narrow payload
 // contract. Public signature/root envelopes are separate, not circular payloads.
 func ReleaseArtifactPolicy(name string) (platform string, maximum int64, allowed bool) {
+	if name == "otu-client-linux-arm64" {
+		// The fixed recipe deliberately has no ARM64 client target. Do not let
+		// a manually supplied executable bypass that reviewed build contract.
+		return "", 0, false
+	}
 	if name == "otu-client-generic-windows-amd64.exe" {
 		return "windows/amd64", 64 << 20, true
 	}

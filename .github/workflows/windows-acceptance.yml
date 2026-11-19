@@ -29,6 +29,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          git config core.autocrlf false
+          git config core.eol lf
+          git checkout-index --force --all
+          if ($LASTEXITCODE -ne 0) { throw 'unfiltered source checkout failed' }
           $env:CGO_ENABLED = '0'
           $builder = Join-Path $env:RUNNER_TEMP 'otu-buildcandidate.exe'
           go build -buildvcs=false -trimpath -o $builder ./tools/buildcandidate

@@ -367,7 +367,7 @@ func defaultFactory(a *Adaptive, idx int) *Client {
 	if idx < len(profileOrder) {
 		opts.Profile = name // fast/balanced/stealth must actually shape differently
 	}
-	if name == H3TierName {
+	if tr.Name() == H3TierName {
 		opts.MuxByteCap = h3MuxByteCap
 	}
 	if tr.Name() == SshTierName {

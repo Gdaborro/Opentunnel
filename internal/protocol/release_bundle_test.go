@@ -41,6 +41,29 @@ func TestReleaseBundleBindsAllArtifactsSourceChannelAndCohort(t *testing.T) {
 	}
 }
 
+func TestReleaseRootRotationRejectsExpiredPredecessor(t *testing.T) {
+	now := time.Now()
+	oldPub, oldKey, _ := ed25519.GenerateKey(rand.Reader)
+	newPub, newKey, _ := ed25519.GenerateKey(rand.Reader)
+	old := ReleaseRoot{Version: 1, Keys: []string{base64.StdEncoding.EncodeToString(oldPub)}, Threshold: 1, IssuedAt: now.Add(-time.Hour).Unix(), ExpiresAt: now.Add(time.Hour).Unix()}
+	rotate := func(issued int64) []byte {
+		root := ReleaseRoot{Version: 2, Keys: []string{base64.StdEncoding.EncodeToString(newPub)}, Threshold: 1, IssuedAt: issued, ExpiresAt: issued + 3600}
+		msg, _ := ReleaseRootMessage(root)
+		rotation := RootRotation{Root: root, Signatures: []RootSignature{
+			{KeyID: ReleaseKeyID(newPub), Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(newKey, msg))},
+			{KeyID: ReleaseKeyID(oldPub), Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(oldKey, msg))},
+		}}
+		raw, _ := json.Marshal(rotation)
+		return raw
+	}
+	if _, err := VerifyRootRotation(rotate(old.ExpiresAt-1), old, time.Unix(old.ExpiresAt-1, 0)); err != nil {
+		t.Fatal("rotation issued before predecessor expiry was refused", err)
+	}
+	if _, err := VerifyRootRotation(rotate(old.ExpiresAt), old, time.Unix(old.ExpiresAt, 0)); err == nil {
+		t.Fatal("rotation issued at predecessor expiry was accepted")
+	}
+}
+
 func TestReleaseRootRotationNeedsOldAndNewDistinctThresholdSignatures(t *testing.T) {
 	now := time.Now()
 	oldPub, oldKey, _ := ed25519.GenerateKey(rand.Reader)

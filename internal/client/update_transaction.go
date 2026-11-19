@@ -196,6 +196,14 @@ func RunUpdateHelper(args []string) (bool, error) {
 	if len(args) != 2 {
 		return true, errors.New("invalid update helper arguments")
 	}
+	store, err := NewTokenStore()
+	if err != nil {
+		return true, err
+	}
+	expectedJournal := filepath.Join(store.Dir, "updates", updateJournalName)
+	if !sameExecutablePath(args[1], expectedJournal) {
+		return true, errors.New("update helper journal must be the exact private install transaction; no lock or directory state was changed")
+	}
 	unlock, err := privatefile.TryLock(filepath.Join(filepath.Dir(args[1]), "update-supervision.lock"))
 	if err != nil {
 		return true, ErrUpdateInProgress
@@ -432,6 +440,34 @@ func fileDigest(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func copyUpdateExecutable(source, destination, expectedSHA256 string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(output, io.LimitReader(input, 64<<20+1))
+	if copyErr == nil {
+		copyErr = output.Sync()
+	}
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	digest, err := fileDigest(destination)
+	if err != nil || !strings.EqualFold(digest, expectedSHA256) {
+		return errors.New("restored executable copy failed digest verification")
+	}
+	return nil
+}
+
 // waitReplacementReady accepts a private per-transaction token written only
 // after local listeners, settings journal and companions initialize, then
 // checks a short stability window. A process Start success is not readiness.
@@ -508,8 +544,22 @@ func RecoverPendingUpdate() (restarted bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	if !sameExecutablePath(exe, tx.Executable) {
-		return false, errors.New("pending update belongs to a different install; journal retained")
+	targetExists := true
+	if _, err := os.Lstat(tx.Executable); errors.Is(err, os.ErrNotExist) {
+		targetExists = false
+	} else if err != nil {
+		return false, err
+	}
+	if targetExists {
+		if !sameExecutablePath(exe, tx.Executable) {
+			return false, errors.New("pending update belongs to a different install; journal retained")
+		}
+	} else if !sameExecutablePath(exe, tx.Staged) && !sameExecutablePath(exe, tx.Backup) {
+		return false, errors.New("missing install requires recovery from its staged or backup image; journal retained")
+	} else if sameExecutablePath(exe, tx.Staged) {
+		if err := verifyStagedUpdate(tx); err != nil {
+			return false, err
+		}
 	}
 	if alive, err := anotherUpdateImageAlive(tx.Executable, tx.Backup, tx.Staged); err != nil {
 		return false, err
@@ -548,7 +598,7 @@ func RecoverPendingUpdate() (restarted bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	if strings.EqualFold(current, tx.PreviousSHA256) {
+	if targetExists && strings.EqualFold(current, tx.PreviousSHA256) {
 		if err := os.Remove(journal); err != nil {
 			return false, err
 		}
@@ -559,21 +609,34 @@ func RecoverPendingUpdate() (restarted bool, err error) {
 	if err != nil || !strings.EqualFold(backup, tx.PreviousSHA256) {
 		return false, errors.New("pending update has no verified rollback executable; manual recovery required")
 	}
-	failed := tx.Executable + ".failed-" + fmt.Sprint(time.Now().UnixNano())
-	if err := moveUpdateNoReplace(exe, failed); err != nil {
+	failed := ""
+	if targetExists {
+		failed = tx.Executable + ".failed-" + fmt.Sprint(time.Now().UnixNano())
+		if err := moveUpdateNoReplace(tx.Executable, failed); err != nil {
+			return false, err
+		}
+	}
+	restored := tx.Executable + ".restore-" + fmt.Sprint(time.Now().UnixNano())
+	if err := copyUpdateExecutable(tx.Backup, restored, tx.PreviousSHA256); err != nil {
+		if failed != "" {
+			return false, errors.Join(err, moveUpdateNoReplace(failed, tx.Executable))
+		}
 		return false, err
 	}
-	if err := moveUpdateNoReplace(tx.Backup, exe); err != nil {
-		return false, errors.Join(err, moveUpdateNoReplace(failed, exe))
+	if err := moveUpdateNoReplace(restored, tx.Executable); err != nil {
+		if failed != "" {
+			return false, errors.Join(err, moveUpdateNoReplace(failed, tx.Executable))
+		}
+		return false, err
 	}
-	if restored, err := fileDigest(exe); err != nil || !strings.EqualFold(restored, tx.PreviousSHA256) {
+	if restored, err := fileDigest(tx.Executable); err != nil || !strings.EqualFold(restored, tx.PreviousSHA256) {
 		return false, errors.New("restored executable did not match the verified rollback digest; journal retained")
 	}
 	_ = os.Remove(tx.ReadyFile)
 	if err := os.Remove(journal); err != nil {
 		return false, err
 	}
-	cmd := exec.Command(exe, tx.Args...)
+	cmd := exec.Command(tx.Executable, tx.Args...)
 	prepareUpdateHelper(cmd)
 	cmd.Env = append(withoutUpdateEnvironment(os.Environ()), "OTU_UPDATE_PARENT_PID="+fmt.Sprint(os.Getpid()))
 	if err := cmd.Start(); err != nil {
