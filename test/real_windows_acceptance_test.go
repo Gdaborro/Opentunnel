@@ -331,7 +331,7 @@ func verifyRealClientTransfer(t *testing.T, process *realClientProcess, proxyAdd
 		t.Fatalf("real proxy payload mismatch: got=%d want=%d err=%v", len(body), len(bulk), err)
 	}
 	var used int64
-	if err := db.QueryRow(`SELECT used_bytes FROM peers`).Scan(&used); err != nil {
+	if err := db.QueryRow(`SELECT bytes_up+bytes_down FROM peers`).Scan(&used); err != nil {
 		t.Fatal(err)
 	}
 	if used < int64(len(bulk)) {
@@ -397,8 +397,8 @@ func TestRealWindowsProxyReadOnlyACLDoesNotPartiallyApply(t *testing.T) {
 	defer restoreRealRegistry(t, original)
 	binary, config, _, _ := realAcceptanceConfig(t, "real-windows-acl")
 	backup := filepath.Join(t.TempDir(), "acl.sddl")
-	setReadOnly := `$p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $a=Get-Acl $p; $a.GetSecurityDescriptorSddlForm('All') | Set-Content -LiteralPath $env:OTU_ACL_BACKUP -Encoding ascii; $a.SetAccessRuleProtection($true,$false); $u=[Security.Principal.WindowsIdentity]::GetCurrent().Name; $r=New-Object Security.AccessControl.RegistryAccessRule($u,'ReadKey','Allow'); $a.AddAccessRule($r); Set-Acl $p $a`
-	restoreACL := `$p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $a=Get-Acl $p; $a.SetSecurityDescriptorSddlForm((Get-Content -LiteralPath $env:OTU_ACL_BACKUP -Raw),'All'); Set-Acl $p $a`
+	setReadOnly := `Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; $p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $a=Get-Acl $p; $a.GetSecurityDescriptorSddlForm('All') | Set-Content -LiteralPath $env:OTU_ACL_BACKUP -Encoding ascii; $a.SetAccessRuleProtection($true,$false); $u=[Security.Principal.WindowsIdentity]::GetCurrent().Name; $r=New-Object Security.AccessControl.RegistryAccessRule($u,'ReadKey','Allow'); $a.AddAccessRule($r); Set-Acl $p $a`
+	restoreACL := `Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; $p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $a=Get-Acl $p; $a.SetSecurityDescriptorSddlForm((Get-Content -LiteralPath $env:OTU_ACL_BACKUP -Raw),'All'); Set-Acl $p $a`
 	t.Setenv("OTU_ACL_BACKUP", backup)
 	if output, err := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-Command", setReadOnly).CombinedOutput(); err != nil {
 		t.Fatal("apply disposable registry ACL", err, string(output))
