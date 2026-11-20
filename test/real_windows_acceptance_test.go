@@ -403,7 +403,9 @@ func setWinINETReadOnlyACL(t *testing.T) string {
 	if err != nil {
 		t.Fatal("resolve current user SID", err)
 	}
-	readOnly, err := windows.SecurityDescriptorFromString("D:P(A;;0x00020019;;;" + user.User.Sid.String() + ")")
+	// KEY_READ remains permitted and KEY_SET_VALUE is denied. WRITE_DAC is
+	// included only so the test can restore the original descriptor afterward.
+	readOnly, err := windows.SecurityDescriptorFromString("D:P(A;;0x00060019;;;" + user.User.Sid.String() + ")")
 	if err != nil {
 		t.Fatal("build read-only registry descriptor", err)
 	}
