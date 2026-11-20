@@ -464,7 +464,7 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	cmd.Stdout, cmd.Stderr = &output, io.Discard
 	perr := cmd.Run()
 	pcancel()
-	if perr != nil || output.overflow || strings.TrimSpace(string(output.data)) != "opentunnel client "+strings.TrimPrefix(rel.TagName, "v") {
+	if perr != nil || output.overflow || strings.TrimSpace(string(output.data)) != "opentunnel client "+rel.TagName {
 		return errors.New("auto-update: signed binary failed version preflight")
 	}
 	if err := armReplacement(ctx, exe, tmp, got); err != nil {

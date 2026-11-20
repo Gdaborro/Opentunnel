@@ -284,7 +284,11 @@ func restoreWithRetry(mgr *netenv.Manager, from string) error {
 }
 
 func clientVersionText() string {
-	text := "opentunnel client " + version.Version
+	display := version.Version
+	if !strings.HasPrefix(display, "v") {
+		display = "v" + display
+	}
+	text := "opentunnel client " + display
 	if version.LocalPreview != "" {
 		text += " (UNRELEASED local preview " + version.LocalPreview + "; edition=" + version.ClientEdition + ")"
 	}

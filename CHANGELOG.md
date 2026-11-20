@@ -5,6 +5,9 @@
 - Add explicit `transport = "h3"` selection using the existing pinned HTTP/3
   transport and stream-rotation bounds. UDP-blocked networks still fail over to
   WS-TLS/SSH rather than weakening certificate or host-key checks.
+- Keep the canonical `v` tag in the client's `--version` output and signed-update
+  preflight so both v1.1.10 and newer clients accept a correctly stamped upgrade.
+  Server/panel display versions remain unprefixed.
 - Fix signed-update display-version preflight, restrict the update helper to the
   exact private journal before any ACL/lock work, and recover the crash window
   where the old executable was moved but the staged one was not installed.
