@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { api, type ServerHealth } from "@/lib/api"
+import { api, type ServerHealth, type SettingsPolicy } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -13,17 +13,7 @@ import { Separator } from "@/components/ui/separator"
 import { Badge } from "@/components/ui/badge"
 import { PowerIcon, ShieldAlertIcon, InfoIcon, GaugeIcon } from "lucide-react"
 import { formatDuration } from "@/lib/format"
-
-type KillDetail = {
-  kill_switch_reason?: string
-  kill_switch_allow?: string[]
-}
-
-type SshTierDetail = {
-  ssh_tier_max_bps?: number
-  ssh_tier_daily_mb?: number
-  ssh_tier_trickle_kbps?: number
-}
+import { HardeningControls } from "@/components/hardening-controls"
 
 export function SystemPage() {
   const [kill, setKill] = useState(false)
@@ -39,58 +29,69 @@ export function SystemPage() {
   const [sshDailyMB, setSshDailyMB] = useState("0")
   const [sshTrickleKbps, setSshTrickleKbps] = useState("0")
   const [sshSaved, setSshSaved] = useState("")
+  const [policyMessage, setPolicyMessage] = useState("")
+
+  const applySettings = useCallback((s: SettingsPolicy) => {
+    setKill(s.kill_switch)
+    setReason(s.kill_switch_reason)
+    setAllow(s.kill_switch_allow.join("\n"))
+    const mbps = (s.ssh_tier_max_bps * 8) / 1e6
+    setSshMaxMbps(String(mbps))
+    setSshDailyMB(String(s.ssh_tier_daily_mb))
+    setSshTrickleKbps(String(s.ssh_tier_trickle_kbps))
+    setLoaded(true)
+  }, [])
 
   const load = useCallback(() => {
     api
       .settings()
-      .then((s) => {
-        setKill(s.kill_switch)
-        const d = s as KillDetail
-        setReason(d.kill_switch_reason ?? "")
-        setAllow((d.kill_switch_allow ?? []).join("\n"))
-        const t = s as SshTierDetail
-        const mbps = ((t.ssh_tier_max_bps ?? 0) * 8) / 1e6
-        setSshMaxMbps(mbps ? String(+mbps.toFixed(3)) : "0")
-        setSshDailyMB(String(t.ssh_tier_daily_mb ?? 0))
-        setSshTrickleKbps(String(t.ssh_tier_trickle_kbps ?? 0))
-        setLoaded(true)
+      .then((value) => {
+        applySettings(value)
+        setPolicyMessage("")
       })
-      .catch(() => setLoaded(false))
-    api.serverHealth().then(setHealth).catch(() => {})
-    fetch("/admin/api/devices")
-      .then((r) => r.json())
-      .then((list) => setDevices(list || []))
-      .catch(() => {})
-  }, [])
+      .catch(() => {
+        setLoaded(false)
+        setPolicyMessage("Policy status unavailable. No defaults were substituted; refresh before editing.")
+      })
+    api.serverHealth().then(setHealth).catch(() => setHealth(null))
+    api.devices().then(setDevices).catch(() => setDevices([]))
+  }, [applySettings])
   useEffect(load, [load])
 
-  const toggleKill = (on: boolean) => {
-    if (toggleBusy) return
+  const toggleKill = async (on: boolean) => {
+    if (toggleBusy || !loaded) return
     setToggleBusy(true)
-    setKill(on)
-    api.setKillSwitch(on)
-      .catch(() => setKill(!on))
-      .finally(() => setToggleBusy(false))
+    setPolicyMessage("")
+    try {
+      await api.setKillSwitch(on)
+      const verified = await api.settings()
+      if (verified.kill_switch !== on) throw new Error("concurrent policy change")
+      setKill(verified.kill_switch)
+      setPolicyMessage("Kill-switch state committed and read back. Relay policy refresh still applies.")
+    } catch {
+      setLoaded(false)
+      setPolicyMessage("Kill-switch update or read-back failed. State is unconfirmed; refresh before retrying.")
+    } finally { setToggleBusy(false) }
   }
 
-  const saveKillDetail = () => {
-    fetch("/admin/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        kill_switch_reason: reason,
-        kill_switch_allow: allow.split("\n").map((t) => t.trim()).filter(Boolean),
-      }),
-    })
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        setSaved("saved")
-        // Preserve a concurrent administrator toggle, and refresh its displayed
-        // state after saving details instead of keeping a stale switch value.
-        api.settings().then((s) => setKill(s.kill_switch)).catch(() => setLoaded(false))
-        setTimeout(() => setSaved(""), 3000)
-      })
-      .catch((e) => setSaved(`save failed: ${e.message}`))
+  const saveKillDetail = async () => {
+    if (toggleBusy || !loaded) return
+    const requestedAllow = [...new Set(allow.split("\n").map((t) => t.trim()).filter(Boolean))].sort()
+    const requestedReason = reason.trim()
+    setToggleBusy(true)
+    setSaved("")
+    try {
+      await api.setSettings({ kill_switch_reason: requestedReason, kill_switch_allow: requestedAllow })
+      const verified = await api.settings()
+      if (verified.kill_switch_reason !== requestedReason || JSON.stringify([...verified.kill_switch_allow].sort()) !== JSON.stringify(requestedAllow)) throw new Error("concurrent policy change")
+      setKill(verified.kill_switch)
+      setReason(verified.kill_switch_reason)
+      setAllow(verified.kill_switch_allow.join("\n"))
+      setSaved("Saved and verified; a concurrent kill-switch toggle was preserved.")
+    } catch {
+      setLoaded(false)
+      setSaved("Save or read-back failed. Policy state is unconfirmed; refresh before retrying.")
+    } finally { setToggleBusy(false) }
   }
 
   const addAllowed = (token: string) => {
@@ -98,26 +99,43 @@ export function SystemPage() {
     if (!cur.includes(token)) setAllow([...cur, token].join("\n"))
   }
 
-  const saveSshTier = () => {
-    fetch("/admin/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ssh_tier_max_bps: Math.max(0, Math.round((parseFloat(sshMaxMbps) || 0) * 1e6 / 8)),
-        ssh_tier_daily_mb: Math.max(0, Math.round(parseFloat(sshDailyMB) || 0)),
-        ssh_tier_trickle_kbps: Math.max(0, Math.round(parseFloat(sshTrickleKbps) || 0)),
-      }),
-    })
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        setSshSaved("saved")
-        setTimeout(() => setSshSaved(""), 3000)
-      })
-      .catch((e) => setSshSaved(`save failed: ${e.message}`))
+  const saveSshTier = async () => {
+    if (toggleBusy || !loaded) return
+    const values = [sshMaxMbps, sshDailyMB, sshTrickleKbps]
+    if (values.some((value) => !value.trim() || !Number.isFinite(Number(value)) || Number(value) < 0)) {
+      setSshSaved("Enter explicit nonnegative numbers. Invalid or empty fields are not treated as zero.")
+      return
+    }
+    const requested = {
+      ssh_tier_max_bps: Math.round(Number(sshMaxMbps) * 1e6 / 8),
+      ssh_tier_daily_mb: Math.round(Number(sshDailyMB)),
+      ssh_tier_trickle_kbps: Math.round(Number(sshTrickleKbps)),
+    }
+    if (Object.values(requested).some((value) => !Number.isSafeInteger(value))) {
+      setSshSaved("Containment values are outside safe numeric limits.")
+      return
+    }
+    setToggleBusy(true)
+    setSshSaved("")
+    try {
+      await api.setSettings(requested)
+      const verified = await api.settings()
+      if (verified.ssh_tier_max_bps !== requested.ssh_tier_max_bps || verified.ssh_tier_daily_mb !== requested.ssh_tier_daily_mb || verified.ssh_tier_trickle_kbps !== requested.ssh_tier_trickle_kbps) throw new Error("concurrent policy change")
+      setKill(verified.kill_switch)
+      setSshSaved("Containment policy saved and verified.")
+    } catch {
+      setLoaded(false)
+      setSshSaved("Save or read-back failed. Containment state is unconfirmed; refresh before retrying.")
+    } finally { setToggleBusy(false) }
   }
 
   return (
     <div className="space-y-4">
+      <HardeningControls />
+      <div className="flex flex-wrap items-center gap-3">
+        <Button variant="outline" disabled={toggleBusy} onClick={load}>Refresh system policy</Button>
+        <p role="status" aria-live="polite" className="text-sm">{policyMessage}</p>
+      </div>
       <Card className="border-destructive/30">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-sm">
@@ -147,6 +165,7 @@ export function SystemPage() {
             <textarea
               id="kill-reason"
               maxLength={500}
+              disabled={!loaded || toggleBusy}
               className="min-h-14 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
               placeholder="Shut down till further notice"
               value={reason}
@@ -157,6 +176,7 @@ export function SystemPage() {
             <label htmlFor="kill-allowlist" className="font-medium">Allowed devices keep browsing (one token per line)</label>
             <textarea
               id="kill-allowlist"
+              disabled={!loaded || toggleBusy}
               className="min-h-11 w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
               value={allow}
               onChange={(e) => setAllow(e.target.value)}
@@ -169,6 +189,7 @@ export function SystemPage() {
                   key={d.token}
                   variant="outline"
                   size="sm"
+                  disabled={!loaded || toggleBusy}
                   onClick={() => addAllowed(d.token)}
                   title={d.token}
                 >
@@ -179,7 +200,7 @@ export function SystemPage() {
           )}
           <div className="flex items-center gap-3">
             <Button disabled={!loaded || toggleBusy} onClick={saveKillDetail}>Save reason + allowlist</Button>
-            <span className="text-xs text-muted-foreground">{saved}</span>
+            <span role="status" aria-live="polite" className="text-xs text-muted-foreground">{saved}</span>
           </div>
         </CardContent>
       </Card>
@@ -204,6 +225,9 @@ export function SystemPage() {
               <input
                 type="number"
                 min={0}
+                step="any"
+                aria-label="SSH sustained cap in Mbps"
+                disabled={!loaded || toggleBusy}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                 value={sshMaxMbps}
                 onChange={(e) => setSshMaxMbps(e.target.value)}
@@ -217,6 +241,8 @@ export function SystemPage() {
               <input
                 type="number"
                 min={0}
+                aria-label="SSH daily budget in MB"
+                disabled={!loaded || toggleBusy}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                 value={sshDailyMB}
                 onChange={(e) => setSshDailyMB(e.target.value)}
@@ -230,6 +256,8 @@ export function SystemPage() {
               <input
                 type="number"
                 min={0}
+                aria-label="SSH post-budget rate in kbps"
+                disabled={!loaded || toggleBusy}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                 value={sshTrickleKbps}
                 onChange={(e) => setSshTrickleKbps(e.target.value)}
@@ -240,8 +268,8 @@ export function SystemPage() {
             </label>
           </div>
           <div className="flex items-center gap-3">
-            <Button disabled={!loaded} onClick={saveSshTier}>Save containment policy</Button>
-            <span className="text-xs text-muted-foreground">{sshSaved}</span>
+            <Button disabled={!loaded || toggleBusy} onClick={saveSshTier}>Save containment policy</Button>
+            <span role="status" aria-live="polite" className="text-xs text-muted-foreground">{sshSaved}</span>
           </div>
         </CardContent>
       </Card>

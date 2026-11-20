@@ -22,12 +22,16 @@ type DirectDialer struct {
 	Inner Dialer
 	// Hosts are the lowercase hostnames (no port) that dial direct —
 	// typically the entry hostname, every fallback entry, and the ssh host.
-	Hosts map[string]bool
+	Hosts    map[string]bool
+	OnDirect func() // status-only count; never logs target names or payloads
 }
 
 // DialTunnel implements Dialer.
 func (d *DirectDialer) DialTunnel(ctx context.Context, target *protocol.Address) (net.Conn, error) {
 	if d.isDirect(target) {
+		if d.OnDirect != nil {
+			d.OnDirect()
+		}
 		var zero net.Dialer
 		return zero.DialContext(ctx, "tcp", target.HostPort())
 	}

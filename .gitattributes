@@ -1,3 +1,4 @@
+.gitattributes text eol=lf
 *.go text eol=lf
 *.sh text eol=lf
 *.service text eol=lf

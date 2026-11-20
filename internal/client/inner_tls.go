@@ -53,6 +53,8 @@ func (t *innerTransport) Dial(ctx context.Context) (net.Conn, error) {
 }
 
 func (t *innerTransport) DialSetup(setup, lifetime context.Context) (net.Conn, error) {
+	dctx, cancel := context.WithTimeout(setup, 15*time.Second)
+	defer cancel()
 	store, err := NewPoolTokenStore(t.scope)
 	if err != nil {
 		return nil, err
@@ -85,22 +87,25 @@ func (t *innerTransport) DialSetup(setup, lifetime context.Context) (net.Conn, e
 	if err != nil {
 		return nil, err
 	}
-	var raw net.Conn
-	if dialer, ok := t.Transport.(interface {
-		DialSetup(context.Context, context.Context) (net.Conn, error)
-	}); ok {
-		raw, err = dialer.DialSetup(setup, lifetime)
-	} else {
-		raw, err = t.Transport.Dial(lifetime)
-	}
+	raw, cancelCarrier, err := dialSetupCarrier(t.Transport, dctx, lifetime)
 	if err != nil {
 		return nil, err
 	}
-	dctx, cancel := context.WithTimeout(setup, 15*time.Second)
-	defer cancel()
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			cancelCarrier()
+			transport.AbortSetup(raw)
+		}
+	}()
+	// Keep the carrier-owned cancellation with its returned connection. TLS
+	// closes this wrapper after successful setup; setup cancellation stays local.
+	raw = &innerCarrierConn{Conn: raw, cancel: cancelCarrier}
 	stop := context.AfterFunc(dctx, func() { transport.AbortSetup(raw) })
 	defer stop()
-	_ = raw.SetDeadline(time.Now().Add(15 * time.Second))
+	if deadline, ok := dctx.Deadline(); ok {
+		_ = raw.SetDeadline(deadline)
+	}
 	if n, err := raw.Write(protocol.InnerTLSMarker[:]); err != nil || n != 4 {
 		transport.AbortSetup(raw)
 		return nil, errors.New("inner TLS marker write failed")
@@ -109,6 +114,10 @@ func (t *innerTransport) DialSetup(setup, lifetime context.Context) (net.Conn, e
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if cs.Version != tls.VersionTLS13 || cs.NegotiatedProtocol != protocol.InnerTLSALPN || len(cs.PeerCertificates) == 0 {
 				return errors.New("inner TLS negotiation failed")
+			}
+			cert := cs.PeerCertificates[0]
+			if now := time.Now(); now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
+				return errors.New("inner TLS relay identity expired or not yet valid")
 			}
 			got, err := protocol.ParsePublicKeyPin(protocol.PublicKeyPin(cs.PeerCertificates[0]))
 			if err != nil {
@@ -144,5 +153,23 @@ func (t *innerTransport) DialSetup(setup, lifetime context.Context) (net.Conn, e
 		return nil, errors.New("inner TLS setup cancellation raced readiness")
 	}
 	_ = conn.SetDeadline(time.Time{})
+	succeeded = true
 	return conn, nil
+}
+
+type innerCarrierConn struct {
+	net.Conn
+	cancel context.CancelFunc
+}
+
+func (c *innerCarrierConn) Close() error {
+	err := c.Conn.Close()
+	c.cancel()
+	return err
+}
+
+func (c *innerCarrierConn) CloseNow() error {
+	transport.AbortSetup(c.Conn)
+	c.cancel()
+	return nil
 }

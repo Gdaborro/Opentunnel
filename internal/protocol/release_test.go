@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,37 @@ func TestReleaseFreshnessExpiryAndPlatformBinding(t *testing.T) {
 	changed, _ = json.Marshal(m)
 	if _, err := VerifyReleaseManifest(changed, ed25519.Sign(key, ReleaseManifestMessage(changed)), pub, now); err == nil {
 		t.Fatal("unbounded freshness window accepted")
+	}
+}
+
+func TestReleaseFreshnessRejectsMissingAndOverflowingIssuance(t *testing.T) {
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	base := ReleaseManifest{Version: 1, Tag: "v1.1.11", Platform: "windows/amd64", Asset: "otu-client-windows-amd64.exe", SHA256: strings.Repeat("a", 64), Bytes: 4096, IssuedAt: now.Unix() - 1, ExpiresAt: now.Add(time.Hour).Unix()}
+	for _, tc := range []struct {
+		name string
+		edit func(*ReleaseManifest)
+	}{
+		{"zero", func(m *ReleaseManifest) { m.IssuedAt = 0 }},
+		{"negative", func(m *ReleaseManifest) { m.IssuedAt = -1 }},
+		{"overflow", func(m *ReleaseManifest) { m.IssuedAt = math.MinInt64; m.ExpiresAt = math.MaxInt64 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base
+			tc.edit(&m)
+			raw, _ := json.Marshal(m)
+			if _, err := VerifyReleaseManifest(raw, ed25519.Sign(key, ReleaseManifestMessage(raw)), pub, now); err == nil {
+				t.Fatal("malformed issuance window accepted")
+			}
+		})
+	}
+	var fields map[string]any
+	raw, _ := json.Marshal(base)
+	_ = json.Unmarshal(raw, &fields)
+	delete(fields, "issued_at")
+	omitted, _ := json.Marshal(fields)
+	if _, err := VerifyReleaseManifest(omitted, ed25519.Sign(key, ReleaseManifestMessage(omitted)), pub, now); err == nil {
+		t.Fatal("omitted issuance time accepted")
 	}
 }
 

@@ -1,7 +1,10 @@
 package panel
 
 import (
+	"context"
+	"errors"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,56 +50,110 @@ func CategoryNames() []string {
 	return []string{"social", "streaming", "adult", "ads", "gambling", "extensions"}
 }
 
-// blockCache caches the blocklist + enabled-category suffixes so IsBlocked
-// (called per stream) does not hit SQLite every time.
+// blockCache holds only complete filtering snapshots. An error is cached as
+// an explicit denial, not as an empty or partially loaded policy.
 type blockCache struct {
-	mu       sync.Mutex
-	suffixes []string
-	loaded   time.Time
+	mu     sync.Mutex
+	loaded time.Time
+	err    error
+	rules  []blockRule
 }
+
+type blockRule struct{ domain, reason string }
+
+const maxBlockRules = 4096
 
 const blockCacheTTL = 3 * time.Second
 
 // blockedSuffixes returns all blocked suffixes: explicit blocklist entries
 // plus domains from enabled categories.
-func (db *DB) blockedSuffixes() []string {
+func (db *DB) blockedRules() ([]blockRule, error) {
+	if db == nil || db.DB == nil {
+		return nil, errors.New("filtering policy unavailable")
+	}
 	db.block.mu.Lock()
 	defer db.block.mu.Unlock()
-	if time.Since(db.block.loaded) < blockCacheTTL && db.block.suffixes != nil {
-		return db.block.suffixes
+	if !db.block.loaded.IsZero() && time.Since(db.block.loaded) < blockCacheTTL {
+		return db.block.rules, db.block.err
 	}
-	out := []string{}
-	rows, err := db.Query(`SELECT domain FROM blocklist`)
-	if err == nil {
-		for rows.Next() {
-			var d string
-			if rows.Scan(&d) == nil {
-				if d = strings.ToLower(strings.TrimSpace(d)); d != "" {
-					out = append(out, d)
-				}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SELECT 'domain',domain,COALESCE(reason,''),0 FROM blocklist
+		UNION ALL SELECT 'category',category,'',enabled FROM blocked_categories LIMIT ?`, maxBlockRules+65)
+	if err != nil {
+		db.block.err = err
+		db.block.loaded = time.Now()
+		return nil, err
+	}
+	defer rows.Close()
+	out := []blockRule{}
+	domainCount, categoryCount := 0, 0
+	for rows.Next() {
+		var kind, name, reason string
+		var enabled int
+		if err = rows.Scan(&kind, &name, &reason, &enabled); err != nil {
+			break
+		}
+		if kind == "category" {
+			categoryCount++
+			list, exists := categoryLists[name]
+			if !exists || categoryCount > 64 || (enabled != 0 && enabled != 1) {
+				err = errors.New("invalid filtering category state")
+				break
 			}
-		}
-		rows.Close()
-	}
-	enabled := map[string]bool{}
-	rows, err = db.Query(`SELECT category FROM blocked_categories WHERE enabled=1`)
-	if err == nil {
-		for rows.Next() {
-			var c string
-			if rows.Scan(&c) == nil {
-				enabled[c] = true
+			if enabled == 0 {
+				continue
 			}
+			for _, domain := range list {
+				out = append(out, blockRule{domain: domain, reason: name + " category"})
+			}
+		} else {
+			domainCount++
+			if domainCount > maxBlockRules {
+				err = errors.New("filtering policy capacity exceeded")
+				break
+			}
+			name = strings.ToLower(strings.TrimSpace(name))
+			if !validBlockDomain(name) || len(reason) > 500 {
+				err = errors.New("invalid filtering policy row")
+				break
+			}
+			if strings.TrimSpace(reason) == "" {
+				reason = "blocklist"
+			}
+			out = append(out, blockRule{domain: name, reason: reason})
 		}
-		rows.Close()
 	}
-	for cat, list := range categoryLists {
-		if enabled[cat] {
-			out = append(out, list...)
-		}
+	if err == nil {
+		err = rows.Err()
 	}
-	db.block.suffixes = out
 	db.block.loaded = time.Now()
-	return out
+	db.block.err = err
+	if err != nil {
+		return nil, err
+	} // retain old complete rules, but never authorize using them on error
+	sort.SliceStable(out, func(i, j int) bool { return len(out[i].domain) > len(out[j].domain) })
+	db.block.rules = out
+	return out, nil
+}
+
+// CheckBlocked returns a verdict and reason from one consistent filtering
+// snapshot. Read failures are explicit; legacy bool-only callers deny too.
+func (db *DB) CheckBlocked(domain string) (bool, string, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" || len(domain) > 253 {
+		return true, "filtering target invalid", errors.New("invalid filtering target")
+	}
+	rules, err := db.blockedRules()
+	if err != nil {
+		return true, "filtering policy unavailable", err
+	}
+	for _, rule := range rules {
+		if domain == rule.domain || strings.HasSuffix(domain, "."+rule.domain) {
+			return true, rule.reason, nil
+		}
+	}
+	return false, "", nil
 }
 
 // invalidateBlockCache forces a reload on the next IsBlocked call (used
@@ -116,66 +173,43 @@ func (db *DB) BlockWhy(domain string) string {
 	if db == nil {
 		return ""
 	}
-	domain = strings.ToLower(strings.TrimSpace(domain))
-	if domain == "" {
-		return ""
-	}
-	match := func(d string) bool {
-		return domain == d || strings.HasSuffix(domain, "."+d)
-	}
-	rows, err := db.Query(`SELECT domain, reason FROM blocklist`)
-	if err == nil {
-		for rows.Next() {
-			var d, reason string
-			if rows.Scan(&d, &reason) == nil {
-				if d = strings.ToLower(strings.TrimSpace(d)); d != "" && match(d) {
-					rows.Close()
-					if reason = strings.TrimSpace(reason); reason != "" {
-						return reason
-					}
-					return "blocklist"
-				}
-			}
-		}
-		rows.Close()
-	}
-	enabled := map[string]bool{}
-	rows, err = db.Query(`SELECT category FROM blocked_categories WHERE enabled=1`)
-	if err == nil {
-		for rows.Next() {
-			var c string
-			if rows.Scan(&c) == nil {
-				enabled[c] = true
-			}
-		}
-		rows.Close()
-	}
-	for _, cat := range CategoryNames() {
-		if !enabled[cat] {
-			continue
-		}
-		for _, d := range categoryLists[cat] {
-			if match(d) {
-				return cat + " category"
-			}
-		}
-	}
-	return ""
+	_, reason, _ := db.CheckBlocked(domain)
+	return reason
 }
 
 // Categories lists all categories with their enabled state and size.
 func (db *DB) Categories() []map[string]any {
+	items, err := db.CategoriesChecked(context.Background())
+	if err != nil {
+		return nil
+	}
+	return items
+}
+
+func (db *DB) CategoriesChecked(parent context.Context) ([]map[string]any, error) {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
 	enabled := map[string]bool{}
-	rows, err := db.Query(`SELECT category, enabled FROM blocked_categories`)
-	if err == nil {
-		for rows.Next() {
-			var c string
-			var e int
-			if rows.Scan(&c, &e) == nil {
-				enabled[c] = e == 1
-			}
+	rows, err := db.QueryContext(ctx, `SELECT category,enabled FROM blocked_categories LIMIT 65`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+		var category string
+		var value int
+		if rows.Scan(&category, &value) != nil || count > 64 || (value != 0 && value != 1) {
+			return nil, errors.New("invalid filtering category state")
 		}
-		rows.Close()
+		if _, known := categoryLists[category]; !known {
+			return nil, errors.New("unknown filtering category")
+		}
+		enabled[category] = value == 1
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	out := []map[string]any{}
 	for _, name := range CategoryNames() {
@@ -185,23 +219,40 @@ func (db *DB) Categories() []map[string]any {
 			"domains":  len(categoryLists[name]),
 		})
 	}
-	return out
+	return out, nil
 }
 
 // SetCategoryEnabled toggles a built-in category block.
 func (db *DB) SetCategoryEnabled(category string, enabled bool) bool {
+	return db.SetCategoryEnabledChecked(context.Background(), category, enabled) == nil
+}
+
+func (db *DB) SetCategoryEnabledChecked(parent context.Context, category string, enabled bool) error {
 	if _, ok := categoryLists[category]; !ok {
-		return false
+		return errors.New("unknown category")
 	}
 	v := 0
 	if enabled {
 		v = 1
 	}
-	if _, err := db.Exec(`INSERT INTO blocked_categories(category,enabled) VALUES(?,?) ON CONFLICT(category) DO UPDATE SET enabled=excluded.enabled`, category, v); err != nil {
-		return false
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO blocked_categories(category,enabled) VALUES(?,?) ON CONFLICT(category) DO UPDATE SET enabled=excluded.enabled`, category, v); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(kind,detail) VALUES('category',?)`, category+" filtering policy changed"); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	db.invalidateBlockCache()
-	return true
+	return nil
 }
 
 // Setting reads a settings key ("" when unset, or when there is no DB).
@@ -401,6 +452,9 @@ func (db *DB) SetPeerLimits(token, schedule string, maxBps, quotaBytes int64) {
 // days by the reaper.
 func (db *DB) SetPeerIP(token, ip string) {
 	if db == nil || token == "" || ip == "" {
+		return
+	}
+	if !db.telemetryAllowed() {
 		return
 	}
 	// A forwarded loopback source is not a device location. Do not replace

@@ -45,6 +45,11 @@ const navMain: { title: PageKey; url: string; icon: React.ReactNode }[] = [
 
 const navSecondary = [
   {
+    title: "Privacy and retention",
+    url: "/admin/privacy",
+    icon: <ShieldIcon />,
+  },
+  {
     title: "Service Status",
     url: "/status",
     icon: <FileTextIcon />,

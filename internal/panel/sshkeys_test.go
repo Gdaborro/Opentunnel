@@ -143,7 +143,7 @@ func TestReconcileAuthorizedKeys(t *testing.T) {
 }
 
 // TestAuthorizedKeyLifecycle (1.0.1, N-11/N-12): canonical lines carry the
-// forced command, upserts are idempotent and clean junk, and revocation
+// forced command, upserts are idempotent and preserve operator work, and revocation
 // removes exactly the revoked key.
 func TestAuthorizedKeyLifecycle(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "authorized_keys")
@@ -174,7 +174,7 @@ func TestAuthorizedKeyLifecycle(t *testing.T) {
 		t.Fatalf("want 2 lines, got: %q", raw)
 	}
 
-	// A junk line introduced behind our back is dropped on the next write.
+	// Unknown operator work is preserved, not interpreted as our key.
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -187,8 +187,8 @@ func TestAuthorizedKeyLifecycle(t *testing.T) {
 		t.Fatalf("upsert with junk: changed=%v err=%v", changed, err)
 	}
 	raw, _ = os.ReadFile(path)
-	if strings.Contains(string(raw), "junk") {
-		t.Fatalf("junk line survived: %q", raw)
+	if !strings.Contains(string(raw), "not-a-key junk") {
+		t.Fatalf("unrelated operator line was discarded: %q", raw)
 	}
 
 	// N-12: revocation removes only the target key.

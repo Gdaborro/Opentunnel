@@ -24,6 +24,7 @@ import (
 	"opentunnel/internal/client"
 	"opentunnel/internal/panel"
 	"opentunnel/internal/privatefile"
+	"opentunnel/internal/protocol"
 	"opentunnel/internal/server"
 	"opentunnel/internal/serverpool"
 	"opentunnel/internal/transport"
@@ -31,6 +32,14 @@ import (
 )
 
 func TestFixtureClientTrustedPoolImportSelectionAndTraffic(t *testing.T) {
+	fixturePoolClientTraffic(t, false)
+}
+
+func TestFixtureClientChannelPoolImportSelectionAndTraffic(t *testing.T) {
+	fixturePoolClientTraffic(t, true)
+}
+
+func fixturePoolClientTraffic(t *testing.T, channelAuth bool) {
 	binary := fixtureClientBinary(t) // compile-time registry/ban adapters must be absent
 	dir := t.TempDir()
 	appData := filepath.Join(dir, "appdata")
@@ -45,21 +54,32 @@ func TestFixtureClientTrustedPoolImportSelectionAndTraffic(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	ph, err := panel.New(db, panel.NewAuth(db), false).WithServerPool(poolID, false)
+	ph, err := panel.New(db, panel.NewAuth(db), false).WithServerPoolAuthentication(poolID, false, channelAuth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := db.BindServerPool(poolID, false)
+	info, err := db.BindServerPoolAuthentication(poolID, false, channelAuth)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/api/token/", ph.Handler())
-	mux.Handle("/", server.Handler(server.Options{PanelDB: db, PoolID: poolID, AuthorityID: info.AuthorityID, WSPath: "/stream", AllowRestrictedTargets: true}))
+	options := server.Options{PanelDB: db, PoolID: poolID, AuthorityID: info.AuthorityID, WSPath: "/stream", AllowRestrictedTargets: true}
+	innerCert := innerTestCert(t)
+	if channelAuth {
+		options.InnerTLSCertificate = &innerCert
+		options.RequireInnerTLS = true
+		options.RequireChannelAuth = true
+	}
+	mux.Handle("/", server.Handler(options))
 	relay := httptest.NewTLSServer(mux)
 	defer relay.Close()
 	now := time.Now()
 	p := serverpool.Profile{Name: "Synthetic executable pool", AuthorityID: info.AuthorityID, IssuedAt: now.Add(-time.Minute).Unix(), ExpiresAt: now.Add(time.Hour).Unix(), ApprovalRequired: true, Nodes: []serverpool.Node{{ID: "entry", Name: "Entry", Address: "entry.example:443", DialAddress: relay.Listener.Addr().String(), Pins: []string{hex.EncodeToString(transport.FingerprintCert(relay.Certificate().Raw))}, WSPath: "/stream"}}}
+	if channelAuth {
+		p.RequireChannelAuth = true
+		p.Nodes[0].InnerTLSPins = []string{protocol.PublicKeyPin(innerCert.Leaf)}
+	}
 	if err := p.Sign(operator, now); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +194,13 @@ func TestFixtureClientTrustedPoolImportSelectionAndTraffic(t *testing.T) {
 	policy, err := db.AccessPolicy(device.Token)
 	if err != nil || policy.UsedBytes < int64(len(payload)) {
 		t.Fatal("fixture bypassed authority/accounting", err)
+	}
+	if channelAuth && (!policy.ChannelSeen || !policy.ChannelVerified) {
+		t.Fatal("fixture executable did not satisfy signed v6 authentication requirement")
+	}
+	status := runCommand("--status")
+	if strings.Contains(status, device.Token) || strings.Contains(status, "synthetic-default-master-not-sent") {
+		t.Fatal("read-only executable status leaked credentials")
 	}
 	for _, name := range []string{"device.json", "device_ssh", "ban.json", "pins.json", "ssh_host"} {
 		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {

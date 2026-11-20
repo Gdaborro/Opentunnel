@@ -27,14 +27,15 @@ export function NavMain({
           {items.map((item) => (
             <SidebarMenuItem key={item.title}>
               <SidebarMenuButton
-                tooltip={item.title}
+                 tooltip={item.title}
+                 aria-label={item.title}
                 isActive={active === item.title}
                 onClick={() => onSelect(item.title)}
               >
                 {item.icon}
                 <span>{item.title}</span>
                 {item.badge && (
-                  <span className="ml-auto inline-flex size-5 items-center justify-center rounded-md bg-primary/15 text-xs font-medium tabular-nums text-primary">
+                  <span aria-hidden="true" className="ml-auto inline-flex size-5 items-center justify-center rounded-md bg-primary/15 text-xs font-medium tabular-nums text-primary">
                     {item.badge}
                   </span>
                 )}

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,32 +13,46 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"opentunnel/internal/authority"
 	"opentunnel/internal/netutil"
 	"opentunnel/internal/serverpool"
+	"opentunnel/internal/version"
 )
 
 type Server struct {
-	Listen                string `toml:"listen"`                  // e.g. ":443"
-	ListenAlt             string `toml:"listen_alt"`              // optional extra TLS port sharing cert/handler
-	ListenInternal        string `toml:"listen_internal"`         // optional PLAIN ws listener bound to loopback (for the ssh transport)
-	ListenCarrierInternal string `toml:"listen_carrier_internal"` // opt-in managed-carrier ingress; loopback only
-	StaticTokenOnly       bool   `toml:"static_token_only"`       // explicit legacy/lab mode, never a DB-failure fallback
-	H3                    *bool  `toml:"h3"`                      // default true; bound to the configured TCP listener's host
-	InnerTLSCertFile      string `toml:"inner_tls_cert"`
-	InnerTLSKeyFile       string `toml:"inner_tls_key"`
-	RequireInnerTLS       bool   `toml:"require_inner_tls"`
-	Token                 string `toml:"token"` // shared secret; generate with a password manager
-	CertFile              string `toml:"cert_file"`
-	KeyFile               string `toml:"key_file"`
-	AcmeDomain            string `toml:"acme_domain"`      // optional: obtain/renew a public LE cert (TLS-ALPN)
-	WSPath                string `toml:"ws_path"`          // default "/ws"
-	Host                  string `toml:"host"`             // public hostname, used for self-signed CN
-	AutoApprove           bool   `toml:"auto_approve"`     // new device registrations start approved (no manual gate)
-	PoolID                string `toml:"pool_id"`          // optional trusted-pool approval authority ID
-	EnrollmentLogin       bool   `toml:"enrollment_login"` // user login permits enrollment, never approval
+	Listen                string   `toml:"listen"`                  // e.g. ":443"
+	ListenAlt             string   `toml:"listen_alt"`              // optional extra TLS port sharing cert/handler
+	ListenInternal        string   `toml:"listen_internal"`         // optional PLAIN ws listener bound to loopback (for the ssh transport)
+	ListenCarrierInternal string   `toml:"listen_carrier_internal"` // opt-in managed-carrier ingress; loopback only
+	StaticTokenOnly       bool     `toml:"static_token_only"`       // explicit legacy/lab mode, never a DB-failure fallback
+	H3                    *bool    `toml:"h3"`                      // default true; bound to the configured TCP listener's host
+	InnerTLSCertFile      string   `toml:"inner_tls_cert"`
+	InnerTLSKeyFile       string   `toml:"inner_tls_key"`
+	RequireInnerTLS       bool     `toml:"require_inner_tls"`
+	RequireChannelAuth    bool     `toml:"require_channel_auth"`
+	Token                 string   `toml:"token"` // shared secret; generate with a password manager
+	CertFile              string   `toml:"cert_file"`
+	KeyFile               string   `toml:"key_file"`
+	AcmeDomain            string   `toml:"acme_domain"`      // optional: obtain/renew a public LE cert (TLS-ALPN)
+	WSPath                string   `toml:"ws_path"`          // default "/ws"
+	Host                  string   `toml:"host"`             // public hostname, used for self-signed CN
+	AutoApprove           bool     `toml:"auto_approve"`     // new device registrations start approved (no manual gate)
+	PoolID                string   `toml:"pool_id"`          // optional trusted-pool approval authority ID
+	EnrollmentLogin       bool     `toml:"enrollment_login"` // user login permits enrollment, never approval
+	AuthorityID           string   `toml:"authority_id"`     // explicitly pinned central approval/accounting authority
+	AuthorityURL          string   `toml:"authority_url"`    // https://host:port; relay never opens a local DB in this mode
+	AuthorityNodeID       string   `toml:"authority_node_id"`
+	AuthorityClientCert   string   `toml:"authority_client_cert"`
+	AuthorityClientKey    string   `toml:"authority_client_key"`
+	AuthorityPins         []string `toml:"authority_pins"`   // independent authority SPKI pins, not public-edge pins
+	AuthorityListen       string   `toml:"authority_listen"` // panel's optional dedicated TLS 1.3 node-only API
+	AuthorityCert         string   `toml:"authority_cert"`
+	AuthorityKey          string   `toml:"authority_key"`
+	AuthorityNodes        string   `toml:"authority_nodes"` // credential-free JSON node ID/SPKI allowlist
 	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
 	// private, link-local/metadata, CGNAT). Default false.
 	AllowRestrictedTargets bool `toml:"allow_restricted_targets"`
+	AllowStreamingHTTP2    bool `toml:"allow_streaming_http2"`
 	// AllowLegacyMaster accepts the shared token at the handshake while
 	// clients migrate to per-device tokens. Default false.
 	AllowLegacyMaster bool `toml:"allow_legacy_master"`
@@ -86,6 +101,8 @@ func (s *Server) RequireV5Time() time.Time {
 }
 
 type ClientConf struct {
+	Telemetry          string `toml:"telemetry"` // full (preserve) or minimal (explicit local opt-in)
+	RequireChannelAuth bool   `toml:"require_channel_auth"`
 	// Runtime-only, loaded from an explicitly imported signed profile. A TOML
 	// file cannot silently introduce an operator or an endpoint callback.
 	Pool            *serverpool.Profile    `toml:"-"`
@@ -102,7 +119,7 @@ type ClientConf struct {
 	Fingerprints            []string       `toml:"fingerprints"`
 	Insecure                bool           `toml:"insecure"` // dev only
 	WSPath                  string         `toml:"ws_path"`
-	Transport               string         `toml:"transport"`      // wstls (default) | ssh
+	Transport               string         `toml:"transport"`      // wstls (default) | h3 | ssh | carrier
 	CarrierSOCKS            string         `toml:"carrier_socks"`  // external managed companion, loopback only
 	CarrierTarget           string         `toml:"carrier_target"` // fixed remote loopback ingress
 	Reality                 *RealityClient `toml:"reality"`
@@ -143,12 +160,13 @@ type ClientConf struct {
 	ECH *bool `toml:"ech"`
 	// ECHDoH overrides the DoH resolvers (comma-separated URLs) used to
 	// fetch the ECHConfigList. Empty = built-in defaults.
-	ECHDoh     string   `toml:"ech_doh"`
-	SOCKSAddr  string   `toml:"socks_addr"`  // default 127.0.0.1:1080
-	HTTPAddr   string   `toml:"http_addr"`   // default 127.0.0.1:8118
-	BypassList []string `toml:"bypass_list"` // extra ProxyOverride entries
-	AutoUpdate *bool    `toml:"auto_update"` // default true: self-update from GitHub Releases
-	HostileSSH *bool    `toml:"hostile_ssh"` // default true: allow the SSH last-resort tier on TLS-intercepting networks
+	ECHDoh        string   `toml:"ech_doh"`
+	SOCKSAddr     string   `toml:"socks_addr"`     // default 127.0.0.1:1080
+	HTTPAddr      string   `toml:"http_addr"`      // default 127.0.0.1:8118
+	BypassList    []string `toml:"bypass_list"`    // extra ProxyOverride entries
+	AutoUpdate    *bool    `toml:"auto_update"`    // default true: self-update from GitHub Releases
+	UpdateChannel string   `toml:"update_channel"` // stable by default; canary/candidate require explicit opt-in
+	HostileSSH    *bool    `toml:"hostile_ssh"`    // default true: allow the SSH last-resort tier on TLS-intercepting networks
 }
 
 // RealityClient explicitly opts into managing a separately provisioned Xray
@@ -206,15 +224,14 @@ func (c *ClientConf) SSHHostOnly() string {
 	return c.ServerAddr
 }
 
-// TransportKind returns "wstls" unless explicitly set to "ssh".
+// TransportKind returns "wstls" unless a supported transport is explicit.
 func (c *ClientConf) TransportKind() string {
-	if c.Transport == "carrier" {
-		return "carrier"
+	switch c.Transport {
+	case "carrier", "ssh", "h3":
+		return c.Transport
+	default:
+		return "wstls"
 	}
-	if c.Transport == "ssh" {
-		return "ssh"
-	}
-	return "wstls"
 }
 
 // MuxEnabled reports the effective multiplexing setting (default true).
@@ -355,10 +372,42 @@ func LoadServer(path string) (*Server, error) {
 	if strings.TrimSpace(s.RequireV5After) != "" && s.RequireV5Time().IsZero() {
 		return nil, fmt.Errorf("config: invalid require_v5_after; enforcement date was not applied")
 	}
-	if (s.InnerTLSCertFile == "") != (s.InnerTLSKeyFile == "") || (s.RequireInnerTLS && s.InnerTLSCertFile == "") {
+	if (s.InnerTLSCertFile == "") != (s.InnerTLSKeyFile == "") || (s.RequireInnerTLS && s.InnerTLSCertFile == "" && s.AuthorityListen == "") {
 		return nil, fmt.Errorf("config: inner TLS requires both certificate and private key")
 	}
-	for _, field := range []*string{&s.InnerTLSCertFile, &s.InnerTLSKeyFile} {
+	if s.RequireChannelAuth && ((!s.RequireInnerTLS && s.AuthorityListen == "") || s.StaticTokenOnly || s.AllowLegacyMaster) {
+		return nil, fmt.Errorf("config: connection-bound authentication requires independent mutual TLS and per-device authority; no legacy/static fallback")
+	}
+	if s.AuthorityURL != "" {
+		u, err := url.Parse(s.AuthorityURL)
+		if err != nil || u.Scheme != "https" || u.User != nil || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || !authority.ValidNodeID(s.AuthorityNodeID) {
+			return nil, fmt.Errorf("config: authority_url must be explicit HTTPS host:port without credentials/query/path; node ID is invalid")
+		}
+		if _, _, err := net.SplitHostPort(u.Host); err != nil {
+			return nil, fmt.Errorf("config: authority URL requires a TLS port")
+		}
+		if s.PoolID == "" || !serverpool.ValidID(s.AuthorityID) || !s.RequireChannelAuth || !s.RequireInnerTLS || s.AuthorityNodeID == "" || s.AuthorityClientCert == "" || s.AuthorityClientKey == "" || len(s.AuthorityPins) < 1 || len(s.AuthorityPins) > 2 || s.AutoApprove || s.StaticTokenOnly || s.AllowLegacyMaster || s.AuthorityListen != "" {
+			return nil, fmt.Errorf("config: remote authority requires separate per-node TLS credentials, matching pool/authority IDs and channel authentication; no local/static/admin fallback")
+		}
+	} else if s.AuthorityNodeID != "" || s.AuthorityClientCert != "" || s.AuthorityClientKey != "" || len(s.AuthorityPins) > 0 {
+		return nil, fmt.Errorf("config: authority node credentials without an explicit authority_url are not used")
+	}
+	for _, pin := range s.AuthorityPins {
+		if !serverpool.ValidID(pin) {
+			return nil, fmt.Errorf("config: invalid authority public-key pin")
+		}
+	}
+	if s.AuthorityListen != "" {
+		if s.PoolID == "" || !s.RequireChannelAuth || s.AuthorityCert == "" || s.AuthorityKey == "" || s.AuthorityNodes == "" || s.AuthorityURL != "" {
+			return nil, fmt.Errorf("config: central authority listener needs a channel-authenticated pool, dedicated TLS identity and explicit node inventory")
+		}
+		if _, _, err := net.SplitHostPort(s.AuthorityListen); err != nil {
+			return nil, fmt.Errorf("config: authority_listen needs an explicit bind endpoint")
+		}
+	} else if s.AuthorityCert != "" || s.AuthorityKey != "" || s.AuthorityNodes != "" {
+		return nil, fmt.Errorf("config: authority server credentials without authority_listen are not used")
+	}
+	for _, field := range []*string{&s.InnerTLSCertFile, &s.InnerTLSKeyFile, &s.AuthorityClientCert, &s.AuthorityClientKey, &s.AuthorityCert, &s.AuthorityKey, &s.AuthorityNodes} {
 		if *field != "" && !filepath.IsAbs(*field) {
 			*field = filepath.Join(filepath.Dir(path), *field)
 		}
@@ -373,6 +422,26 @@ func LoadClient(path string) (*ClientConf, error) {
 	}
 	if c.ServerAddr == "" {
 		return nil, fmt.Errorf("config: client needs server_addr")
+	}
+	if version.RequiresOwnServerConfiguration {
+		if c.Insecure || c.AllowUntrustedBootstrap {
+			return nil, fmt.Errorf("config: generic clients require verified TLS; insecure or untrusted bootstrap is not a server configuration")
+		}
+		pins := c.FingerprintSet()
+		if len(pins) == 0 || len(pins) > 8 {
+			return nil, fmt.Errorf("config: configure your own server and independently verified fingerprint before starting the generic client")
+		}
+		for _, pin := range pins {
+			if raw, err := hex.DecodeString(pin); err != nil || len(raw) != 32 {
+				return nil, fmt.Errorf("config: generic client needs valid public TLS certificate SHA256 pins from its server operator")
+			}
+		}
+	}
+	if c.Telemetry != "" && c.Telemetry != "full" && c.Telemetry != "minimal" {
+		return nil, fmt.Errorf("config: telemetry must be full or minimal")
+	}
+	if c.UpdateChannel != "" && c.UpdateChannel != "stable" && c.UpdateChannel != "canary" && c.UpdateChannel != "candidate" {
+		return nil, fmt.Errorf("config: update_channel must be stable, canary or candidate")
 	}
 	// token is optional: panel mode authenticates with a per-device token
 	// generated on first run; token only matters for legacy/no-panel servers.
@@ -398,7 +467,7 @@ func LoadClient(path string) (*ClientConf, error) {
 		return nil, fmt.Errorf("config: SOCKS and HTTP listeners must use different ports")
 	}
 	switch c.Transport {
-	case "", "wstls", "ssh", "carrier":
+	case "", "wstls", "h3", "ssh", "carrier":
 	default:
 		return nil, fmt.Errorf("config: unknown transport %q", c.Transport)
 	}
@@ -452,6 +521,9 @@ func LoadClient(path string) (*ClientConf, error) {
 	if len(c.InnerTLSPins) > 8 {
 		return nil, fmt.Errorf("config: inner TLS pin set too large")
 	}
+	if c.RequireChannelAuth && (len(c.InnerTLSPins) == 0 || c.Insecure || c.AllowUntrustedBootstrap || c.Token != "") {
+		return nil, fmt.Errorf("config: connection-bound authentication needs independent relay TLS pins and a per-device identity; no insecure/shared-token bootstrap")
+	}
 	return &c, nil
 }
 
@@ -474,9 +546,22 @@ key_file  = ""
 	# Default false: every new device waits for admin approval.
 	auto_approve = false
 	# Opt-in signed trusted pool (see docs/TRUSTED-SERVER-POOLS.md). The ID is
-	# printed by otu-pool --gen-key; all entries must use one local authority.
+	# printed by otu-pool --gen-key; use one local or explicit central authority.
 	# pool_id = "<operator-public-key SHA256>"
 	# enrollment_login = true # enrollment users, separate from admin approval
+	# Independent channel authentication is opt-in; canary/migrate before requiring.
+	# inner_tls_cert = "relay-inner.pem"
+	# inner_tls_key = "relay-inner-key.pem"
+	# require_inner_tls = true
+	# require_channel_auth = true
+	# allow_streaming_http2 = false # explicitly validated H3-edge -> H2-origin contract
+	# Remote relay ONLY: no local panel DB or administrator routes.
+	# authority_url = "https://authority.example:9443"
+	# authority_id = "<independently verified authority ID>"
+	# authority_node_id = "node-a"
+	# authority_client_cert = "node-a.pem"
+	# authority_client_key = "node-a-key.pem"
+	# authority_pins = ["<authority SPKI SHA256>"]
 	# When true, clients may dial loopback/private/link-local/metadata
 	# targets through the relay (SSRF filter off). Default false.
 	allow_restricted_targets = false
@@ -500,116 +585,13 @@ key_file  = ""
 	return writeFile(path, t)
 }
 
-// DefaultClientTOML is the built-in configuration written on first run when
-// no config file exists, so the client works as a standalone executable.
-const DefaultClientTOML = `# opentunnel client — default configuration (auto-generated on first run)
-server_addr = "cdn.aborro.dev:443"
-# server_ip: literal IP dialed instead of resolving server_addr (SNI and
-# cert pin stay on the hostname above). Set this to survive DNS sinkholing.
-# server_ip = ""
-# server_fallbacks: extra entry host[:port]s, rotated when an entry fails
-# or looks shaped. Needs a second IP/hostname to matter.
-# server_fallbacks = []
-# Signed self-hosted profiles are imported/selected with --pool-import and
-# --pool-select, not by copying other operators' keys into this config.
-fingerprint = "e86816f5e328d6d705b5594e64e7229276a639a264ca51db7916dc3c826aeac1"
-# fingerprints: extra accepted pins for certificate rotation. The relay
-# announces its current pin in-band and clients learn it automatically;
-# this list is for pre-staging or manual pin updates.
-# fingerprints = []
-insecure = false
-ws_path = "/api/v1/stream"
-profile = "auto"
-mux = true
-udp = true
-# HTTP/3 tier (default on): QUIC to :443 cannot be transparently
-# intercepted, so pinned handshakes get through on MITM networks — bulk
-# traffic rides "ordinary h3 browsing" instead of SSH there. Only
-# engages after every ws-tls profile has failed; UDP-blocked networks
-# fall through to ssh in seconds.
-h3_tier = true
-# ECH (Encrypted Client Hello, default on): once the server host
-# publishes an ECHConfigList (HTTPS DNS record — Cloudflare publishes it
-# automatically), the real SNI rides encrypted behind a cover name.
-# Fail-open: a rejected attempt retries without ECH.
-ech = true
-# Last-resort tier for networks that intercept TLS: tunnel inside real SSH.
-# Drop tun.key next to this config to enable it (skipped when missing).
-fallback_ssh = true
-# On intercepting networks SSH is conspicuous: set false to forbid the
-# SSH tier there (stealth TLS tiers only; may leave you offline).
-hostile_ssh = true
-ssh_port = "22"
-ssh_user = "tun"
-ssh_key = "tun.key"
-ssh_internal = "127.0.0.1:8081"
-ssh_host_keys = "SHA256:msXZMQ8kGmiZF6bt75T3aWtL2ebPnWtZ6+X1vs69Jas,SHA256:og9K+1+YtASuye2jO06RN3V6TA/eK+/zIMF8GHcsLyQ,SHA256:tWpmC5YfGj9UJD9iDb/FlkeCO/m/2pB59vGRSKvTl5o"
-# Direct hostname the ssh tier dials (empty = derive from server_addr).
-# Once the tunnel domain is CDN-fronted (CDNs don't proxy port 22), point
-# this at a plain A record like git.aborro.dev — bulk SSH to a git host is
-# the most ordinary heavy-SSH pattern there is.
-# ssh_dial_host = "git.aborro.dev"
-# SSH banner the ssh tier announces (default matches the server's OpenSSH
-# family per the firewall probe; "-" reverts to Go's stock banner).
-# ssh_client_version = "SSH-2.0-OpenSSH_9.6p1"
-socks_addr = "127.0.0.1:1080"
-http_addr = "127.0.0.1:18080"
-# Bypass list stays neutral — operator domains no longer ride the visible
-# WinINET ProxyOverride (loop protection is built into the client itself:
-# targets matching a configured entry dial direct instead of tunneling).
-bypass_list = []
-# Optional externally managed authenticated carrier. No process is downloaded
-# or launched automatically; configure and verify the companion independently.
-# carrier_socks = "127.0.0.1:19090"
-# carrier_target = "127.0.0.1:8082"
-# allow_untrusted_bootstrap = false
-# allow_non_loopback_proxy = false
-`
-
 // WriteDefaultClientConfig writes DefaultClientTOML to path (0600).
 func WriteDefaultClientConfig(path string) error {
 	return writeFile(path, DefaultClientTOML)
 }
 
 func WriteClientTemplate(path string) error {
-	t := `# opentunnel client configuration
-server_addr = "example.com:443"
-token = "CHANGE_ME_LONG_RANDOM_SECRET"
-# Paste the fingerprint printed by the server at startup (SHA-256 hex):
-fingerprint = ""
-insecure = false        # NEVER true outside local testing
-ws_path = "/api/v1/stream"
-# auto = start fast, escalate to balanced/stealth only when blocked,
-# then drop back to fast automatically (recommended):
-profile = "auto"
-# Multiplexing (recommended): one tunnel session, many connections.
-mux = true
-udp = true              # SOCKS5 UDP ASSOCIATE over the tunnel
-# Last-resort tier: if all TLS tiers get intercepted, tunnel inside real SSH.
-# Requires ssh_user + ssh_key (+ server running listen_internal).
-fallback_ssh = false
-# Allow that SSH tier on intercepting networks (conspicuous but connected).
-hostile_ssh = true
-ssh_user = "ubuntu"
-ssh_key = 'C:\path\to\ssh-key'
-ssh_internal = "127.0.0.1:8081"
-# SSH banner announced by the ssh tier (default = whitelisted OpenSSH family;
-# "-" reverts to Go's stock banner).
-# ssh_client_version = "SSH-2.0-OpenSSH_9.6p1"
-# ECH (Encrypted Client Hello): hides the real server name behind the
-# ECHConfig's cover name once the host publishes one (HTTPS DNS record —
-# Cloudflare publishes it automatically). Fail-open. Default: on.
-ech = true
-# ech_doh = "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query"
-socks_addr = "127.0.0.1:1080"
-http_addr = "127.0.0.1:8118"
-bypass_list = ["*.internal.example.com"]
-# carrier_socks = "127.0.0.1:19090"
-# carrier_target = "127.0.0.1:8082"
-# allow_untrusted_bootstrap = false
-# allow_non_loopback_proxy = false
-`
-	return writeFile(path, t)
+	return writeFile(path, GenericClientTOML)
 }
 
 func writeFile(path, content string) error {

@@ -49,8 +49,10 @@ Sustained denial still retains evidence and returns a failure or pending warning
 retries never weaken ACLs or discard an existing recovery record.
 
 The same-executable guardian retries a bounded number of times after parent
-termination. It never restores a new active lease owner. `--restore` and the
-next start are further retry opportunities; there is no monitoring daemon.
+termination. It never restores a new active lease owner. An explicit
+`--restore`/`--restore-from` retries the lease handoff for a bounded interval,
+which covers the short window after `stop-otu.bat` force-stops the client; the
+next start is a further retry opportunity. There is no monitoring daemon.
 
 An empty `network-settings.lease` file is harmless bookkeeping. Removing it
 after releasing its handle would race a new owner, so it can remain. Original

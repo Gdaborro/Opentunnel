@@ -1,0 +1,285 @@
+# Pre-1.2 hardening readiness report - 2026-11-18
+
+## Decision: NOT READY for public download or stable deployment
+
+This is the final report of the automated engineering/validation work recorded
+below, **not completion of the seven release gates or an independent security
+certification**. The operator requested website downloads only when ready.
+Consequently, no new EXE/download link is being published on the website, no
+stable release is created, and no production authentication migration is enabled.
+
+The original installed v1.1.10 client, device identities, networking backups and
+fleet policy remain preserved. PC-specific reset instructions and credentials
+remain private. Self-review, unsigned test binaries and local hash repetition
+do not authorize release signing or deployment.
+
+## Source and evidence scope
+
+- Released baseline: `2638f828eab09cbe279c38c5eafbef17e1f8fb5d` (v1.1.10).
+- Review implementation: `6c5fbcc523851e46ce66ad9bec7e679f3e1b2e06` on
+  `fix/pre-1.2-hardening`, followed by the release-contract work in this report's
+  commit. Publication of that review branch is not promotion of `main`.
+- [CI for the first review implementation](https://github.com/Gdaborro/Opentunnel/actions/runs/44286693158):
+  core and companion checks passed on Windows and Ubuntu; the frontend audit
+  failed, and the dependent build job was skipped. **Overall CI failed.**
+- The exact review commit also passed a full Windows race/vet/module run from a
+  separate clean checkout. Later release-contract code has dedicated race/fault
+  checks and real separately built Windows/Linux amd64/arm64 fixture inputs.
+- Synthetic version `v1.1.99` is test data only. No hardening release version,
+  fleet enforcement date, root rotation or production signing ceremony was chosen.
+- Raw diagnostics, local test databases, fixture credentials, broker source and
+  per-device evidence are kept outside the public repository. This report
+  summarizes outcomes without publishing those private inputs.
+
+## Implemented and tested
+
+| Area | Evidence completed | Acceptance still missing |
+|---|---|---|
+| Security/correctness | Bounded admission/password/abuse state, fail-closed policy/filter reads, audited transactional mutations, durable managed SSH reconciliation; synthetic fault/race tests | Intended sustained anonymous/authenticated load and independent review |
+| Session authentication | Opt-in pinned TLS 1.3 mutual authentication and exporter-bound v6 proofs; generation-bound persistent latches; captured proof rejection across sessions/restart | Real canary migration and released-old/new stored-state rollback |
+| Networking/recovery | Setup/caller cancellation, DNS/network generation checks, strict carrier cooldown recovery, active-transfer teardown ownership, half-close download fix; fresh registry-free executable acceptance | Real disposable Windows ACL/policy/logoff/shutdown/sleep and intended-device liveness |
+| Operations/distribution | Narrow central authority API and separate node credentials, consistent database snapshots, public signed-inventory/root parsing, separate client editions, fixed source/build consistency tooling | Trusted independent reproduction, durable scoped signing history, all-artifact signatures and least-privilege host acceptance |
+| Multi-VPS authority | Two independent local relay OS processes against one authority; aggregate grant/quota/refund/partition/generation tests; no relay-local SQLite fallback | Two independent relay hosts, sustained latency/load and credential rotation/revocation acceptance |
+| Scope/privacy/status | Application-proxy scope diagnostics, opt-in minimal telemetry/retention, preserved bans/accounting/approval; isolated SPA normal/fault flows | Intended-device leak/accessibility matrix and actual managed-browser acceptance |
+| Release proof | Repeatable failure/race suites, bounded resource/payload journals, short synthetic mixed-traffic smoke and internal reviews | At least 72 hours on exact signed assets, actual rollback, external independent review and measured canary/fleet uptake |
+
+### Client startup and reported process exit
+
+Local reproductions fixed stalled setup ownership and interrupted-update startup,
+orphan proxy restoration and download-drain problems. Explicit `--restore` works
+with an unrelated corrupt updater journal and does not create configuration or
+replace device credentials. Recovery refuses live network owners and ambiguous/
+live executable replacements; failure evidence is retained rather than erased.
+The minimum upstream smux buffered half-close fix is pinned to v1.5.58.
+
+The supplied device logs did not contain a recorded process crash. They showed
+failed TLS/SSH connections and denied managed-browser policy writes. Local fixes
+and passing fixtures therefore **do not establish that the affected PCs are
+repaired**. Their identity resets, separate enrollment approvals and actual
+permitted-network transfers have not been verified. No shared credential or
+weakened TLS/SSH check is used to force connectivity.
+
+### 2026-11-19 connectivity and CI follow-up
+
+Read-only public checks found the current `cdn.aborro.dev` leaf is a hostname-
+valid Let's Encrypt certificate (issuer YE2, valid 2026-10-26 through
+2027-01-24) with SHA-256 leaf fingerprint
+`20687078735870a4c74ea153d8ea81115b4478d8da921a3beeeef6ffbc77a322`.
+Independent connections from the VPS and the Windows engineering host, both
+using normal system-chain and hostname validation, resolved the same public
+service and matched that leaf. It differs from the historical first-run pin.
+The relay's generated origin certificate is a different trust layer and was not
+substituted for the public edge identity. The review branch's hosted first-run
+default and H3 diagnostic therefore use the verified current leaf; installed
+configs, production services and released downloads were not changed. Existing
+approved clients still need an authenticated pin-learning/SSH recovery path.
+
+The production panel currently has no pending device rows and no duplicate
+public-key or machine-fingerprint groups among its seven approved rows. This
+does **not** verify either affected PC's reset or approval. At the time of that
+read-only check no identity, ban, approval, authorized-key or production
+configuration mutation had been performed. A later explicitly confirmed fleet
+wipe is recorded below.
+
+Hosted CI run 44474741210 failed only its isolated native release smoke: the new
+fixed build recipe stamped `internal/version.Version` with the canonical
+`v1.1.10` tag spelling, while the server/panel display path deliberately prints
+`1.1.10`. The recipe now strips the `v` only for the display value; the update
+tag and compatibility floor keep the canonical prefix, with a regression test.
+The user-supplied v1.1.10 logs did not contain a process crash. They showed the
+console hiding after eight seconds even when no carrier was verified, followed
+by TLS-interception, cloned-identity SSH-key refusal and managed-browser policy
+denial. The review branch instead keeps the console visible until authenticated
+activity is observed, retries an explicit restore across the forced-stop lease
+window, and keeps double-click failures readable. These changes do not weaken
+TLS/SSH checks, override browser policy, restore a copied PC's identity or prove
+that any affected device can now reach the relay.
+
+### 2026-11-19 confirmed fleet re-enrollment wipe
+
+After explicit operator confirmation, the production panel was reset to require
+fresh enrollment and separate approval for every device. The operation stopped
+both services, verified an exact preflight scope, wrote a consistent private
+SQLite backup and authorized-key copy with integrity and digest checks, deleted
+only `peers`, `peer_enrollments`, `fingerprints_banned` and `pubkeys_banned`,
+atomically emptied the managed SSH authorization input, and restarted both
+services. It retained the two administrator accounts plus all 62 daily-usage,
+12 ingress-usage, 195 event and 500 alert rows.
+
+Verified result: zero peer rows, zero fingerprint bans, zero public-key bans,
+zero managed SSH key lines, database integrity `ok`, and both `opentunnel` and
+`otu-panel` active. The rollback evidence is
+`/var/lib/opentunnel/fleet-reset-backups/20261119T081222Z-de59de2c612d0908`
+(mode 0700; `panel.db`, `authorized_keys` and `reset-status.json` at 0600), with
+manifest status `completed`, database SHA-256
+`1c31024d7a1e4725e5a0ba6f12ff91a2a2990967c6c1bab63b01e4481541824a` and
+authorized-key SHA-256
+`93f00965eab822ff0407e881d290ef99122e33c96bb7aa04b24d47045f3fc0f3`.
+The cleared bans were an explicit operator decision, not an automatic unban.
+This server-side wipe does **not** reset either copied PC's local identity,
+prove their separate approvals or establish permitted-network connectivity.
+
+Follow-up CI run 44297855037 failed a Windows Git checkout-root spelling check
+and intermittently timed out one denied-cleanup bulk transfer. Checkout roots
+are now compared by actual directory identity, with MSYS/drive-root regression
+coverage. The follow-up working tree passed the complete four-CPU Windows race
+suite; the denied-cleanup case also passed 20 consecutive race runs during
+concurrent client/panel/relay tests, with 3,014,656-byte transfers taking about
+0.82-0.93 seconds. The original 15-second acceptance deadline and all payload,
+accounting and recovery assertions remain unchanged; failure diagnostics now
+record elapsed time and exact received bytes.
+
+The subsequent hosted CI run 44485530268 passed every job on commit
+`7e0689d3acdc5c512f257b97d3f49fe2ddabd4bc`: frontend, both companion jobs,
+both test jobs, and the previously failing `build` job, including its fixed
+recipe checks and isolated native release smoke. Locally staged
+`otu-panel`/`otu-server` binaries built with the fixed recipe also printed
+`1.1.10` from `--version`. This closes that specific CI regression; it is not a
+signed release, independent reproduction or publication authorization.
+
+### Two client editions
+
+- The hosted edition preserves the existing identity directory and historical
+  Windows update asset name. It embeds public routing/trust only; device private
+  credentials are generated locally and still require separate approval.
+- The generic edition has no implicit hosted endpoint or public pin. It refuses
+  startup until the owner configures an endpoint and independently verified TLS
+  pin. Its credentials/status/update trust and update asset are separate.
+- Both editions share only the user's network-recovery journal/lease, because
+  the Windows proxy itself is shared. Separate credentials do not allow competing
+  proxy ownership or restoration of a running client's settings.
+- Delivered previews are explicitly unsigned and disable automatic update/
+  release-freshness authorization. They are not website-release artifacts.
+
+### Source/build verification hardening
+
+The new `internal/releasebuild` contract and `tools/buildcandidate` /
+`tools/releasebundle` now:
+
+1. Check a pristine exact Git HEAD with bounded regular source files, no ignored
+   build inputs, no linked/submodule entries, and raw checkout bytes matching Git
+   blobs. A normalized `git status` verdict alone is not accepted.
+2. Build fixed core/companion targets with exact toolchain/platform/client-edition
+   settings, readonly modules, external output and no local Go flag/workspace/
+   environment configuration injection.
+3. Generate a deterministic bounded USTAR/gzip source archive from those blobs,
+   module inventory text and a build consistency document, all new-only.
+4. Parse bounded PE/ELF inline Go buildinfo without allocating from unchecked
+   virtual section/string lengths; verify package/platform/edition/toolchain/VCS
+   identity and dependency versions/checksums against archived module files.
+5. Compare exact SBOM bytes to the selected executable's module/settings inventory
+   and companion notice to its archived source notice. A valid synthetic
+   signature/hash declaration over fake binaries or source is refused.
+
+Real Go 1.27.4 buildinfo differs from simplified synthetic expectations: it omits
+linker flags under `-trimpath`, omits off-PGO metadata, and may report a VCS-derived
+main module version. The consistency parser now checks the actual bounded format.
+**Missing metadata does not prove the linker/version/floor stamps.** Trusted
+independent reproduction remains mandatory before the signing broker can use a
+real key. The compatibility-only verifier cannot authorize post-v1.1.10 releases.
+
+A same-host repeat initially matched 21/21 binary hashes. A later raw-source
+check found Windows line-ending transformations hidden by Git's clean verdict.
+Only 15/21 hashes matched between filtered and unfiltered checkouts: embedded
+panel/server output changed. The filtered builds are **not valid release input**.
+They are retained as reproduction evidence, not silently relabeled as accepted
+builds. A new unfiltered checkout matched all 506 tracked Git blobs, and its
+strict build/source/module/SBOM inventory smoke passed. These are test builds,
+not independently approved reproducible or signed candidate artifacts.
+
+### Short soak and frontend evidence
+
+The revised race-enabled loopback soak smoke ran **20 seconds**, completed 15
+mixed TCP download/upload/UDP/status cycles, observed three fail-closed authority
+partition probes, verified 3,195,150 payload bytes and wrote 11 durable resource
+samples. No incomplete operations or observation gaps were recorded in that
+short window. This is one-process/host harness validation, **not the 72-hour
+multi-device/carrier pilot or a sustained resource-growth result**.
+
+Ten isolated Edge SPA normal/fault flows passed, including explicit retention
+consent, preserved bans/accounting, pending SSH notices, unavailable reads and
+failed mutation visibility, with no uncaught SPA exceptions. That is not proof
+of real corporate browser policies or logoff/sleep/shutdown behavior.
+
+## Frontend advisory status update
+
+Earlier audits reported four high-severity findings for
+[GHSA-fc5q-39xc-vjpf / CVE-2026-112366](https://github.com/advisories/GHSA-fc5q-39xc-vjpf),
+picomatch ReDoS through Vite/fdir/tinyglobby. GitHub withdrew the advisory at
+2026-11-18 15:38:56 UTC. The linked maintainer rationale says globs are regular
+expressions, arbitrary pathological patterns cannot all be predicted, and
+untrusted users must not define them; the proposed PR was closed unmerged.
+
+On 2026-11-19, Node 26.13.0 `npm audit --audit-level=low` and an explicit
+lockfile/development-dependency JSON audit both reported zero vulnerabilities
+across 279 dependencies, including 149 development dependencies. The latest
+published picomatch remains 4.0.7 with no patched release listed. No manifest,
+lockfile, dependency override, Vite version or audit suppression was changed.
+This removes that specific registry-audit blocker; it does not certify every
+possible glob or permit untrusted build patterns. The audit remains enabled,
+and exact-source hosted CI must confirm it. Zero audit findings are not a
+security certification.
+
+## What autonomous work cannot truthfully replace
+
+Before public downloads, final signing and rollout, the following need actual
+authorized resources/evidence, not another synthetic test:
+
+1. Green exact-source Windows/Linux/frontend/companion CI, with a final frozen
+   complete artifact inventory.
+2. Trusted independent binary reproduction and durable scoped signing history,
+   real threshold signatures/root ceremony and all-artifact verification.
+3. Disposable Windows managed-policy/ACL/logoff/shutdown/sleep tests and verified
+   affected-device reset/enrollment/liveness without changing corporate controls.
+4. Native Linux least-privilege process/file/credential ownership acceptance and
+   sustained two-independent-host authority load/partition/rotation tests.
+5. Released-old/new stored-state rollback that preserves subsequent bans,
+   revocations and accounting; the released v1.1.10 server does not understand
+   new authentication latches and is not a safe enforced-state rollback target.
+6. At least **72 uninterrupted hours** of the intended mixed-carrier/device pilot
+   on the exact signed candidate, followed by independent external review and
+   recorded canary/fleet uptake before stable promotion.
+
+No external review was purchased or fabricated, no real credentials/root were
+rotated, and no test on an everyday PC is substituted for those device/host gates.
+
+### 2026-11-19 reset-utility publication
+
+Two credential-free reset packages were published after the targeted and
+generalized synthetic suites passed 12 and 14 checks respectively. The
+generalized package is a public GitHub prerelease asset:
+`copied-identity-reset-20261119`, file
+`OpenTunnel-Copied-Identity-Reset-20261119.zip`, 8,114 bytes, SHA-256
+`2e8fdb81251eb519c8b9bad7c1e51430f6fad57915882abfab4c5d3ac66c549f`.
+Downloading it back from the public URL reproduced that hash, and
+`releases/latest` still resolves to `v1.1.10`. The generalized script contains
+no private device name, supports both hosted and generic state directories,
+refuses ambiguous selection and a saved name that matches the actual PC, and
+archives/digest-verifies the five identity files before deletion. It preserves
+bans, journals, policies, configs and other operator identities, and requires
+typing `RESET <actual PC name>`.
+
+The server-specific package, which intentionally names the known copied device,
+was published only at an unlisted, unauthenticated HTTPS route on
+`cdn.aborro.dev:8445`; the exact path is retained in private evidence rather
+than in this public report. **The unlisted URL is not access control.** Downloads
+from the VPS and the Windows host over normal certificate and hostname
+validation matched SHA-256
+`07656015b5c33e49a91784e6eaffbcde82a1843b02fb89f5623a6982d140f4fe`.
+Wrong paths and the route root return 404, and `https://cdn.aborro.dev/` still
+returns 200. The Caddyfile was backed up to
+`/var/backups/caddy/Caddyfile.pre-reset-20261119` (SHA-256
+`a3163b194ee1e5109167e74018d0a49055349e60cf68acd0134947f1b4ef0585`) before
+reload; `caddy`, `opentunnel` and `otu-panel` remained active. No relay or panel
+binary changed. This publication does not reset either affected PC, approve a
+device or authorize a client release.
+
+## Publication outcome
+
+**NO-GO for a client release.** Source changes and this report may be published
+on the review branch. The reset utility above is an unsigned, scope-limited
+script package, not a client release. No client EXE, website download link,
+stable release, installed client or relay/panel binary was published by it. The
+operator's “only if ready” condition takes precedence over completing an upload.
+The final client release and website publication must remain on hold until every
+remaining acceptance item above has honest evidence.

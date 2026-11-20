@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"opentunnel/internal/version"
 )
 
 func TestWriteDefaultClientConfigRoundtrip(t *testing.T) {
@@ -12,11 +14,23 @@ func TestWriteDefaultClientConfigRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := LoadClient(p)
+	if version.RequiresOwnServerConfiguration {
+		if err == nil {
+			t.Fatal("generic first-run template connected without operator configuration")
+		}
+		if strings.Contains(DefaultClientTOML, "aborro.dev") || strings.Contains(DefaultClientTOML, "CHANGE_ME_LONG_RANDOM_SECRET") {
+			t.Fatal("generic client embeds hosted routing or a shared credential template")
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.ServerAddr == "" || c.Fingerprint == "" {
 		t.Fatalf("default config incomplete: %+v", c)
+	}
+	if pins := c.FingerprintSet(); len(pins) != 1 || pins[0] != "20687078735870a4c74ea153d8ea81115b4478d8da921a3beeeef6ffbc77a322" {
+		t.Fatalf("hosted default pins differ from the independently verified 2026-11-19 public leaf: %q", pins)
 	}
 	if c.Token != "" {
 		t.Fatal("default config must NOT embed a shared token (per-device auth)")
@@ -29,6 +43,15 @@ func TestWriteDefaultClientConfigRoundtrip(t *testing.T) {
 	}
 	if !c.MuxEnabled() || !c.UDPEnabled() {
 		t.Fatal("default config should enable mux and udp")
+	}
+}
+
+func TestTransportKindIncludesExplicitH3(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{{"", "wstls"}, {"wstls", "wstls"}, {"h3", "h3"}, {"ssh", "ssh"}, {"carrier", "carrier"}} {
+		c := &ClientConf{Transport: tc.input}
+		if got := c.TransportKind(); got != tc.want {
+			t.Errorf("TransportKind(%q) = %q, want %q", tc.input, got, tc.want)
+		}
 	}
 }
 
@@ -85,6 +108,12 @@ func TestDefaultPathsAreBoring(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := LoadClient(p)
+	if version.RequiresOwnServerConfiguration {
+		if err == nil || !strings.Contains(DefaultClientTOML, `ws_path = "/api/v1/stream"`) {
+			t.Fatal("generic template has an implicit server or unexpected protocol path")
+		}
+		return
+	}
 	if err != nil {
 		t.Fatalf("default config must load: %v", err)
 	}

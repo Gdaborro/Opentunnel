@@ -1,15 +1,18 @@
 package client
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
 
@@ -32,6 +35,10 @@ type deviceFile struct {
 	Token       string `json:"token"`
 	Fingerprint string `json:"fingerprint"`
 	DeviceName  string `json:"device_name"`
+	// Created is true only for the process that minted this identity. Plain
+	// bootstrap is restricted to that first run; an existing device whose
+	// approval marker is missing or unreadable must use a verified channel.
+	Created bool `json:"-"`
 }
 
 // DeviceIdentity is the persistent per-operator device identity, never an
@@ -68,27 +75,43 @@ func (s *TokenStore) BanPath() string        { return filepath.Join(s.Dir, "ban.
 func (s *TokenStore) SSHPrivatePath() string { return filepath.Join(s.Dir, "device_ssh") }
 func (s *TokenStore) SSHPublicPath() string  { return filepath.Join(s.Dir, "device_ssh.pub") }
 func (s *TokenStore) approvedPath() string   { return filepath.Join(s.Dir, "approved.flag") }
+func (s *TokenStore) keyEstablishedPath() string {
+	return filepath.Join(s.Dir, "device-key-established.flag")
+}
 
 // MarkApproved records that this device identity has been approved by the
 // panel at least once, keyed on the device FINGERPRINT (not the token):
 // a forced token rotation or re-registration cannot reset the marker, so
 // a middleman-forged "you are a fresh device" state cannot re-open the
 // bootstrap channels for a device the panel already trusts.
-func (s *TokenStore) MarkApproved(fingerprint string) {
+func (s *TokenStore) MarkApproved(fingerprint string) error {
 	if fingerprint == "" {
-		return
+		return nil
 	}
-	_ = privatefile.Write(s.approvedPath(), []byte(fingerprint))
+	return privatefile.Write(s.approvedPath(), []byte(fingerprint))
 }
 
 // EverApproved reports whether an approval verdict ever arrived over a
 // trusted channel (pinned HTTPS or in-band) for this device fingerprint.
 func (s *TokenStore) EverApproved(fingerprint string) bool {
 	data, err := privatefile.Read(s.approvedPath(), 256)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	return string(data) == fingerprint && fingerprint != ""
+	if err != nil {
+		// Approval state is unreadable, not evidence that this device was
+		// never approved. Fail closed instead of reopening plain bootstrap.
+		return fingerprint != ""
+	}
+	if fingerprint == "" {
+		return false
+	}
+	if string(data) == fingerprint {
+		return true
+	}
+	// A valid marker for another fingerprint is not this identity's approval.
+	// Malformed content is instead approval-unknown and closes plain bootstrap.
+	return len(data) == 0 || len(data) > 128 || !utf8.Valid(data) || bytes.ContainsAny(data, "\x00\r\n")
 }
 
 func (s *TokenStore) LoadOrCreate() (*deviceFile, error) {
@@ -124,6 +147,7 @@ func (s *TokenStore) LoadOrCreate() (*deviceFile, error) {
 	df := &deviceFile{
 		Token:      base64.RawURLEncoding.EncodeToString(tok),
 		DeviceName: hostname(),
+		Created:    true,
 	}
 	if s.Scope != "" {
 		// An independent random enrollment fingerprint avoids sharing the
@@ -200,6 +224,13 @@ func (s *TokenStore) EnsureSSHKey() (string, error) {
 		}
 	}
 	if os.IsNotExist(err) {
+		for _, marker := range []string{s.keyEstablishedPath(), s.approvedPath()} {
+			if _, markerErr := os.Lstat(marker); markerErr == nil {
+				return "", fmt.Errorf("established device private key missing; administrator-assisted recovery required")
+			} else if !os.IsNotExist(markerErr) {
+				return "", markerErr
+			}
+		}
 		// A surviving public key means a private key was lost, not that a
 		// fresh identity should be minted under an already-approved token.
 		if _, perr := os.Stat(pubPath); perr == nil {
@@ -231,6 +262,13 @@ func (s *TokenStore) EnsureSSHKey() (string, error) {
 	signer, err := ssh.ParsePrivateKey(keyRaw)
 	if err != nil || signer.PublicKey().Type() != ssh.KeyAlgoED25519 {
 		return "", fmt.Errorf("device private key is invalid; refusing to replace it")
+	}
+	if _, err := os.Lstat(s.keyEstablishedPath()); os.IsNotExist(err) {
+		if err := privatefile.WriteNew(s.keyEstablishedPath(), []byte("established\n")); err != nil && !os.IsExist(err) {
+			return "", fmt.Errorf("persist device-key ownership: %w", err)
+		}
+	} else if err != nil {
+		return "", err
 	}
 	// The public file is a cache, not the identity. Recover it from the
 	// private key if missing, stale, or corrupted; never regenerate the key.

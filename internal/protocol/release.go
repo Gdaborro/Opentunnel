@@ -55,7 +55,7 @@ func VerifyReleaseManifest(raw, sig []byte, pub ed25519.PublicKey, now time.Time
 	if hash, err := hex.DecodeString(m.SHA256); err != nil || len(hash) != 32 {
 		return m, errors.New("fresh release digest invalid")
 	}
-	if m.IssuedAt > now.Unix()+300 || m.ExpiresAt <= now.Unix() || m.ExpiresAt <= m.IssuedAt || m.ExpiresAt-m.IssuedAt > int64(MaxReleaseValidity/time.Second) {
+	if m.IssuedAt < 1 || m.IssuedAt > now.Unix()+300 || m.ExpiresAt <= now.Unix() || m.ExpiresAt <= m.IssuedAt || m.ExpiresAt-m.IssuedAt > int64(MaxReleaseValidity/time.Second) {
 		return m, errors.New("release metadata expired or outside its freshness window")
 	}
 	return m, nil

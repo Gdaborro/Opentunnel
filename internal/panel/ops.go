@@ -1,27 +1,33 @@
 package panel
 
 import (
+	"context"
+	"errors"
 	"strings"
+	"time"
 )
 
 // DeviceHealth is one client-reported telemetry sample (upsert per device).
 type DeviceHealth struct {
-	Token        string  `json:"token"`
-	DeviceName   string  `json:"device_name"`
-	Status       string  `json:"status"`
-	Version      string  `json:"version"`
-	OS           string  `json:"os"`
-	Arch         string  `json:"arch"`
-	CPUPct       float64 `json:"cpu_pct"`
-	MemPct       float64 `json:"mem_pct"`
-	TempC        float64 `json:"temp_c"`
-	UptimeS      int64   `json:"uptime_s"`
-	LatencyMs    float64 `json:"latency_ms"`
-	JitterMs     float64 `json:"jitter_ms"`
-	ProbeLossPct float64 `json:"probe_loss_pct"`
-	LastIP       string  `json:"last_ip,omitempty"`
-	Country      string  `json:"country,omitempty"`
-	At           string  `json:"at"`
+	UpdateChannel         string  `json:"update_channel,omitempty"`
+	UpdateState           string  `json:"update_state,omitempty"`
+	ChannelAuthentication bool    `json:"channel_authentication,omitempty"`
+	Token                 string  `json:"token"`
+	DeviceName            string  `json:"device_name"`
+	Status                string  `json:"status"`
+	Version               string  `json:"version"`
+	OS                    string  `json:"os"`
+	Arch                  string  `json:"arch"`
+	CPUPct                float64 `json:"cpu_pct"`
+	MemPct                float64 `json:"mem_pct"`
+	TempC                 float64 `json:"temp_c"`
+	UptimeS               int64   `json:"uptime_s"`
+	LatencyMs             float64 `json:"latency_ms"`
+	JitterMs              float64 `json:"jitter_ms"`
+	ProbeLossPct          float64 `json:"probe_loss_pct"`
+	LastIP                string  `json:"last_ip,omitempty"`
+	Country               string  `json:"country,omitempty"`
+	At                    string  `json:"at"`
 }
 
 // ApprovedSSHPubKeys returns the stored public key of every approved
@@ -75,6 +81,43 @@ func (db *DB) MarkV5(token string) {
 	db.Exec(`UPDATE peers SET v5_seen=datetime('now') WHERE token=? AND v5_seen IS NULL`, token)
 }
 
+// CommitV5 is the checked, generation-bound upgrade latch used by the relay.
+// A targeted write failure or concurrent rekey must not report successful v5
+// authentication while leaving unsigned legacy downgrade admission available.
+func (db *DB) CommitV5(token, generation, publicKey string) error {
+	return db.CommitAuthentication(token, generation, publicKey, false)
+}
+
+func (db *DB) CommitAuthentication(token, generation, publicKey string, channelBound bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	p, err := accessPolicy(ctx, tx, token)
+	if err != nil {
+		return err
+	}
+	if p.Generation != generation || p.PublicKey != publicKey || publicKey == "" || (p.Status != "approved" && p.Status != "kicked") {
+		return errors.New("authentication identity changed")
+	}
+	if (p.ChannelSeen || p.ChannelRequired) && !channelBound {
+		return errors.New("connection-bound authentication required for this upgraded identity")
+	}
+	if !p.V5Seen || (channelBound && !p.ChannelVerified) {
+		result, err := tx.ExecContext(ctx, `UPDATE peers SET v5_seen=COALESCE(v5_seen,datetime('now')),channel_seen=MAX(channel_seen,?),channel_epoch=CASE WHEN ? THEN ? ELSE channel_epoch END WHERE token=? AND auth_epoch=? AND ssh_pubkey=? AND status IN ('approved','kicked')`, channelBound, channelBound, generation, token, generation, publicKey)
+		if err != nil {
+			return err
+		}
+		if n, err := result.RowsAffected(); err != nil || n != 1 {
+			return errors.New("authentication upgrade state was not persisted")
+		}
+	}
+	return tx.Commit()
+}
+
 // V5Seen reports whether the peer has ever authenticated with a v5
 // proof-of-possession handshake.
 func (db *DB) V5Seen(token string) bool {
@@ -126,12 +169,19 @@ func (db *DB) RecordVisit(token, domain string) {
 	if db == nil || token == "" || domain == "" {
 		return
 	}
+	if !db.telemetryAllowed() {
+		return
+	}
 	db.Exec(`INSERT INTO visits(token,domain,hits,last_seen) VALUES(?,?,1,datetime('now'))
 		ON CONFLICT(token,domain) DO UPDATE SET hits=hits+1, last_seen=datetime('now')`, token, domain)
 }
 
 // RecordHealth upserts a device telemetry sample.
 func (db *DB) RecordHealth(token, version, osName, arch string, cpuPct, memPct, tempC float64, uptimeS int64, latencyMs, jitterMs, probeLossPct float64) {
+	if !db.telemetryAllowed() {
+		cpuPct, memPct, tempC, latencyMs, jitterMs, probeLossPct = 0, 0, 0, 0, 0, 0
+		uptimeS = 0
+	}
 	db.Exec(`INSERT INTO device_health(token,version,os,arch,cpu_pct,mem_pct,temp_c,uptime_s,latency_ms,jitter_ms,probe_loss_pct,at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
 		ON CONFLICT(token) DO UPDATE SET
@@ -143,27 +193,9 @@ func (db *DB) RecordHealth(token, version, osName, arch string, cpuPct, memPct, 
 }
 
 // AllHealth joins telemetry with peers for the device inventory view.
+// Legacy callers receive nil on unavailable reads; HTTP uses AllHealthChecked.
 func (db *DB) AllHealth() []DeviceHealth {
-	rows, err := db.Query(`SELECT p.token, p.device_name, p.status,
-		COALESCE(h.version,''), COALESCE(h.os,''), COALESCE(h.arch,''),
-		COALESCE(h.cpu_pct,0), COALESCE(h.mem_pct,0), COALESCE(h.temp_c,0),
-		COALESCE(h.uptime_s,0), COALESCE(h.latency_ms,0), COALESCE(h.jitter_ms,0), COALESCE(h.probe_loss_pct,0),
-		COALESCE(p.last_ip,''), COALESCE(h.at,'')
-		FROM peers p LEFT JOIN device_health h ON h.token=p.token
-		ORDER BY p.last_seen DESC`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := []DeviceHealth{}
-	for rows.Next() {
-		var d DeviceHealth
-		if rows.Scan(&d.Token, &d.DeviceName, &d.Status, &d.Version, &d.OS, &d.Arch,
-			&d.CPUPct, &d.MemPct, &d.TempC, &d.UptimeS, &d.LatencyMs, &d.JitterMs, &d.ProbeLossPct,
-			&d.LastIP, &d.At) == nil {
-			out = append(out, d)
-		}
-	}
+	out, _ := db.AllHealthChecked(context.Background())
 	return out
 }
 
@@ -194,36 +226,48 @@ func (db *DB) RecordAlertOnce(severity, kind, message string) {
 }
 
 // Alerts returns recent alerts, unacked first.
+// Legacy callers receive nil on unavailable reads; HTTP uses a checked snapshot.
 func (db *DB) Alerts(limit int) []Alert {
-	if limit <= 0 {
-		limit = 50
-	}
-	rows, err := db.Query(`SELECT id, severity, kind, message, acked, at FROM alerts ORDER BY acked ASC, id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := []Alert{}
-	for rows.Next() {
-		var a Alert
-		var acked int
-		if rows.Scan(&a.ID, &a.Severity, &a.Kind, &a.Message, &acked, &a.At) == nil {
-			a.Acked = acked == 1
-			out = append(out, a)
-		}
-	}
+	out, _ := db.AlertsChecked(context.Background(), limit)
 	return out
 }
 
 // AckAlert marks an alert acknowledged.
 func (db *DB) AckAlert(id int64) {
-	db.Exec(`UPDATE alerts SET acked=1 WHERE id=?`, id)
+	_ = db.AckAlertChecked(context.Background(), id)
 }
 
-// UnackedAlertCount returns the number of unacknowledged alerts.
+func (db *DB) AckAlertChecked(parent context.Context, id int64) error {
+	if id < 1 {
+		return errors.New("invalid alert")
+	}
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE alerts SET acked=1 WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		return errors.New("alert not found")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(kind,detail) VALUES('alert-ack','operator acknowledged an alert')`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UnackedAlertCount returns the number of unacknowledged alerts, or -1 when
+// unavailable. Error-aware callers should use UnackedAlertCountChecked.
 func (db *DB) UnackedAlertCount() int {
-	var n int
-	db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE acked=0`).Scan(&n)
+	n, err := db.UnackedAlertCountChecked(context.Background())
+	if err != nil {
+		return -1
+	}
 	return n
 }
 

@@ -117,7 +117,11 @@ func serveUDPStream(rw io.ReadWriteCloser, opt Options, token, peerStatus, ingre
 		if name == "" && dst.IP != nil {
 			name = dst.IP.String()
 		}
-		if opt.PanelDB != nil && opt.PanelDB.IsBlocked(name) {
+		blocked, _, policyErr := opt.checkBlocked(name)
+		if policyErr != nil {
+			return
+		}
+		if blocked {
 			continue
 		}
 		raddr, err := resolveUDP(ctx, dst)

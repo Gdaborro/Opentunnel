@@ -14,6 +14,8 @@ package panel
 // person holding the kill-switch allowlist.
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"sort"
@@ -26,22 +28,31 @@ import (
 // kick expires on its own via the reaper (db.go reaper releases expired
 // kicks). Returns true when the peer was actually kicked.
 func (db *DB) AutoKick(token, reason string, until time.Time) bool {
-	if db == nil || token == "" {
+	if db == nil || !validTokenCharset(token) || len(reason) > 500 || !until.After(time.Now()) || until.After(time.Now().Add(24*time.Hour)) {
 		return false
 	}
-	if db.KillSwitchAllow(token) {
-		return false
-	}
-	res, err := db.Exec(`UPDATE peers SET status='kicked', kick_reason=?, kick_expires=? WHERE token=? AND status='approved'`,
-		reason, until.UTC().Format("2006-01-02 15:04:05"), token)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false
 	}
-	n, _ := res.RowsAffected()
-	if n > 0 {
-		db.RecordEvent("sentinel", "auto-kick "+shortPK(token)+": "+reason)
+	defer tx.Rollback()
+	p, err := accessPolicy(ctx, tx, token)
+	if err != nil || p.KillAllowed || p.Status != "approved" {
+		return false
 	}
-	return n > 0
+	res, err := tx.ExecContext(ctx, `UPDATE peers SET status='kicked',kick_reason=?,kick_expires=? WHERE token=? AND status='approved' AND auth_epoch=?`, reason, until.UTC().Format("2006-01-02 15:04:05"), token, p.Generation)
+	if err != nil {
+		return false
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(kind,detail) VALUES('sentinel',?)`, "auto-kick "+shortPK(token)+": "+reason); err != nil {
+		return false
+	}
+	return tx.Commit() == nil
 }
 
 // TravelHit is one impossible-travel finding: a token seen from two
@@ -232,17 +243,45 @@ func (db *DB) SentinelTick(countryOf func(string) string) {
 // fired within d. State lives in the settings table so restarts and
 // redeploys do not reset the gates.
 func (db *DB) throttleKV(key string, d time.Duration) bool {
+	if db == nil || len(key) < 1 || len(key) > 512 || d <= 0 || d > 24*time.Hour {
+		return false
+	}
 	k := "sentinel_ts_" + key
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback()
+	var raw string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, k).Scan(&raw)
+	if err != nil && err != sql.ErrNoRows {
+		return false
+	}
 	var last int64
-	if _, err := fmt.Sscanf(db.Setting(k), "%d", &last); err != nil {
-		last = 0
+	if err == nil {
+		if _, err := fmt.Sscanf(raw, "%d", &last); err != nil {
+			return false
+		}
 	}
 	now := time.Now().Unix()
 	if last > 0 && now-last < int64(d.Seconds()) {
 		return false
 	}
-	db.SetSetting(k, fmt.Sprintf("%d", now))
-	return true
+	if last == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key LIKE 'sentinel_ts_%' AND CAST(value AS INTEGER)<?`, now-24*3600); err != nil {
+			return false
+		}
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key LIKE 'sentinel_ts_%'`).Scan(&count); err != nil || count >= 8192 {
+			return false
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, k, fmt.Sprintf("%d", now)); err != nil {
+		return false
+	}
+	return tx.Commit() == nil
 }
 
 func shortPK(t string) string {

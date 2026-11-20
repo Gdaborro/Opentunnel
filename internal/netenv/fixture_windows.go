@@ -31,7 +31,7 @@ func NewManager() (*Manager, error) {
 	if _, err := loadFixture(path); err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(base, version.ProductName)
+	dir := filepath.Join(base, version.NetworkStateName())
 	if err := privatefile.EnsureDir(dir); err != nil {
 		return nil, err
 	}

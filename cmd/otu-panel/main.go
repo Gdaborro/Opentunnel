@@ -24,8 +24,11 @@ import (
 
 	"golang.org/x/crypto/acme/autocert"
 
+	"opentunnel/internal/authority"
 	"opentunnel/internal/config"
 	"opentunnel/internal/panel"
+	"opentunnel/internal/privatefile"
+	"opentunnel/internal/serverpool"
 	"opentunnel/internal/transport"
 	"opentunnel/internal/version"
 )
@@ -46,6 +49,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	if cfg.AuthorityURL != "" {
+		log.Fatal("a remote relay node cannot start a local panel/database; run otu-panel only at the central authority")
+	}
 
 	// Panel state dir must match the relay's so both open the same DB.
 	stateDir := os.Getenv("TMPDIR")
@@ -56,6 +62,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("panel db: %v", err)
 	}
+	defer panelDB.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	auth := panel.NewAuth(panelDB)
 	if envUser := os.Getenv("ADMIN_USER"); envUser != "" {
 		if envPass := os.Getenv("ADMIN_PASSWORD"); envPass != "" {
@@ -74,9 +83,50 @@ func main() {
 		}
 	}
 	ph := panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo)
-	ph, err = ph.WithServerPool(cfg.PoolID, cfg.EnrollmentLogin)
+	ph, err = ph.WithServerPoolAuthentication(cfg.PoolID, cfg.EnrollmentLogin, cfg.RequireChannelAuth && cfg.PoolID != "")
 	if err != nil {
 		log.Fatalf("server pool authority: %v", err)
+	}
+	ph.WithPoolChannelSupport(cfg.InnerTLSCertFile != "" && cfg.InnerTLSKeyFile != "")
+	if cfg.AuthorityListen != "" {
+		certData, err := privatefile.ReadOnly(cfg.AuthorityCert, 16<<10)
+		if err != nil {
+			log.Fatal("authority TLS certificate unavailable")
+		}
+		keyData, err := privatefile.ReadOnly(cfg.AuthorityKey, 16<<10)
+		if err != nil {
+			log.Fatal("authority TLS private key unavailable")
+		}
+		pair, err := tls.X509KeyPair(certData, keyData)
+		clear(keyData)
+		if err != nil {
+			log.Fatal("authority TLS identity invalid")
+		}
+		raw, err := serverpool.ReadDocument(cfg.AuthorityNodes)
+		var nodes authority.Nodes
+		if err != nil || serverpool.DecodeStrict(raw, &nodes) != nil || nodes.Validate() != nil {
+			log.Fatal("authority node inventory invalid; no implicit node trust")
+		}
+		tlsConfig, err := authority.ServerTLS(pair, nodes)
+		if err != nil {
+			log.Fatal(err)
+		}
+		info, err := panelDB.BindServerPoolAuthentication(cfg.PoolID, cfg.EnrollmentLogin, true)
+		if err != nil {
+			log.Fatal("authority policy mismatch")
+		}
+		ah, err := authority.NewHandler(panelDB, info, nodes, ph.Handler())
+		if err != nil {
+			log.Fatal(err)
+		}
+		srv := &http.Server{Addr: cfg.AuthorityListen, Handler: ah, TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+		defer srv.Close()
+		go func() { <-ctx.Done(); _ = srv.Close() }()
+		go func() {
+			if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				log.Print("panel: central authority listener stopped; relay requests will fail closed")
+			}
+		}()
 	}
 
 	// permitopen pins device-key forwarding to the relay's internal ws
@@ -92,55 +142,38 @@ func main() {
 		permitTarget = cfg.ListenInternal
 	}
 
-	// Approving a device installs/refreshes its SSH public key in the ssh
-	// tier's authorized_keys. The canonical line carries a forced command
-	// (1.0.1, N-11: `restrict` alone still permits non-PTY command
-	// execution and SFTP — proven empirically against OpenSSH 10.0) plus
-	// least-privilege options: forwarding ONLY to the internal ws
-	// listener. The rewrite is idempotent, drops malformed lines it finds,
-	// and refuses keys that fail validation outright. Ban and delete
-	// remove the key again — N-12: revocation is real.
+	// One serialized durable reconcile covers approval, revoke, rekey, reaper,
+	// missing files and missed hooks. Unknown operator entries are preserved.
 	akPath := os.Getenv("OTU_AUTHORIZED_KEYS")
 	if akPath == "" {
 		akPath = filepath.Join(stateDir, "authorized_keys")
 	}
-	ph.WithApproveHook(func(token string) {
-		pub, ok := panel.CanonicalSSHPubKey(ph.SSHKeyPath(token))
-		if !ok {
-			return
+	sshEnabled := cfg.ListenInternal != "" || os.Getenv("OTU_AUTHORIZED_KEYS") != ""
+	if info, err := os.Lstat(akPath); err == nil {
+		sshEnabled = sshEnabled || info.Mode().IsRegular()
+	} else if !os.IsNotExist(err) {
+		sshEnabled = true
+	}
+	if sshEnabled {
+		reconcile := func() error { _, err := panelDB.ReconcileSSH(akPath, permitTarget); return err }
+		ph.WithSSHReconciler(reconcile)
+		if err := reconcile(); err != nil {
+			log.Print("panel: managed SSH reconciliation incomplete; durable inventory retained")
 		}
-		if _, err := os.Stat(akPath); err != nil {
-			return
-		}
-		if _, err := panel.UpsertAuthorizedKey(akPath, pub, permitTarget); err != nil {
-			log.Printf("panel: authorize ssh key for %s: %v", shortLogTok(token), err)
-		}
-	})
-	ph.WithRevokeHook(func(token string) {
-		pub, ok := panel.CanonicalSSHPubKey(ph.SSHKeyPath(token))
-		if !ok {
-			return
-		}
-		if _, err := os.Stat(akPath); err != nil {
-			return
-		}
-		if _, err := panel.RemoveAuthorizedKey(akPath, pub); err != nil {
-			log.Printf("panel: revoke ssh key for %s: %v", shortLogTok(token), err)
-		}
-	})
-
-	// Startup self-heal (2026-11-05 incident): an approved device whose
-	// line is missing from the file the running sshd actually reads can
-	// never authenticate — and nothing on the device can distinguish
-	// "not approved" from "key lost". Re-add every approved device's key
-	// on startup: only ADDS missing lines, never removes, so revocations
-	// and operator entries are untouched.
-	if _, err := os.Stat(akPath); err == nil {
-		if n, err := panel.ReconcileAuthorizedKeys(akPath, permitTarget, panelDB.ApprovedSSHPubKeys()); err != nil {
-			log.Printf("panel: authorized_keys reconcile: %v", err)
-		} else if n > 0 {
-			log.Printf("panel: authorized_keys reconcile: restored %d missing device key(s)", n)
-		}
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := reconcile(); err != nil {
+						log.Print("panel: managed SSH reconciliation incomplete; durable inventory retained")
+					}
+				}
+			}
+		}()
 	}
 
 	srv := &http.Server{
@@ -154,9 +187,7 @@ func main() {
 	}
 
 	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
+		<-ctx.Done()
 		_ = srv.Close()
 	}()
 
@@ -218,6 +249,8 @@ func main() {
 			ReadHeaderTimeout: 15 * time.Second,
 			TLSConfig:         tlsCfg,
 		}
+		defer tlsSrv.Close()
+		go func() { <-ctx.Done(); _ = tlsSrv.Close() }()
 		go func() {
 			log.Printf("panel tls listener on %s", *tlsListen)
 			if err := tlsSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
@@ -233,8 +266,13 @@ func main() {
 	go func() {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
-		for range t.C {
-			panelDB.SentinelTick(geo.CountryName)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				panelDB.SentinelTick(geo.CountryName)
+			}
 		}
 	}()
 

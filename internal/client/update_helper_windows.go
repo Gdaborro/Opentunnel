@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -16,6 +17,76 @@ import (
 
 func prepareUpdateHelper(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+}
+
+func updateProcessCreated(pid int) (uint64, error) {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseHandle(h)
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {
+		return 0, err
+	}
+	return uint64(created.HighDateTime)<<32 | uint64(created.LowDateTime), nil
+}
+
+// Old journals did not record the replacement PID. Check exact executable
+// paths as well as recorded owners before any recovery rename. Matching image
+// names with unreadable process identity are not permission to risk a rollback.
+func anotherUpdateImageAlive(images ...string) (bool, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return false, err
+	}
+	defer windows.CloseHandle(snapshot)
+	entry := windows.ProcessEntry32{Size: uint32(unsafe.Sizeof(windows.ProcessEntry32{}))}
+	for err = windows.Process32First(snapshot, &entry); err == nil; err = windows.Process32Next(snapshot, &entry) {
+		if entry.ProcessID == uint32(os.Getpid()) {
+			continue
+		}
+		candidate := false
+		for _, image := range images {
+			if strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), filepath.Base(image)) {
+				candidate = true
+				break
+			}
+		}
+		if !candidate {
+			continue
+		}
+		alive, queryErr := updateProcessAlive(int(entry.ProcessID), images...)
+		if queryErr != nil {
+			// A process can disappear between snapshot and query. Retry once
+			// without trusting PID reuse or an access-denied matching image.
+			time.Sleep(time.Millisecond)
+			alive, queryErr = updateProcessAlive(int(entry.ProcessID), images...)
+		}
+		if queryErr != nil {
+			return false, queryErr
+		}
+		if alive {
+			return true, nil
+		}
+	}
+	if !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+		return false, err
+	}
+	return false, nil
+}
+
+func moveUpdateNoReplace(source, destination string) error {
+	from, err := windows.UTF16PtrFromString(source)
+	if err != nil {
+		return err
+	}
+	to, err := windows.UTF16PtrFromString(destination)
+	if err != nil {
+		return err
+	}
+	// Deliberately omit MOVEFILE_REPLACE_EXISTING, including dangling links.
+	return windows.MoveFileEx(from, to, windows.MOVEFILE_WRITE_THROUGH)
 }
 func validateActualUpdateParent(pid int, image string) error {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)

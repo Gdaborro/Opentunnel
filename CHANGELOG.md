@@ -1,5 +1,62 @@
 # Changelog
 
+## v1.1.11 - pre-1.2 hardening
+
+- Add explicit `transport = "h3"` selection using the existing pinned HTTP/3
+  transport and stream-rotation bounds. UDP-blocked networks still fail over to
+  WS-TLS/SSH rather than weakening certificate or host-key checks.
+- Keep the canonical `v` tag in the client's `--version` output and signed-update
+  preflight so both v1.1.10 and newer clients accept a correctly stamped upgrade.
+  Server/panel display versions remain unprefixed.
+- Fix signed-update display-version preflight, restrict the update helper to the
+  exact private journal before any ACL/lock work, and recover the crash window
+  where the old executable was moved but the staged one was not installed.
+- Parse recovery arguments by actual flag semantics, make plain bootstrap a
+  first-run-only operation with fail-closed approval state, and replace global
+  image-name termination with PID/creation/path-verified `--stop` recovery.
+- Reject root rotations issued after predecessor expiry, off-recipe ARM64 client
+  artifacts and malformed legacy freshness timestamps; fail closed for unknown
+  sources when anti-abuse source maps saturate instead of discarding punishment.
+- Fail closed on stale/failed policy, authority and accounting reads; bind usage
+  to authenticated identities and complete managed SSH desired-state
+  reconciliation without deleting unrelated administrator keys.
+- Add optional, independently pinned mutual TLS 1.3 channel authentication and
+  fresh v6 connection proofs with durable downgrade latches. Migration is
+  explicit: existing configurations are not silently made more restrictive.
+- Correct automatic HTTP/SOCKS setup, transfer cancellation/drain ownership and
+  network-change handling. Preserve orphan proxy journals, retry explicit
+  `--restore`/`--restore-from` across the forced-stop lease window, and keep
+  double-click startup failures visible instead of looking like instant crashes.
+- Add a narrowly authenticated central authority for independent relay nodes,
+  with per-node credentials, conservative aggregate reservations and denial of
+  new work during authority loss. Relays cannot open the authority database or
+  administrator sessions.
+- Add read-only secret-free client status, opt-in minimal telemetry and bounded
+  retention controls without silently removing monitoring, bans or accounting.
+- Separate hosted and generic client identity/update state while retaining the
+  released hosted asset name and sharing only the Windows network-recovery lease.
+- Add signed release-bundle inventory, candidate/canary/stable channel policy,
+  root-rotation verification, fixed source/build provenance and least-privilege
+  reference service units. These contracts do not themselves authorize a release.
+- Add repeatable authority, rollback, transport and mixed-traffic soak harnesses,
+  native executable acceptance, frontend gates and exact-source artifact checks.
+- Stamp the fixed release recipe's display version without the canonical `v`
+  tag prefix while keeping `v` on the update tag and compatibility floor. The
+  previous stamp made staged `--version` smoke output inconsistent and blocked
+  the release build job.
+- Normalize checkout roots before the link check, so a trailing separator or
+  final `/.` cannot make `Lstat` follow a linked repository root. Added symlink
+  and junction regressions.
+- Describe a saved-device-name mismatch as a likely copied identity and direct
+  the operator to the separate identity-reset package; never reset credentials
+  automatically.
+
+Version and update floor raised to v1.1.11. This remains a Windows/Linux
+application-proxy release, not a system-wide VPN/TUN driver. Existing admission,
+privacy, pool and listener settings are preserved; optional channel/pool features
+still require explicit provisioning and approval. See `docs/PRE-1.2-HARDENING.md`
+and `docs/HARDENING-ACCEPTANCE.md` for the evidence required before promotion.
+
 ## v1.1.10 - trusted server pools and enrollment accounts
 
 - Add explicitly imported, Ed25519-signed, credential-free self-hosted profiles
