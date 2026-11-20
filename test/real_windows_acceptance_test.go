@@ -391,29 +391,58 @@ func TestRealWindowsProxyCompetingChangeIsNotOverwritten(t *testing.T) {
 	restoreRealRegistry(t, original)
 }
 
+func setWinINETReadOnlyACL(t *testing.T) string {
+	t.Helper()
+	objectName := `CURRENT_USER\` + fixtureWinINET
+	descriptor, err := windows.GetNamedSecurityInfo(objectName, windows.SE_REGISTRY_KEY, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal("read disposable registry security descriptor", err)
+	}
+	original := descriptor.String()
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal("resolve current user SID", err)
+	}
+	readOnly, err := windows.SecurityDescriptorFromString("D:P(A;;0x00020019;;;" + user.User.Sid.String() + ")")
+	if err != nil {
+		t.Fatal("build read-only registry descriptor", err)
+	}
+	dacl, _, err := readOnly.DACL()
+	if err != nil {
+		t.Fatal("read read-only DACL", err)
+	}
+	if err := windows.SetNamedSecurityInfo(objectName, windows.SE_REGISTRY_KEY, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		t.Fatal("apply disposable read-only registry ACL", err)
+	}
+	return original
+}
+
+func restoreWinINETACL(t *testing.T, sddl string) {
+	t.Helper()
+	descriptor, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatal("parse original registry security descriptor", err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatal("read original registry DACL", err)
+	}
+	if err := windows.SetNamedSecurityInfo(`CURRENT_USER\`+fixtureWinINET, windows.SE_REGISTRY_KEY, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		t.Fatal("restore original registry ACL", err)
+	}
+}
+
 func TestRealWindowsProxyReadOnlyACLDoesNotPartiallyApply(t *testing.T) {
 	_ = realWindowsClient(t)
 	original := realRegistrySnapshot(t)
 	defer restoreRealRegistry(t, original)
 	binary, config, _, _ := realAcceptanceConfig(t, "real-windows-acl")
-	backup := filepath.Join(t.TempDir(), "acl.sddl")
-	setReadOnly := `Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; $p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $a=Get-Acl $p; $a.GetSecurityDescriptorSddlForm('All') | Set-Content -LiteralPath $env:OTU_ACL_BACKUP -Encoding ascii; $a.SetAccessRuleProtection($true,$false); $u=[Security.Principal.WindowsIdentity]::GetCurrent().Name; $r=New-Object Security.AccessControl.RegistryAccessRule($u,'ReadKey','Allow'); $a.AddAccessRule($r); Set-Acl $p $a`
-	restoreACL := `Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; $p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'; $a=Get-Acl $p; $a.SetSecurityDescriptorSddlForm((Get-Content -LiteralPath $env:OTU_ACL_BACKUP -Raw),'All'); Set-Acl $p $a`
-	t.Setenv("OTU_ACL_BACKUP", backup)
-	if output, err := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-Command", setReadOnly).CombinedOutput(); err != nil {
-		t.Fatal("apply disposable registry ACL", err, string(output))
-	}
-	defer func() {
-		if output, err := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-Command", restoreACL).CombinedOutput(); err != nil {
-			t.Errorf("restore disposable registry ACL: %v: %s", err, output)
-		}
-	}()
+	originalACL := setWinINETReadOnlyACL(t)
+	defer restoreWinINETACL(t, originalACL)
 	process := startRealClient(t, binary, config)
 	_ = process.wait(t)
 	waitRealRegistry(t, original)
-	if output, err := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-Command", restoreACL).CombinedOutput(); err != nil {
-		t.Fatal("restore registry ACL before explicit recovery", err, string(output))
-	}
+	restoreWinINETACL(t, originalACL)
 	restore := exec.Command(binary, "-c", config, "--restore")
 	restore.Env = os.Environ()
 	if output, err := restore.CombinedOutput(); err != nil {
