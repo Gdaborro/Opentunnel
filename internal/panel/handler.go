@@ -149,8 +149,7 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 	// Standalone kill-switch console (plain HTML; the SPA bundle predates
 	// the reason/allowlist fields and there is no rebuild toolchain).
 	mux.Handle("/admin/killswitch", h.auth.RequireAuth(http.HandlerFunc(h.killswitchPage)))
-	// Standalone sentinel console (plain HTML, same reasoning as above):
-	// mode toggle + recent findings, no SPA rebuild needed.
+	// Legacy sentinel bookmark: the integrated SPA owns this UI now.
 	mux.Handle("/admin/sentinel", h.auth.RequireAuth(http.HandlerFunc(h.sentinelPage)))
 	mux.Handle("/admin/ssh-keys", h.auth.RequireAuth(http.HandlerFunc(h.sshKeysPage)))
 	mux.Handle("/admin/ssh-keys.js", h.auth.RequireAuth(http.HandlerFunc(h.sshKeysScript)))

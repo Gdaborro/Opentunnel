@@ -447,7 +447,6 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 			if pub == "" {
 				opt.logger().Printf("server: no registered key for %s — v5 signature not enforced this session", shortToken(hs.Token))
 			} else if !verifySessionHandshakeSig(pub, hs, stream) {
-				opt.guard().Punish(peerIP)
 				opt.sentinel().StolenToken(hs.Token, peerIP, "handshake signature mismatch")
 				opt.logger().Printf("server: v5 signature mismatch for %s", shortToken(hs.Token))
 				_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
@@ -492,7 +491,6 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 				enforce = !opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After)
 			}
 			if enforce {
-				opt.guard().Punish(peerIP)
 				opt.sentinel().StolenToken(hs.Token, peerIP, "v4 downgrade attempt")
 				opt.logger().Printf("server: v4 downgrade attempt for %s (v5 required)", shortToken(hs.Token))
 				_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)

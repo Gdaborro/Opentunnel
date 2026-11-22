@@ -243,6 +243,57 @@ func TestPoolEnrollmentProofAndReplay(t *testing.T) {
 	}
 }
 
+func TestPoolEnrollmentIdentityConflictAlertsWithoutMutation(t *testing.T) {
+	db, h := enrollmentFixture(t, false)
+	original, _ := enrollmentIdentity(t, "original")
+	if _, _, err := db.enrollPool(t.Context(), original, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE peers SET status='approved',approval_required=0,auth_epoch='original-generation' WHERE token=?`, original.Token); err != nil {
+		t.Fatal(err)
+	}
+	before := identityStateSnapshot(t, db)
+	var enrolledPool, enrolledKey string
+	if err := db.QueryRow(`SELECT pool_id,public_key FROM peer_enrollments WHERE token=?`, original.Token).Scan(&enrolledPool, &enrolledKey); err != nil {
+		t.Fatal(err)
+	}
+
+	conflict, conflictKey := enrollmentIdentity(t, "conflict")
+	conflict.Token = original.Token
+	for i := 0; i < 2; i++ {
+		r, _ := enrollmentHTTP(conflict, conflictKey, "")
+		r.RemoteAddr = "203.0.113.87:40000"
+		w := httptest.NewRecorder()
+		h.enrollPool(w, r)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("identity conflict status = %d, want 409: %s", w.Code, w.Body.String())
+		}
+	}
+	var severity, kind, message string
+	if err := db.QueryRow(`SELECT severity,kind,message FROM alerts WHERE kind='security'`).Scan(&severity, &kind, &message); err != nil {
+		t.Fatalf("signed-pool conflict alert: %v", err)
+	}
+	for _, want := range []string{"203.0.113.87", "ssh_pubkey", "fingerprint", "stored identity preserved", "possible clone, reinstall, or spoof"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("conflict alert missing %q: %s", want, message)
+		}
+	}
+	if severity != "warning" || kind != "security" {
+		t.Fatalf("unexpected conflict alert classification: %s %s", severity, kind)
+	}
+	var securityAlerts int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE kind='security'`).Scan(&securityAlerts); err != nil || securityAlerts != 1 {
+		t.Fatalf("conflict alert was not throttled: %d err=%v", securityAlerts, err)
+	}
+	if after := identityStateSnapshot(t, db); after != before {
+		t.Fatal("identity conflict changed the original peer, keys, status, epoch, managed keys, or bans")
+	}
+	var afterPool, afterKey string
+	if err := db.QueryRow(`SELECT pool_id,public_key FROM peer_enrollments WHERE token=?`, original.Token).Scan(&afterPool, &afterKey); err != nil || afterPool != enrolledPool || afterKey != enrolledKey {
+		t.Fatalf("signed enrollment binding changed: %q %q err=%v", afterPool, afterKey, err)
+	}
+}
+
 func TestPoolEnrollmentAccountDisableAndQuotaAreTransactional(t *testing.T) {
 	db, _ := enrollmentFixture(t, true)
 	account := createSyntheticEnrollmentAccount(t, db, 1)

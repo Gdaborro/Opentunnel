@@ -135,6 +135,20 @@ export interface AlertItem {
   at: string
 }
 
+export type SentinelMode = "off" | "alert" | "respond"
+
+export interface SentinelFinding {
+  severity: "info" | "warning" | "critical"
+  message: string
+  at: string
+}
+
+export interface SentinelSnapshot {
+  mode: SentinelMode
+  alerts_24h: number
+  recent: SentinelFinding[]
+}
+
 export interface ServerHealth {
   relay_online?: boolean
   metrics_age_s?: number
@@ -208,6 +222,8 @@ export const api = {
   devices: () => req<DeviceHealth[]>("/admin/api/devices"),
   alerts: () => req<{ alerts: AlertItem[]; unacked: number }>("/admin/api/alerts"),
   ackAlert: (id: number) => req<{ ok: boolean }>("/admin/api/alerts", post({ id, ack: true })),
+  sentinel: () => req<SentinelSnapshot>("/admin/api/sentinel"),
+  setSentinelMode: (mode: SentinelMode) => req<{ mode: SentinelMode }>("/admin/api/sentinel", post({ mode })),
   serverHealth: () => req<ServerHealth>("/admin/api/server-health"),
   peerAction: (token: string, action: string, body?: unknown) =>
     req<{ ok: boolean; ssh_reconcile_pending?: boolean }>(`/admin/api/peers/${token}/${action}`, body !== undefined ? post(body) : { method: "POST" }),

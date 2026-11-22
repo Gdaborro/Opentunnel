@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -246,6 +247,103 @@ func TestV4DowngradeGate(t *testing.T) {
 	pastOpt.RequireV5After = time.Now().Add(-time.Hour)
 	if st := dialV4(pastOpt); st != protocol.StatusBadToken {
 		t.Fatalf("post-date v4: status=%d, want BadToken", st)
+	}
+}
+
+func spoofTestHandshakeStatus(t *testing.T, opt Options, ip, token string, legacy bool) byte {
+	t.Helper()
+	client, server := net.Pipe()
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(3 * time.Second))
+	done := make(chan struct{})
+	go func() {
+		handleSession(server, opt, ip, "")
+		close(done)
+	}()
+	var err error
+	if legacy {
+		err = protocol.WriteHandshake(client, token)
+	} else {
+		err = protocol.WriteHandshakeV5(client, token, protocol.RandomSalt(), make([]byte, ed25519.SignatureSize))
+	}
+	if err != nil {
+		t.Fatalf("write spoof-test handshake: %v", err)
+	}
+	_, status, err := protocol.ReadHandshakeStatus(client)
+	if err != nil {
+		t.Fatalf("read spoof-test status: %v", err)
+	}
+	<-done // The generic bad-token verdict is written before Guard.Punish.
+	return status
+}
+
+func TestSpoofOnlyHandshakesDoNotBanSource(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshPub, _ := ssh.NewPublicKey(pub)
+	authKey := string(ssh.MarshalAuthorizedKey(sshPub))
+	for _, legacy := range []bool{false, true} {
+		name := "v5-bad-signature"
+		if legacy {
+			name = "established-key-v4-downgrade"
+		}
+		t.Run(name, func(t *testing.T) {
+			const token = "spoof-only-token-123456"
+			const ip = "203.0.113.91"
+			v5State := &atomic.Bool{}
+			v5State.Store(legacy)
+			guard := NewGuard(4, 32, time.Hour, time.Hour)
+			reporter := newSentinelStub()
+			opt := Options{
+				PanelDB: v5Stub{token: token, pubkey: authKey, v5: v5State},
+				Guard:   guard,
+				Sntl:    NewSentinel(reporter, guard),
+			}
+			for i := 0; i < sentinelAuthFlood+2; i++ {
+				if status := spoofTestHandshakeStatus(t, opt, ip, token, legacy); status != protocol.StatusBadToken {
+					t.Fatalf("spoof attempt status = %d, want BadToken", status)
+				}
+			}
+			if release := guard.Acquire(ip); release == nil {
+				t.Fatal("repeated spoof-only attempts banned the source")
+			} else {
+				release()
+			}
+			if reporter.eventCount() != 0 {
+				t.Fatal("spoof-only attempts triggered an enforcement event")
+			}
+			if got := reporter.alertText(); !strings.Contains(got, "possible stolen token") || strings.Contains(got, "auth-failure flood") {
+				t.Fatalf("unexpected spoof-only reporting: %q", got)
+			}
+		})
+	}
+}
+
+func TestUnknownTokenFloodStillBansSource(t *testing.T) {
+	const ip = "203.0.113.92"
+	guard := NewGuard(4, 32, time.Hour, time.Hour)
+	opt := Options{
+		PanelDB: v5Stub{token: "known-token-123456"},
+		Guard:   guard,
+		Sntl:    NewSentinel(newSentinelStub(), guard),
+	}
+	for i := 0; i < 3; i++ {
+		if status := spoofTestHandshakeStatus(t, opt, ip, "unknown-token-123456", false); status != protocol.StatusBadToken {
+			t.Fatalf("unknown token status = %d, want BadToken", status)
+		}
+	}
+	guard.mu.Lock()
+	failures := 0
+	if record := guard.fails[ip]; record != nil {
+		failures = record.count
+	}
+	bannedUntil := guard.bans[ip]
+	guard.mu.Unlock()
+	if release := guard.Acquire(ip); release != nil {
+		release()
+		t.Fatalf("generic unknown-token failures no longer ban a brute-force source (failures=%d banned_until=%v)", failures, bannedUntil)
 	}
 }
 

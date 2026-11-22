@@ -15,6 +15,7 @@ package panel
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"net"
@@ -200,6 +201,81 @@ func (db *DB) DetectRegBurst(minN int, window time.Duration) []RegBurstHit {
 	return out
 }
 
+const (
+	sentinelIdentityPeerLimit = 4096
+	sentinelIdentityHitLimit  = 64
+)
+
+type duplicateIdentityHit struct {
+	TokenA, TokenB           string
+	SameKey, SameFingerprint bool
+}
+
+// detectDuplicateIdentities compares approved and pending peers without changing
+// identity state. Both the inventory and emitted pairs are bounded; key
+// comments/options are ignored by canonicalization before comparison.
+func (db *DB) detectDuplicateIdentities(limit int) []duplicateIdentityHit {
+	if db == nil || limit <= 0 {
+		return nil
+	}
+	limit = min(limit, sentinelIdentityHitLimit)
+	rows, err := db.Query(`SELECT token,fingerprint,COALESCE(ssh_pubkey,'') FROM peers
+		WHERE status IN ('approved','pending') ORDER BY token LIMIT ?`, sentinelIdentityPeerLimit)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	type identity struct {
+		token, fingerprint, key string
+	}
+	peers := make([]identity, 0, 256)
+	byKey := map[string][]int{}
+	byFingerprint := map[string][]int{}
+	var out []duplicateIdentityHit
+	for rows.Next() {
+		var p identity
+		var rawKey string
+		if rows.Scan(&p.token, &p.fingerprint, &rawKey) != nil {
+			continue
+		}
+		p.key, _ = CanonicalSSHPubKey(rawKey)
+		candidates := map[int]struct{}{}
+		for _, i := range byKey[p.key] {
+			candidates[i] = struct{}{}
+		}
+		for _, i := range byFingerprint[p.fingerprint] {
+			candidates[i] = struct{}{}
+		}
+		prior := make([]int, 0, len(candidates))
+		for i := range candidates {
+			prior = append(prior, i)
+		}
+		sort.Ints(prior)
+		current := len(peers)
+		for _, i := range prior {
+			other := peers[i]
+			hit := duplicateIdentityHit{TokenA: other.token, TokenB: p.token,
+				SameKey:         p.key != "" && p.key == other.key,
+				SameFingerprint: p.fingerprint != "" && p.fingerprint == other.fingerprint}
+			if hit.SameKey || hit.SameFingerprint {
+				out = append(out, hit)
+				if len(out) >= limit {
+					return out
+				}
+			}
+		}
+		peers = append(peers, p)
+		if p.key != "" {
+			byKey[p.key] = append(byKey[p.key], current)
+		}
+		if p.fingerprint != "" {
+			byFingerprint[p.fingerprint] = append(byFingerprint[p.fingerprint], current)
+		}
+	}
+	return out
+}
+
 // SentinelTick runs the panel-side detectors once. otu-panel calls it on a
 // one-minute cadence. countryOf may be nil (travel detection degrades).
 func (db *DB) SentinelTick(countryOf func(string) string) {
@@ -237,6 +313,32 @@ func (db *DB) SentinelTick(countryOf func(string) string) {
 		db.RecordAlert("warning", "sentinel", fmt.Sprintf(
 			"registration burst: %d new devices from %s in 1h", h.N, h.Subnet))
 	}
+	for _, h := range db.detectDuplicateIdentities(sentinelIdentityHitLimit) {
+		if !db.throttleKV(sentinelDigestKey("duplicate-identity", h.TokenA, h.TokenB), 6*time.Hour) {
+			continue
+		}
+		shared := "both the same canonical device public key and the same hardware fingerprint"
+		switch {
+		case h.SameKey && !h.SameFingerprint:
+			shared = "the same canonical device public key with different hardware fingerprints"
+		case h.SameFingerprint && !h.SameKey:
+			shared = "the same hardware fingerprint with different device public keys"
+		}
+		db.RecordAlert("warning", "security", fmt.Sprintf(
+			"possible clone, reinstall, or spoof: active devices %s and %s share %s — review only; stored identities unchanged",
+			shortPK(h.TokenA), shortPK(h.TokenB), shared))
+	}
+}
+
+// sentinelDigestKey keeps raw identity material out of persistent throttle
+// keys while giving each stable subject its own gate.
+func sentinelDigestKey(scope string, parts ...string) string {
+	h := sha256.New()
+	for _, part := range parts {
+		fmt.Fprintf(h, "%d:", len(part))
+		h.Write([]byte(part))
+	}
+	return fmt.Sprintf("%s|%x", scope, h.Sum(nil))
 }
 
 // throttleKV is a persistent per-subject throttle: true when key has not

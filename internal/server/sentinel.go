@@ -13,7 +13,7 @@ package server
 //
 //   - auth-failure flood from one IP  → 30-minute guard ban + alert
 //   - unverified token use (v5 signature mismatch / v4 downgrade) → critical
-//     alert; sustained failures may ban the source, never the named victim
+//     alert only; neither the failing source nor the named victim is banned
 //   - scanning/probing floods → alert only (probers already get the decoy;
 //     changing their response would itself fingerprint the relay)
 //
@@ -294,15 +294,15 @@ func (s *Sentinel) AuthFail(ip string) {
 }
 
 // StolenToken observes an attempt that knows a token but has not proven
-// private-key possession. Automatically kicking the named device here lets
-// a token thief disconnect the legitimate victim by sending one bad signature.
-// Alert on the evidence; only the failing source may be rate-limited.
+// private-key possession. Automatically kicking the named device or banning
+// the failing source here would turn unverified evidence into a denial-of-
+// service primitive. Report only; generic malformed/unknown-token floods keep
+// their independent brute-force handling.
 func (s *Sentinel) StolenToken(token, ip, what string) {
 	if token == "" || !s.active() {
 		return
 	}
 	s.hit("stolen", token, sentinelThrottle)
-	s.AuthFail(ip)
 	msg := what + " for device " + shortToken(token) + " — possible stolen token"
 	if ip != "" && !isLoopbackIP(ip) {
 		msg += " (source " + ip + "; device left connected)"

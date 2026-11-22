@@ -194,6 +194,7 @@ func (h *Handler) enrollPool(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "enrollment login required", 401)
 		return
 	case errors.Is(err, errEnrollmentIdentityConflict):
+		h.db.recordPoolIdentityConflict(req, clientIP(r))
 		http.Error(w, "stored identity differs; administrator verification required", 409)
 		return
 	case errors.Is(err, errEnrollmentDenied):
@@ -219,6 +220,36 @@ var (
 	errEnrollmentIdentityConflict = errors.New("enrollment identity conflict")
 	errEnrollmentDenied           = errors.New("enrollment denied")
 )
+
+// recordPoolIdentityConflict makes a rejected signed-pool identity change
+// visible without changing the enrolled identity or banning either party.
+func (db *DB) recordPoolIdentityConflict(req enrollmentRequest, ip string) {
+	if db == nil || !db.throttleKV(sentinelDigestKey("pool-key-conflict", req.Token), time.Hour) {
+		return
+	}
+	var existingKey, existingFP, enrolledUser string
+	err := db.QueryRow(`SELECT COALESCE(p.ssh_pubkey,''),p.fingerprint,COALESCE(e.username,'')
+		FROM peers p LEFT JOIN peer_enrollments e ON e.token=p.token WHERE p.token=?`, req.Token).
+		Scan(&existingKey, &existingFP, &enrolledUser)
+	fields := make([]string, 0, 3)
+	if err == nil {
+		if !sameSSHKey(existingKey, req.SSHPubKey) {
+			fields = append(fields, "ssh_pubkey")
+		}
+		if existingFP != req.Fingerprint {
+			fields = append(fields, "fingerprint")
+		}
+		if req.Username != "" && enrolledUser != "" && enrolledUser != req.Username {
+			fields = append(fields, "username")
+		}
+	}
+	if len(fields) == 0 {
+		fields = append(fields, "identity")
+	}
+	db.RecordAlert("warning", "security", "conflicting signed-pool enrollment identity for device "+shortPK(req.Token)+
+		" from "+ip+"; changed field(s): "+strings.Join(fields, ", ")+
+		"; stored identity preserved — possible clone, reinstall, or spoof; review required")
+}
 
 type verifiedEnrollmentAccount struct {
 	username string

@@ -232,7 +232,7 @@ func TestDiagnosticReadsOptionalFieldsAndGETNoMutation20261116(t *testing.T) {
 				}
 			case "sentinel":
 				v := value.(map[string]any)
-				if v["mode"] != "respond" || len(v["recent"].([]any)) != 1 {
+				if v["mode"] != "respond" || len(v["recent"].([]any)) != 2 {
 					t.Fatal("released default or nullable finding was not preserved")
 				}
 			case "stats":
@@ -272,8 +272,11 @@ func TestDiagnosticReadsSuccessfulSnapshots20261116(t *testing.T) {
 		t.Fatal("valid abuse counters changed", err)
 	}
 	sentinel, err := db.SentinelChecked(t.Context())
-	if err != nil || sentinel["mode"] != "alert" || sentinel["alerts_24h"] != 2 || len(sentinel["recent"].([]diagnosticFinding)) != 1 {
+	if err != nil || sentinel["mode"] != "alert" || sentinel["alerts_24h"] != 2 || len(sentinel["recent"].([]diagnosticFinding)) != 2 {
 		t.Fatal("valid sentinel counters changed", err)
+	}
+	if sentinel["recent"].([]diagnosticFinding)[0].Message != "synthetic second finding" {
+		t.Fatal("security finding missing from recent sentinel diagnostics")
 	}
 	alerts, err := db.AlertsSnapshotChecked(t.Context(), 60)
 	if err != nil || alerts["unacked"] != 2 || len(alerts["alerts"].([]Alert)) != 2 {
@@ -287,7 +290,7 @@ func TestDiagnosticReadsReleasedTimestampFormatting20261116(t *testing.T) {
 	if err := db.QueryRow(`SELECT at FROM events ORDER BY id DESC LIMIT 1`).Scan(&eventAt); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT at FROM alerts WHERE kind='sentinel' LIMIT 1`).Scan(&findingAt); err != nil {
+	if err := db.QueryRow(`SELECT at FROM alerts WHERE kind IN ('sentinel','security') ORDER BY id DESC LIMIT 1`).Scan(&findingAt); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow(`SELECT at FROM alerts ORDER BY acked ASC,id DESC LIMIT 1`).Scan(&alertAt); err != nil {

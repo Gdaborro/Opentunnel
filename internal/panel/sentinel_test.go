@@ -3,6 +3,7 @@ package panel
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,30 @@ func seedPeer(t *testing.T, db *DB, token, status string) {
 		VALUES(?, 'fp', 'dev', ?, datetime('now'), datetime('now'))`, token, status); err != nil {
 		t.Fatalf("seed %s: %v", token, err)
 	}
+}
+
+func seedIdentityPeer(t *testing.T, db *DB, token, status, fingerprint, key string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen,auth_epoch)
+		VALUES(?,?,'dev',?,?,datetime('now'),datetime('now'),?)`, token, fingerprint, key, status, token+"-epoch"); err != nil {
+		t.Fatalf("seed identity %s: %v", token, err)
+	}
+}
+
+func identityStateSnapshot(t *testing.T, db *DB) string {
+	t.Helper()
+	var peers, fingerprintBans, keyBans, managedKeys string
+	for query, dst := range map[string]*string{
+		`SELECT COALESCE(group_concat(token||'|'||fingerprint||'|'||COALESCE(ssh_pubkey,'')||'|'||status||'|'||auth_epoch,';'),'') FROM (SELECT * FROM peers ORDER BY token)`: &peers,
+		`SELECT COALESCE(group_concat(fingerprint||'|'||COALESCE(reason,''),';'),'') FROM (SELECT * FROM fingerprints_banned ORDER BY fingerprint)`:                           &fingerprintBans,
+		`SELECT COALESCE(group_concat(pubkey||'|'||COALESCE(reason,''),';'),'') FROM (SELECT * FROM pubkeys_banned ORDER BY pubkey)`:                                          &keyBans,
+		`SELECT COALESCE(group_concat(public_key||'|'||desired,';'),'') FROM (SELECT * FROM managed_ssh_keys ORDER BY public_key)`:                                            &managedKeys,
+	} {
+		if err := db.QueryRow(query).Scan(dst); err != nil {
+			t.Fatalf("identity snapshot: %v", err)
+		}
+	}
+	return peers + "\n" + fingerprintBans + "\n" + keyBans + "\n" + managedKeys
 }
 
 // TestAutoKick: kicks only approved, non-allowlisted devices; the kick
@@ -209,6 +234,104 @@ func TestSentinelTickOffIsSilent(t *testing.T) {
 	}
 }
 
+func TestSentinelDuplicateActiveIdentityIsReviewOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		fingerprintA, fingerprintB string
+		differentKey               bool
+		want                       string
+	}{
+		{"same-key-different-fingerprint", "hwid-a", "hwid-b", false, "same canonical device public key with different hardware fingerprints"},
+		{"same-fingerprint-different-key", "hwid-shared", "hwid-shared", true, "same hardware fingerprint with different device public keys"},
+		{"both-same", "hwid-shared", "hwid-shared", false, "both the same canonical device public key and the same hardware fingerprint"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := sentinelTestDB(t)
+			keyA := testKeyLine(t)
+			keyB := keyA
+			if tc.differentKey {
+				keyB = testKeyLine(t)
+			}
+			seedIdentityPeer(t, db, "duplicate-a-1234567890", "approved", tc.fingerprintA, keyA+" comment@example")
+			seedIdentityPeer(t, db, "duplicate-b-1234567890", "approved", tc.fingerprintB, keyB)
+			before := identityStateSnapshot(t, db)
+
+			db.SentinelTick(nil)
+			var severity, kind, message string
+			if err := db.QueryRow(`SELECT severity,kind,message FROM alerts WHERE kind='security'`).Scan(&severity, &kind, &message); err != nil {
+				t.Fatalf("duplicate identity alert: %v", err)
+			}
+			if severity != "warning" || kind != "security" || !strings.Contains(message, tc.want) ||
+				!strings.Contains(message, "possible clone, reinstall, or spoof") || !strings.Contains(message, "review only") {
+				t.Fatalf("unexpected duplicate finding: %s %s %s", severity, kind, message)
+			}
+			if after := identityStateSnapshot(t, db); after != before {
+				t.Fatal("duplicate detection changed peer, key, status, epoch, managed-key, or identity-ban state")
+			}
+			var throttleKey string
+			if err := db.QueryRow(`SELECT key FROM settings WHERE key LIKE 'sentinel_ts_duplicate-identity|%'`).Scan(&throttleKey); err != nil {
+				t.Fatalf("digest throttle key: %v", err)
+			}
+			for _, raw := range []string{tc.fingerprintA, tc.fingerprintB, keyA, keyB} {
+				if raw != "" && strings.Contains(throttleKey, raw) {
+					t.Fatal("raw hardware fingerprint or public key leaked into throttle key")
+				}
+			}
+			db.SentinelTick(nil)
+			var alerts int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE kind='security'`).Scan(&alerts); err != nil || alerts != 1 {
+				t.Fatalf("second tick was not throttled: alerts=%d err=%v", alerts, err)
+			}
+		})
+	}
+}
+
+func TestSentinelDuplicateIdentityOffInactiveAndBounded(t *testing.T) {
+	db := sentinelTestDB(t)
+	key := testKeyLine(t)
+	db.SetSetting("sentinel_mode", "off")
+	seedIdentityPeer(t, db, "duplicate-off-a-123456", "approved", "hwid-off", key)
+	seedIdentityPeer(t, db, "duplicate-off-b-123456", "approved", "hwid-off", key)
+	before := identityStateSnapshot(t, db)
+	db.SentinelTick(nil)
+	var alerts int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM alerts`).Scan(&alerts); err != nil || alerts != 0 {
+		t.Fatalf("off mode emitted duplicate findings: %d err=%v", alerts, err)
+	}
+	if after := identityStateSnapshot(t, db); after != before {
+		t.Fatal("off-mode duplicate detection changed identity state")
+	}
+
+	db = sentinelTestDB(t)
+	seedIdentityPeer(t, db, "duplicate-active-123456", "approved", "hwid-pending", key)
+	seedIdentityPeer(t, db, "duplicate-pending-123456", "pending", "hwid-pending", key)
+	before = identityStateSnapshot(t, db)
+	db.SentinelTick(nil)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM alerts`).Scan(&alerts); err != nil || alerts != 1 {
+		t.Fatalf("approved/pending duplicate did not emit one finding: %d err=%v", alerts, err)
+	}
+	if after := identityStateSnapshot(t, db); after != before {
+		t.Fatal("approved/pending duplicate detection changed identity state")
+	}
+
+	for i := 0; i < 4; i++ {
+		seedIdentityPeer(t, db, fmt.Sprintf("duplicate-bound-%d-123456", i), "approved", fmt.Sprintf("hwid-%d", i), key)
+	}
+	if hits := db.detectDuplicateIdentities(2); len(hits) != 2 {
+		t.Fatalf("detector exceeded or missed its output bound: %+v", hits)
+	}
+}
+
+func TestLegacySentinelRedirectsToIntegratedTab(t *testing.T) {
+	db := sentinelTestDB(t)
+	h := New(db, NewAuth(db), false)
+	rr := httptest.NewRecorder()
+	h.sentinelPage(rr, httptest.NewRequest("GET", "/admin/sentinel", nil))
+	if rr.Code != http.StatusFound || rr.Header().Get("Location") != "/admin/#sentinel" {
+		t.Fatalf("legacy redirect = %d %q", rr.Code, rr.Header().Get("Location"))
+	}
+}
+
 // TestAPISentinel: GET defaults to respond + lists findings; POST validates
 // and persists the mode.
 func TestAPISentinel(t *testing.T) {
@@ -243,13 +366,22 @@ func TestAPISentinel(t *testing.T) {
 		t.Fatalf("persisted mode = %q, want alert", v)
 	}
 
-	// Findings surface in the GET payload.
+	// Sentinel and security findings surface in the same bounded recent feed.
 	db.RecordAlert("warning", "sentinel", "test finding")
+	db.RecordAlert("warning", "security", "test security finding")
 	rr = httptest.NewRecorder()
 	h.apiSentinel(rr, httptest.NewRequest("GET", "/admin/api/sentinel", nil))
 	body := rr.Body.String()
-	if !strings.Contains(body, "test finding") || !strings.Contains(body, `"mode":"alert"`) {
+	if !strings.Contains(body, "test finding") || !strings.Contains(body, "test security finding") || !strings.Contains(body, `"mode":"alert"`) {
 		t.Fatalf("GET payload missing finding/mode: %s", body)
+	}
+}
+
+func TestLegacySentinelPageRedirectsToIntegratedTab(t *testing.T) {
+	w := httptest.NewRecorder()
+	new(Handler).sentinelPage(w, httptest.NewRequest(http.MethodGet, "/admin/sentinel", nil))
+	if w.Code != http.StatusFound || w.Header().Get("Location") != "/admin/#sentinel" {
+		t.Fatalf("legacy sentinel route = %d %q", w.Code, w.Header().Get("Location"))
 	}
 }
 

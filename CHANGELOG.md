@@ -1,5 +1,23 @@
 # Changelog
 
+## Next (unreleased)
+
+- Add bounded, review-only duplicate-identity detection across approved and
+  pending devices. Canonical key reuse and hardware-fingerprint reuse raise
+  throttled `security` warnings without changing either identity, creating bans,
+  or treating a clone, reinstall, or spoof as proven.
+- Show signed-pool enrollment conflicts and other security findings in Sentinel.
+  Bad-signature/downgrade attempts no longer trigger automatic source-IP bans;
+  generic malformed/unknown-token brute-force protection remains enabled.
+- Add Sentinel as an integrated main-console tab, including stale-read warnings,
+  mode read-back, and a link to deliberate administrator rekey. The legacy
+  `/admin/sentinel` bookmark redirects to `/admin/#sentinel`.
+- Preserve the last-known-good cryptographic identity during anomaly review.
+  There is no automatic HWID-based reset/restoration, rekey, or ban. Hardware
+  fingerprints remain risk evidence rather than hardware attestation; recovery
+  still requires expected-key verification, out-of-band confirmation, and
+  separate administrator approval.
+
 ## v1.1.11 - pre-1.2 hardening
 
 - Add explicit `transport = "h3"` selection using the existing pinned HTTP/3

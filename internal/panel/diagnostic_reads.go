@@ -322,7 +322,7 @@ func (db *DB) SentinelChecked(parent context.Context) (map[string]any, error) {
 			return nil, err
 		}
 		recent, err := diagnosticRows(ctx, conn, 20,
-			`SELECT severity, COALESCE(message,''), at FROM alerts WHERE kind='sentinel' ORDER BY id DESC LIMIT 20`,
+			`SELECT severity, COALESCE(message,''), at FROM alerts WHERE kind IN ('sentinel','security') ORDER BY id DESC LIMIT 20`,
 			func(rows *sql.Rows) (diagnosticFinding, error) {
 				var f diagnosticFinding
 				var at sql.NullString
