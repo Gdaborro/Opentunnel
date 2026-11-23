@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
   Card,
   CardContent,
@@ -44,32 +44,59 @@ export function Security() {
   const [health, setHealth] = useState<ServerHealth | null>(null)
   const [aaUntil, setAaUntil] = useState<string | undefined>(undefined)
   const [aaActive, setAaActive] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState("")
+  const [readFailures, setReadFailures] = useState<string[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const busyRef = useRef(false)
 
-  const load = () => {
-    api.peers().then(setPeers).catch(() => {})
-    api.devices().then(setDevices).catch(() => {})
-    api.alerts().then((a) => setAlerts(a.alerts)).catch(() => {})
-    api.categories().then(setCategories).catch(() => {})
-    api.serverHealth().then(setHealth).catch(() => {})
-    api
-      .settings()
-      .then((s) => {
+  const load = useCallback(async () => {
+    if (busyRef.current) return
+    const results = await Promise.allSettled([
+      api.peers().then(setPeers),
+      api.devices().then(setDevices),
+      api.alerts().then((a) => setAlerts(a.alerts)),
+      api.categories().then(setCategories),
+      api.serverHealth().then(setHealth),
+      api.settings().then((s) => {
         setAaUntil(s.auto_accept_until)
         setAaActive(s.auto_accept_active)
-      })
-      .catch(() => {})
-  }
+      }),
+    ])
+    const names = ["device admission", "device telemetry", "security alerts", "filtering categories", "relay health", "admission policy"]
+    setReadFailures(results.flatMap((result, index) => result.status === "rejected" ? [names[index]] : []))
+    setLoaded(true)
+  }, [])
   useEffect(() => {
     load()
     const id = setInterval(load, 5000)
     return () => clearInterval(id)
-  }, [])
+  }, [load])
+
+  const mutate = async (action: () => Promise<void>) => {
+    if (busyRef.current || !loaded || readFailures.length > 0) return
+    busyRef.current = true
+    setBusy(true)
+    setMessage("")
+    try { await action() }
+    catch { setMessage("Operation or read-back failed. State is unconfirmed; refresh before retrying.") }
+    finally {
+      busyRef.current = false
+      setBusy(false)
+      await load()
+    }
+  }
 
   const openWindow = (minutes: number) => {
-    api
-      .setAutoAccept(minutes)
-      .then(load)
-      .catch(() => {})
+    if (minutes > 0 && !window.confirm(`Open default-operator auto-accept for ${minutes} minutes? Trusted-pool enrollment still requires separate administrator approval.`)) return
+    void mutate(async () => {
+      await api.setAutoAccept(minutes)
+      const verified = await api.settings()
+      if (verified.auto_accept_active !== (minutes > 0)) throw new Error("concurrent admission change")
+      setAaUntil(verified.auto_accept_until)
+      setAaActive(verified.auto_accept_active)
+      setMessage("Admission window committed and read back. Pool-account login still does not approve devices.")
+    })
   }
 
   const pending = peers.filter((p) => p.status === "pending")
@@ -78,11 +105,37 @@ export function Security() {
   )
   const versionMap = new Map(devices.map((d) => [d.token, d]))
 
-  const act = (token: string, action: string) =>
-    api.peerAction(token, action).then(load).catch(() => {})
+  const act = (token: string, action: string) => {
+    void mutate(async () => {
+      const result = await api.peerAction(token, action)
+      const verified = await api.peers()
+      const expected = action === "approve" ? "approved" : "banned"
+      if (verified.find((peer) => peer.token === token)?.status !== expected) throw new Error("concurrent admission change")
+      setPeers(verified)
+      setMessage(result.ssh_reconcile_pending
+        ? "Admission policy committed, but SSH reconciliation is pending. The authority will retry; do not assume the SSH file is applied."
+        : "Admission action committed and read back.")
+    })
+  }
+
+  const toggleCategory = (category: string, enabled: boolean) => {
+    void mutate(async () => {
+      await api.setCategory(category, enabled)
+      const verified = await api.categories()
+      if (verified.find((item) => item.category === category)?.enabled !== enabled) throw new Error("concurrent filter change")
+      setCategories(verified)
+      setMessage("Filtering choice committed and read back.")
+    })
+  }
 
   return (
     <>
+      <div className="flex flex-wrap items-center gap-3">
+        <Button variant="outline" disabled={busy} onClick={() => { void load() }}>Refresh security status</Button>
+        <p role="status" aria-live="polite" className="text-sm">{message}</p>
+        {!loaded && <p role="status" className="text-sm">Reading security status…</p>}
+        {readFailures.length > 0 && <p role="alert" className="text-sm text-destructive">Unavailable: {readFailures.join(", ")}. Previously shown data may be stale; not an all-clear.</p>}
+      </div>
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-sm">
@@ -97,11 +150,11 @@ export function Security() {
         <CardContent className="flex flex-col gap-4">
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/60 bg-muted/30 p-3">
             <div className="text-sm">
-              {aaActive ? (
+              {!loaded || readFailures.includes("admission policy") ? <span>Admission policy unavailable</span> : aaActive ? (
                 <>
                   <span className="mr-2 inline-flex size-2 animate-pulse rounded-full bg-primary" />
                   <span className="font-medium text-primary">Auto-accept open</span>
-                  <span className="text-muted-foreground"> — new devices are approved instantly (until {new Date(aaUntil ?? "").toLocaleTimeString()})</span>
+                  <span className="text-muted-foreground"> — default-operator bootstrap devices may be approved until {new Date(aaUntil ?? "").toLocaleTimeString()}. Pool-account devices still need administrator approval.</span>
                 </>
               ) : aaUntil ? (
                 <>
@@ -117,18 +170,18 @@ export function Security() {
             </div>
             <div className="flex gap-2">
               {aaActive ? (
-                <Button size="sm" variant="outline" onClick={() => openWindow(0)}>
+                <Button size="sm" variant="outline" disabled={busy || !loaded || readFailures.length > 0} onClick={() => openWindow(0)}>
                   Close window
                 </Button>
               ) : (
                 <>
-                  <Button size="sm" variant="outline" onClick={() => openWindow(15)}>
+                  <Button size="sm" variant="outline" disabled={busy || !loaded || readFailures.length > 0} onClick={() => openWindow(15)}>
                     Open 15 min
                   </Button>
-                  <Button size="sm" variant="outline" onClick={() => openWindow(30)}>
+                  <Button size="sm" variant="outline" disabled={busy || !loaded || readFailures.length > 0} onClick={() => openWindow(30)}>
                     30 min
                   </Button>
-                  <Button size="sm" variant="outline" onClick={() => openWindow(60)}>
+                  <Button size="sm" variant="outline" disabled={busy || !loaded || readFailures.length > 0} onClick={() => openWindow(60)}>
                     60 min
                   </Button>
                 </>
@@ -138,7 +191,7 @@ export function Security() {
           {pending.length === 0 ? (
             <p className="flex items-center gap-2 text-sm text-muted-foreground">
               <ShieldCheckIcon className="size-4 text-primary" />
-              Admission queue clear — no devices awaiting approval.
+              {!loaded || readFailures.includes("device admission") ? "Admission queue unavailable — not confirmed clear." : "Admission queue clear — no devices awaiting approval."}
             </p>
           ) : (
             <Table>
@@ -182,14 +235,16 @@ export function Security() {
                       <TableCell className="text-right">
                         <div className="flex justify-end gap-2">
                           <Button
-                            size="sm"
+                             size="sm"
+                             disabled={busy || !loaded || readFailures.length > 0}
                             onClick={() => act(p.token, "approve")}
                           >
                             <CheckIcon /> Approve
                           </Button>
                           <Button
                             size="sm"
-                            variant="destructive"
+                             variant="destructive"
+                             disabled={busy || !loaded || readFailures.length > 0}
                             onClick={() => act(p.token, "ban")}
                           >
                             <XIcon /> Deny
@@ -220,7 +275,7 @@ export function Security() {
           <CardContent className="flex flex-col gap-2.5">
             {securityAlerts.length === 0 && (
               <p className="text-sm text-muted-foreground">
-                No active security alerts.
+                {!loaded || readFailures.includes("security alerts") ? "Security alerts unavailable — not confirmed clear." : "No active security alerts."}
               </p>
             )}
             {securityAlerts.slice(0, 10).map((a) => (
@@ -266,11 +321,11 @@ export function Security() {
                     {c.domains} rules
                   </p>
                 </div>
-                <Switch
-                  checked={c.enabled}
-                  onCheckedChange={(on) =>
-                    api.setCategory(c.category, on).then(load).catch(() => {})
-                  }
+                 <Switch
+                   aria-label={`Block ${c.category}`}
+                   disabled={busy || !loaded || readFailures.length > 0}
+                   checked={c.enabled}
+                   onCheckedChange={(on) => toggleCategory(c.category, on)}
                 />
               </div>
             ))}

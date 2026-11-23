@@ -22,6 +22,7 @@ type Auth struct {
 	lmu         sync.Mutex
 	fails       map[string]*loginFail
 	bootstrapMu sync.Mutex
+	loginSweep  time.Time
 }
 
 type session struct {
@@ -30,15 +31,17 @@ type session struct {
 }
 
 type loginFail struct {
-	count int
-	until time.Time // locked until this time
-	last  time.Time
+	count    int
+	inflight int
+	until    time.Time // locked until this time
+	last     time.Time
 }
 
 const (
 	sessionTTL      = 24 * time.Hour
 	loginMaxFails   = 5
 	loginLockWindow = 15 * time.Minute
+	maxLoginSources = 8192
 )
 
 func NewAuth(db *DB) *Auth {
@@ -61,7 +64,7 @@ func (a *Auth) EnsureAdmin(username, password string) error {
 	if count > 0 {
 		return nil
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	hash, err := generatePasswordHash(password)
 	if err != nil {
 		return err
 	}
@@ -78,7 +81,7 @@ func (a *Auth) CreateAdmin(username, password string) error {
 	if len(username) < 3 || len(username) > 64 || len(password) < 8 || len(password) > 72 {
 		return sql.ErrTxDone
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	hash, err := generatePasswordHash(password)
 	if err != nil {
 		return err
 	}
@@ -93,15 +96,93 @@ func (a *Auth) CreateAdmin(username, password string) error {
 }
 
 func (a *Auth) Login(username, password string) (bool, error) {
-	var hash string
-	err := a.db.QueryRow(`SELECT password_hash FROM admins WHERE username=?`, username).Scan(&hash)
-	if err == sql.ErrNoRows {
+	if len(username) < 3 || len(username) > 64 || len(password) > 72 {
 		return false, nil
 	}
+	release, err := passwordWork()
 	if err != nil {
 		return false, err
 	}
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil, nil
+	defer release()
+	var hash string
+	err = a.db.QueryRow(`SELECT password_hash FROM admins WHERE username=?`, username).Scan(&hash)
+	missing := err == sql.ErrNoRows
+	if err == sql.ErrNoRows {
+		hash = dummyEnrollmentHash
+	}
+	if err != nil && !missing {
+		return false, err
+	}
+	valid := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+	return valid && !missing, nil
+}
+
+type loginAttempt struct {
+	a    *Auth
+	f    *loginFail
+	once sync.Once
+}
+
+func (attempt *loginAttempt) finish(success, failed bool) {
+	attempt.once.Do(func() {
+		a := attempt.a
+		a.lmu.Lock()
+		defer a.lmu.Unlock()
+		f := attempt.f
+		f.inflight--
+		f.last = time.Now()
+		if success {
+			f.count = 0
+			f.until = time.Time{}
+		} else if failed {
+			f.count = min(f.count+1, loginMaxFails)
+			if f.count >= loginMaxFails {
+				f.until = f.last.Add(loginLockWindow)
+			}
+		}
+	})
+}
+
+// Outstanding requests count toward admission before bcrypt starts. Busy/SQL
+// failures release their reservation without labeling a password as incorrect.
+func (a *Auth) beginLogin(ip string) (*loginAttempt, bool) {
+	if ip == "" || len(ip) > 128 {
+		return nil, false
+	}
+	a.lmu.Lock()
+	defer a.lmu.Unlock()
+	now := time.Now()
+	a.sweepLoginsLocked(now)
+	f := a.fails[ip]
+	if f == nil {
+		if len(a.fails) >= maxLoginSources {
+			return nil, false
+		}
+		f = &loginFail{}
+		a.fails[ip] = f
+	}
+	if f.inflight == 0 && now.Sub(f.last) > loginLockWindow && !now.Before(f.until) {
+		f.count = 0
+		f.until = time.Time{}
+	}
+	if now.Before(f.until) || f.count+f.inflight >= loginMaxFails {
+		return nil, false
+	}
+	f.inflight++
+	f.last = now
+	return &loginAttempt{a: a, f: f}, true
+}
+
+func (a *Auth) sweepLoginsLocked(now time.Time) {
+	if now.Sub(a.loginSweep) < time.Minute {
+		return
+	}
+	a.loginSweep = now
+	for ip, f := range a.fails {
+		if f.inflight == 0 && now.Sub(f.last) > loginLockWindow && !now.Before(f.until) {
+			delete(a.fails, ip)
+		}
+	}
 }
 
 func (a *Auth) CreateSession(username string) string {
@@ -155,9 +236,6 @@ func (a *Auth) LoginLocked(ip string) bool {
 	a.lmu.Lock()
 	defer a.lmu.Unlock()
 	f := a.fails[ip]
-	if f == nil {
-		f = a.fails["overflow"]
-	}
 	return f != nil && time.Now().Before(f.until)
 }
 
@@ -167,22 +245,16 @@ func (a *Auth) RecordLoginFail(ip string) {
 	a.lmu.Lock()
 	defer a.lmu.Unlock()
 	now := time.Now()
-	if len(a.fails) >= 8192 {
-		for key, f := range a.fails {
-			if now.Sub(f.last) > loginLockWindow && !now.Before(f.until) {
-				delete(a.fails, key)
-			}
-		}
-		if len(a.fails) >= 8192 {
-			ip = "overflow"
-		}
+	a.sweepLoginsLocked(now)
+	if len(a.fails) >= maxLoginSources && a.fails[ip] == nil {
+		return
 	}
 	f := a.fails[ip]
-	if f == nil || now.Sub(f.last) > loginLockWindow {
+	if f == nil || (f.inflight == 0 && now.Sub(f.last) > loginLockWindow && !now.Before(f.until)) {
 		f = &loginFail{}
 		a.fails[ip] = f
 	}
-	f.count++
+	f.count = min(f.count+1, loginMaxFails)
 	f.last = now
 	if f.count >= loginMaxFails {
 		f.until = now.Add(loginLockWindow)
@@ -192,7 +264,12 @@ func (a *Auth) RecordLoginFail(ip string) {
 // ClearLoginFail resets the counter after a successful login.
 func (a *Auth) ClearLoginFail(ip string) {
 	a.lmu.Lock()
-	delete(a.fails, ip)
+	if f := a.fails[ip]; f != nil && f.inflight > 0 {
+		f.count = 0
+		f.until = time.Time{}
+	} else {
+		delete(a.fails, ip)
+	}
 	a.lmu.Unlock()
 }
 

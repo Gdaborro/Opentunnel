@@ -20,7 +20,7 @@ func NewManager() (*Manager, error) {
 	if base == "" {
 		return nil, errors.New("netenv: LOCALAPPDATA is not set")
 	}
-	dir := filepath.Join(base, version.ProductName)
+	dir := filepath.Join(base, version.NetworkStateName())
 	if err := privatefile.EnsureDir(dir); err != nil {
 		return nil, err
 	}

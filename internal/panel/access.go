@@ -46,8 +46,9 @@ func accessPolicy(ctx context.Context, reader policyReader, token string) (acces
 		COALESCE((SELECT value FROM settings WHERE key='ssh_tier_daily_mb'),'0'),
 		COALESCE((SELECT value FROM settings WHERE key='ssh_tier_trickle_kbps'),'0'),
 		COALESCE((SELECT up+down FROM ingress_usage WHERE token=p.token AND ingress='ssh' AND day=date('now')),0),
-		(p.v5_seen IS NOT NULL AND p.v5_seen!=''), p.approval_required,
-		COALESCE(a.pool_id,''), COALESCE(a.authority_id,''),
+		(p.v5_seen IS NOT NULL AND p.v5_seen!=''), p.channel_seen, (p.channel_seen=1 AND p.channel_epoch=p.auth_epoch AND p.auth_epoch!=''), p.approval_required,
+		COALESCE(a.pool_id,''), COALESCE(a.authority_id,''), COALESCE(a.channel_required,0),
+		COALESCE((SELECT value FROM settings WHERE key='telemetry_mode'),'preserve'),
 		EXISTS(SELECT 1 FROM peer_enrollments e WHERE e.token=p.token AND e.pool_id=a.pool_id AND e.public_key=p.ssh_pubkey
 			AND (a.login_required=0 OR EXISTS(SELECT 1 FROM enrollment_accounts u WHERE u.username=e.username)))
 		FROM peers p LEFT JOIN fingerprints_banned f ON f.fingerprint=p.fingerprint
@@ -55,10 +56,13 @@ func accessPolicy(ctx context.Context, reader policyReader, token string) (acces
 		Scan(&p.Status, &kickReason, &banReason, &kickExpiry, &expiry, &p.PublicKey,
 			&p.Generation, &schedule, &p.MaxBps, &p.QuotaBytes, &p.UsedBytes,
 			&identityBanned, &identityReason, &kill, &p.KillReason, &allow,
-			&sshMax, &sshDaily, &sshTrickle, &p.SSHUsedBytes, &p.V5Seen, &approvalRequired,
-			&p.PoolID, &p.AuthorityID, &p.Enrolled)
+			&sshMax, &sshDaily, &sshTrickle, &p.SSHUsedBytes, &p.V5Seen, &p.ChannelSeen, &p.ChannelVerified, &approvalRequired,
+			&p.PoolID, &p.AuthorityID, &p.ChannelRequired, &p.TelemetryMode, &p.Enrolled)
 	if err != nil {
 		return p, err
+	}
+	if p.TelemetryMode != "preserve" && p.TelemetryMode != "minimal" {
+		return p, errors.New("invalid telemetry policy")
 	}
 	switch strings.TrimSpace(kill) {
 	case "", "0":

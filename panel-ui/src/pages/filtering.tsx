@@ -34,30 +34,77 @@ export function Filtering() {
   const [domain, setDomain] = useState("")
   const [reason, setReason] = useState("")
   const [busy, setBusy] = useState(false)
+  const [categoryError, setCategoryError] = useState("")
+  const [blockError, setBlockError] = useState("")
+  const [categoriesReady, setCategoriesReady] = useState(false)
+  const [blocksReady, setBlocksReady] = useState(false)
 
-  const load = useCallback(() => {
-    api.blocklist().then(setEntries).catch(() => {})
-    api.categories().then(setCategories).catch(() => {})
+  const loadCategories = useCallback(async () => {
+    try {
+      const values = await api.categories()
+      setCategories(values)
+      setCategoriesReady(true)
+      setCategoryError("")
+      return values
+    } catch (error) {
+      setCategoriesReady(false)
+      setCategoryError("Filtering categories unavailable. Previously shown choices may be stale; no policy was changed by this read.")
+      throw error
+    }
   }, [])
-  useEffect(load, [load])
+  const loadBlocks = useCallback(async () => {
+    try {
+      const values = await api.blocklist()
+      setEntries(values)
+      setBlocksReady(true)
+      setBlockError("")
+    } catch (error) {
+      setBlocksReady(false)
+      setBlockError("Blocklist unavailable. Previously shown entries may be stale; no empty policy was substituted.")
+      throw error
+    }
+  }, [])
+  const load = useCallback(() => Promise.allSettled([loadBlocks(), loadCategories()]), [loadBlocks, loadCategories])
+  useEffect(() => { void load() }, [load])
 
-  const add = () => {
+  const add = async () => {
     const d = domain.trim().toLowerCase()
-    if (!d) return
+    if (!d || busy || !blocksReady) return
     setBusy(true)
-    api
-      .addBlock(d, reason.trim() || "manual block")
-      .then(() => {
-        setDomain("")
-        setReason("")
-        load()
-      })
-      .finally(() => setBusy(false))
+    try {
+      await api.addBlock(d, reason.trim() || "manual block")
+      await loadBlocks()
+      setDomain("")
+      setReason("")
+    } catch {
+      setBlocksReady(false)
+      setBlockError("Blocklist update or read-back failed. Policy state is unconfirmed; refresh before retrying.")
+    } finally { setBusy(false) }
   }
 
-  const toggleCat = (c: Category, enabled: boolean) => {
-    setCategories(categories.map((x) => (x.category === c.category ? { ...x, enabled } : x)))
-    api.setCategory(c.category, enabled).then(load).catch(load)
+  const toggleCat = async (c: Category, enabled: boolean) => {
+    if (busy || !categoriesReady) return
+    setBusy(true)
+    try {
+      await api.setCategory(c.category, enabled)
+      const verified = await loadCategories()
+      if (verified.find((item) => item.category === c.category)?.enabled !== enabled) throw new Error("concurrent policy change")
+    } catch {
+      setCategoriesReady(false)
+      setCategoryError("Category update or read-back failed. Policy state is unconfirmed; refresh before retrying.")
+    } finally { setBusy(false) }
+  }
+
+  const remove = async (domain: string) => {
+    if (busy || !blocksReady) return
+    setBusy(true)
+    try {
+      await api.removeBlock(domain)
+      await loadBlocks()
+    } catch {
+      setBlocksReady(false)
+      setBlockError("Block removal or read-back failed. Policy state is unconfirmed; refresh before retrying.")
+    } finally { setBusy(false) }
   }
 
   return (
@@ -74,6 +121,9 @@ export function Filtering() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {categoryError && <p role="alert" className="text-sm text-destructive">{categoryError}</p>}
+          {!categoriesReady && !categoryError && <p role="status" className="text-sm">Reading filtering categories…</p>}
+          <Button variant="outline" disabled={busy} onClick={() => { void load() }}>Refresh filtering policy</Button>
           {categories.map((c) => (
             <div key={c.category} className="flex items-center justify-between">
               <div>
@@ -84,7 +134,7 @@ export function Filtering() {
                   {c.domains} known domains, suffix-matched
                 </p>
               </div>
-              <Switch checked={c.enabled} onCheckedChange={(v) => toggleCat(c, v)} />
+              <Switch aria-label={`Block ${categoryLabels[c.category] ?? c.category}`} checked={c.enabled} disabled={busy || !categoriesReady} onCheckedChange={(v) => { void toggleCat(c, v) }} />
             </div>
           ))}
         </CardContent>
@@ -101,20 +151,25 @@ export function Filtering() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
+          {blockError && <p role="alert" className="text-sm text-destructive">{blockError}</p>}
           <div className="flex gap-2">
             <Input
               placeholder="example.com"
+              aria-label="Domain to block"
+              disabled={busy || !blocksReady}
               value={domain}
               onChange={(e) => setDomain(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && add()}
             />
             <Input
               placeholder="reason (optional)"
+              aria-label="Block reason"
+              disabled={busy || !blocksReady}
               value={reason}
               onChange={(e) => setReason(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && add()}
             />
-            <Button onClick={add} disabled={busy || !domain.trim()}>
+            <Button onClick={() => { void add() }} disabled={busy || !blocksReady || !domain.trim()}>
               <PlusIcon /> Add
             </Button>
           </div>
@@ -127,7 +182,7 @@ export function Filtering() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {entries.length === 0 && (
+              {entries.length === 0 && blocksReady && (
                 <TableRow>
                   <TableCell colSpan={3} className="py-6 text-center text-muted-foreground">
                     No custom blocks.
@@ -142,7 +197,9 @@ export function Filtering() {
                     <Button
                       size="icon"
                       variant="ghost"
-                      onClick={() => api.removeBlock(e.domain).then(load)}
+                      disabled={busy || !blocksReady}
+                      onClick={() => { void remove(e.domain) }}
+                      aria-label={`Remove block for ${e.domain}`}
                       title="Remove"
                     >
                       <Trash2Icon className="text-destructive" />

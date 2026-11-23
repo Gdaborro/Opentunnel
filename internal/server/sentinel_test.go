@@ -123,25 +123,32 @@ func TestSentinelModes(t *testing.T) {
 	}
 }
 
-// A bad signature must not give a token thief a remote victim-kick primitive.
-func TestSentinelStolenTokenCannotKickVictim(t *testing.T) {
+// A bad signature must not give a token thief a victim-kick or source-ban
+// primitive, even after enough attempts to trigger the generic auth flood.
+func TestSentinelStolenTokenCannotKickVictimOrBanSource(t *testing.T) {
 	st := newSentinelStub()
-	s := NewSentinel(st, nil)
+	g := NewGuard(4, 32, 30*time.Second, 10*time.Minute)
+	s := NewSentinel(st, g)
 
-	s.StolenToken("stolen-token-abcdef", "203.0.113.77", "handshake signature mismatch")
+	for i := 0; i < sentinelAuthFlood+2; i++ {
+		s.StolenToken("stolen-token-abcdef", "203.0.113.77", "handshake signature mismatch")
+	}
 	if st.kickCount() != 0 {
 		t.Fatalf("unverified evidence kicked the victim: %d", st.kickCount())
 	}
 	if got := st.alertText(); !strings.Contains(got, "critical|security|") || !strings.Contains(got, "possible stolen token") {
 		t.Fatalf("want critical security alert, got %q", got)
 	}
-	// Repeat attempts are throttled: no kick storm, no alert storm.
-	s.StolenToken("stolen-token-abcdef", "203.0.113.77", "handshake signature mismatch")
-	if st.kickCount() != 0 {
-		t.Fatalf("repeat unverified evidence kicked the victim: %d", st.kickCount())
-	}
 	if n := strings.Count(st.alertText(), "possible stolen token"); n != 1 {
-		t.Fatalf("want 1 alert, got %d", n)
+		t.Fatalf("want 1 throttled alert, got %d", n)
+	}
+	if st.eventCount() != 0 {
+		t.Fatal("spoof-only evidence triggered an enforcement event")
+	}
+	if release := g.Acquire("203.0.113.77"); release == nil {
+		t.Fatal("spoof-only attempts banned the source")
+	} else {
+		release()
 	}
 }
 

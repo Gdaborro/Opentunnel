@@ -28,22 +28,24 @@ type nodeRank struct {
 // Pool membership is verified over each node's own pinned TLS connection.
 // Selection is latency-based, not geographic, and never changes operator trust.
 type PoolSelector struct {
-	profile  serverpool.Profile
-	mu       sync.Mutex
-	ranks    []nodeRank
-	current  serverpool.Node
-	probed   time.Time
-	refresh  *poolRefresh
-	probe    func(context.Context, serverpool.Node) (time.Duration, error)
-	dialNode func(context.Context, context.Context, serverpool.Node, time.Duration) (net.Conn, error)
+	profile    serverpool.Profile
+	mu         sync.Mutex
+	ranks      []nodeRank
+	current    serverpool.Node
+	probed     time.Time
+	generation uint64
+	refresh    *poolRefresh
+	probe      func(context.Context, serverpool.Node) (time.Duration, error)
+	dialNode   func(context.Context, context.Context, serverpool.Node, time.Duration) (net.Conn, error)
 }
 
 type poolRefresh struct {
-	done      chan struct{}
-	cancel    context.CancelFunc
-	waiters   int
-	err       error
-	abandoned bool
+	done       chan struct{}
+	cancel     context.CancelFunc
+	waiters    int
+	err        error
+	abandoned  bool
+	generation uint64
 }
 
 func NewPoolSelector(p serverpool.Profile) (*PoolSelector, error) {
@@ -116,7 +118,7 @@ func (s *PoolSelector) waitRefresh(ctx context.Context) (bool, error) {
 		// A caller owns its wait, not every other caller's refresh. Cancel
 		// the bounded job only when its last waiter leaves.
 		budget, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-		job = &poolRefresh{done: make(chan struct{}), cancel: cancel}
+		job = &poolRefresh{done: make(chan struct{}), cancel: cancel, generation: s.generation}
 		s.refresh = job
 		go s.runRefresh(budget, job)
 	}
@@ -174,6 +176,10 @@ func (s *PoolSelector) runRefresh(budget context.Context, job *poolRefresh) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer func() { s.refresh = nil; close(job.done) }()
+	if job.abandoned || job.generation != s.generation {
+		job.err = ErrNetworkChanged
+		return // old-network probes must never publish fresh reachability
+	}
 	if len(ranks) == 0 || errors.Is(budget.Err(), context.Canceled) {
 		// Do not reuse stale reachability after a failed refresh.
 		s.ranks, s.probed = nil, time.Time{}
@@ -201,6 +207,19 @@ func (s *PoolSelector) runRefresh(budget context.Context, job *poolRefresh) {
 		}
 	}
 	s.ranks, s.current, s.probed = ranks, ranks[0].node, time.Now()
+}
+
+// Invalidate cancels the old bounded probe batch. New callers wait for its
+// teardown rather than creating overlapping batches or accepting stale ranks.
+func (s *PoolSelector) Invalidate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.generation++
+	s.ranks, s.probed = nil, time.Time{}
+	if job := s.refresh; job != nil {
+		job.abandoned = true
+		job.cancel()
+	}
 }
 
 func (s *PoolSelector) Profile() serverpool.Profile {
@@ -236,6 +255,7 @@ func (p *poolTransport) DialSetup(setup, lifetime context.Context) (net.Conn, er
 	p.selector.mu.Lock()
 	ranks := append([]nodeRank(nil), p.selector.ranks...)
 	current := p.selector.current.ID
+	generation := p.selector.generation
 	p.selector.mu.Unlock()
 	// A recently successful failover remains the first candidate.
 	for i := range ranks {
@@ -274,6 +294,11 @@ func (p *poolTransport) DialSetup(setup, lifetime context.Context) (net.Conn, er
 			return nil, err
 		}
 		p.selector.mu.Lock()
+		if p.selector.generation != generation {
+			p.selector.mu.Unlock()
+			transport.AbortSetup(c)
+			return nil, ErrNetworkChanged
+		}
 		p.selector.current = n
 		p.selector.mu.Unlock()
 		return c, nil
@@ -306,6 +331,10 @@ func (s *PoolSelector) connectNode(setup, lifetime context.Context, n serverpool
 		return nil, err
 	}
 	if len(n.InnerTLSPins) == 0 {
+		if s.profile.RequireChannelAuth {
+			transport.AbortSetup(c)
+			return nil, errors.New("connection-bound pool node has no independent TLS pin")
+		}
 		return c, nil
 	}
 	wrapped, err := withScopedInnerTLS(&oneConnTransport{conn: c}, n.InnerTLSPins, s.profile.ID)
@@ -358,6 +387,9 @@ func verifiedPoolInfo(ctx context.Context, p serverpool.Profile, n serverpool.No
 	if err != nil {
 		return info, err
 	}
+	if p.Version == serverpool.ChannelProfileVersion {
+		req.Header.Set("X-Otu-Profile-Version", "2")
+	}
 	resp, err := cl.Do(req)
 	if err != nil {
 		return info, errors.New("node could not be verified over pinned TLS")
@@ -370,7 +402,7 @@ func verifiedPoolInfo(ctx context.Context, p serverpool.Profile, n serverpool.No
 	if err != nil || len(raw) > 4096 {
 		return info, errors.New("node capability response oversized or incomplete")
 	}
-	if err := serverpool.DecodeStrict(raw, &info); err != nil || info.Version != 1 || info.PoolID != p.ID || info.AuthorityID != p.AuthorityID || info.LoginRequired != p.LoginRequired || !info.ApprovalRequired {
+	if err := serverpool.DecodeStrict(raw, &info); err != nil || (info.Version != serverpool.ProfileVersion && info.Version != serverpool.ChannelProfileVersion) || (info.RequireChannelAuth && info.Version != serverpool.ChannelProfileVersion) || info.PoolID != p.ID || info.AuthorityID != p.AuthorityID || info.LoginRequired != p.LoginRequired || (!p.RequireChannelAuth && info.RequireChannelAuth) || (p.RequireChannelAuth && (!info.RequireChannelAuth && !info.ChannelAuthSupported)) || !info.ApprovalRequired {
 		return info, errors.New("verified node pool identity or approval/login policy differs from the accepted profile")
 	}
 	return info, nil

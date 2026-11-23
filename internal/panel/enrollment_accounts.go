@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
 	"opentunnel/internal/serverpool"
 )
 
@@ -82,8 +81,12 @@ func (h *Handler) enrollmentAccountsAPI(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "account authentication work busy", 429)
 			return
 		}
-		value, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+		value, err := generatePasswordHash(req.Password)
 		if err != nil {
+			if errors.Is(err, ErrAuthenticationBusy) {
+				http.Error(w, "account authentication work busy", 429)
+				return
+			}
 			http.Error(w, "password could not be stored", 400)
 			return
 		}

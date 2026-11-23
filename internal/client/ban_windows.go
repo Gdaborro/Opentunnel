@@ -8,6 +8,8 @@ import (
 	"os"
 
 	"golang.org/x/sys/windows/registry"
+
+	"opentunnel/internal/version"
 )
 
 func deviceFingerprint() string {
@@ -28,7 +30,7 @@ var banState banBackend = windowsBanBackend{}
 type windowsBanBackend struct{}
 
 func (windowsBanBackend) Banned() bool {
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\OpenTunnel`, registry.QUERY_VALUE)
+	k, err := registry.OpenKey(registry.CURRENT_USER, version.ClientBanRegistryKey, registry.QUERY_VALUE)
 	if err != nil {
 		return false
 	}
@@ -38,7 +40,7 @@ func (windowsBanBackend) Banned() bool {
 }
 
 func (windowsBanBackend) Write(reason, duration string) {
-	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\OpenTunnel`, registry.SET_VALUE)
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, version.ClientBanRegistryKey, registry.SET_VALUE)
 	if err != nil {
 		return
 	}
@@ -49,7 +51,7 @@ func (windowsBanBackend) Write(reason, duration string) {
 
 // clearRegistryBan removes the registry half of a hard ban (best effort).
 func (windowsBanBackend) Clear() {
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\OpenTunnel`, registry.SET_VALUE)
+	k, err := registry.OpenKey(registry.CURRENT_USER, version.ClientBanRegistryKey, registry.SET_VALUE)
 	if err != nil {
 		return
 	}

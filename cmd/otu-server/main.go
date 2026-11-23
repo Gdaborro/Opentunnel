@@ -30,6 +30,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme/autocert"
 
+	"opentunnel/internal/authority"
 	"opentunnel/internal/config"
 	"opentunnel/internal/metrics"
 	"opentunnel/internal/panel"
@@ -75,6 +76,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	if cfg.AuthorityListen != "" {
+		log.Fatal("authority-only panel configuration cannot start a relay; use a separate node configuration/identity")
+	}
+	lifetime, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	cert, fingerprint, err := transport.LoadOrCreateCert(cfg.CertFile, cfg.KeyFile, cfg.Host)
 	if err != nil {
@@ -82,15 +88,16 @@ func main() {
 	}
 	var innerCertificate *tls.Certificate
 	if cfg.InnerTLSCertFile != "" {
-		certData, err := os.ReadFile(cfg.InnerTLSCertFile)
+		certData, err := privatefile.ReadOnly(cfg.InnerTLSCertFile, 16<<10)
 		if err != nil {
 			log.Fatal("inner TLS certificate unavailable")
 		}
-		keyData, err := privatefile.Read(cfg.InnerTLSKeyFile, 16<<10)
+		keyData, err := privatefile.ReadOnly(cfg.InnerTLSKeyFile, 16<<10)
 		if err != nil {
 			log.Fatal("inner TLS private key unavailable")
 		}
 		pair, err := tls.X509KeyPair(certData, keyData)
+		clear(keyData)
 		if err != nil {
 			log.Fatal("inner TLS keypair invalid")
 		}
@@ -118,7 +125,7 @@ func main() {
 	// refreshH3Cert reloads the h3 listener's certificate from the ACME
 	// cache (set below once the cache dir is known); the pin probe's
 	// cadence keeps it current across renewals.
-	var refreshH3Cert func()
+	var refreshH3Cert atomic.Pointer[func()]
 	if cfg.PinProbeHost != "" {
 		probePin := func() {
 			// Standard chain verification against the host's system roots
@@ -134,14 +141,20 @@ func main() {
 				return
 			}
 			leafFP.Store(fp)
-			if refreshH3Cert != nil {
-				refreshH3Cert()
+			if refresh := refreshH3Cert.Load(); refresh != nil {
+				(*refresh)()
 			}
 		}
 		probePin()
 		go func() {
 			for {
-				time.Sleep(30*time.Minute + time.Duration(rand.Int63n(int64(30*time.Minute))))
+				timer := time.NewTimer(30*time.Minute + time.Duration(rand.Int63n(int64(30*time.Minute))))
+				select {
+				case <-lifetime.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 				probePin()
 			}
 		}()
@@ -210,22 +223,81 @@ func main() {
 		stateDirForPanel = "/var/lib/opentunnel"
 	}
 	var panelDB *panel.DB
+	var policyDB server.PolicyDB
+	var central *authority.Client
 	var poolInfo serverpool.Info
-	if !cfg.StaticTokenOnly {
+	if cfg.AuthorityURL != "" {
+		certData, err := privatefile.ReadOnly(cfg.AuthorityClientCert, 16<<10)
+		if err != nil {
+			log.Fatal("authority node certificate unavailable")
+		}
+		keyData, err := privatefile.ReadOnly(cfg.AuthorityClientKey, 16<<10)
+		if err != nil {
+			log.Fatal("authority node private key unavailable")
+		}
+		pair, err := tls.X509KeyPair(certData, keyData)
+		clear(keyData)
+		if err != nil {
+			log.Fatal("authority node TLS identity invalid")
+		}
+		central, err = authority.NewClient(authority.ClientOptions{URL: cfg.AuthorityURL, PoolID: cfg.PoolID, AuthorityID: cfg.AuthorityID, NodeID: cfg.AuthorityNodeID, Certificate: pair, Pins: cfg.AuthorityPins})
+		if err != nil {
+			log.Fatalf("central authority configuration: %v", err)
+		}
+		defer central.Close()
+		poolInfo, err = central.Info(context.Background())
+		if err != nil || poolInfo.LoginRequired != cfg.EnrollmentLogin {
+			log.Fatal("central approval/accounting authority unavailable or policy mismatch; local database fallback refused")
+		}
+		policyDB = central
+	} else if !cfg.StaticTokenOnly {
 		panelDB, err = panel.Open(filepath.Join(stateDirForPanel, "panel.db"), cfg.PurgeAfterDays)
 		if err != nil {
 			log.Fatalf("panel policy database unavailable; refusing to disable enforcement: %v", err)
 		}
 		defer panelDB.Close()
-		poolInfo, err = panelDB.BindServerPool(cfg.PoolID, cfg.EnrollmentLogin)
+		poolInfo, err = panelDB.BindServerPoolAuthentication(cfg.PoolID, cfg.EnrollmentLogin, cfg.RequireChannelAuth && cfg.PoolID != "")
 		if err != nil {
 			log.Fatalf("server pool authority: %v", err)
 		}
+		policyDB = panelDB
 	}
-	metricsCtx, stopMetrics := context.WithCancel(context.Background())
+	metricsCtx, stopMetrics := context.WithCancel(lifetime)
 	defer stopMetrics()
-	if panelDB != nil {
-		_ = panelDB.RecordRelayMetrics(metrics.Capture(version.Version))
+
+	baseOpts := server.Options{
+		PoolID: cfg.PoolID, AuthorityID: poolInfo.AuthorityID,
+		InnerTLSCertificate:    innerCertificate,
+		RequireInnerTLS:        cfg.RequireInnerTLS,
+		RequireChannelAuth:     cfg.RequireChannelAuth,
+		Token:                  cfg.Token,
+		WSPath:                 cfg.WSPath,
+		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
+		AllowStreamingHTTP2:    cfg.AllowStreamingHTTP2,
+		AllowLegacyMaster:      cfg.AllowLegacyMaster,
+		TrustCloudflareIPs:     cfg.TrustCloudflareIPs,
+		RequireV5After:         cfg.RequireV5Time(),
+		CurrentPin:             func() string { v, _ := leafFP.Load().(string); return v },
+		SSHPublicHost:          cfg.SSHPublicHost,
+	}
+	if policyDB != nil {
+		baseOpts.PanelDB = policyDB
+	} // else: leave the interface nil (a typed-nil *DB would defeat the
+	// nil checks and crash the relay on first use — legacy static-token
+	// mode when the panel is disabled).
+	// Sentinel (v1.1.0): one instance shared by the relay handlers and the
+	// HTTP error log (scanner intel); pre-seeding here makes Handler() use
+	// this one instead of lazily creating its own.
+	sntl := baseOpts.EnsureSentinel()
+	if policyDB != nil {
+		metricStore := policyDB.(interface{ RecordRelayMetrics(metrics.Snapshot) error })
+		capture := func() metrics.Snapshot {
+			snapshot := metrics.Capture(version.Version)
+			snapshot.GuardDroppedSources = baseOpts.GuardInstance().DroppedSources()
+			snapshot.SentinelDroppedSubjects, snapshot.SentinelDroppedThrottles, snapshot.SentinelSaturatedEvents = sntl.CapacityCounters()
+			return snapshot
+		}
+		_ = metricStore.RecordRelayMetrics(capture())
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
@@ -234,37 +306,23 @@ func main() {
 				case <-metricsCtx.Done():
 					return
 				case <-ticker.C:
-					_ = panelDB.RecordRelayMetrics(metrics.Capture(version.Version))
+					_ = metricStore.RecordRelayMetrics(capture())
 				}
 			}
 		}()
 	}
-
-	baseOpts := server.Options{
-		PoolID: cfg.PoolID, AuthorityID: poolInfo.AuthorityID,
-		InnerTLSCertificate:    innerCertificate,
-		RequireInnerTLS:        cfg.RequireInnerTLS,
-		Token:                  cfg.Token,
-		WSPath:                 cfg.WSPath,
-		AllowRestrictedTargets: cfg.AllowRestrictedTargets,
-		AllowLegacyMaster:      cfg.AllowLegacyMaster,
-		TrustCloudflareIPs:     cfg.TrustCloudflareIPs,
-		RequireV5After:         cfg.RequireV5Time(),
-		CurrentPin:             func() string { v, _ := leafFP.Load().(string); return v },
-		SSHPublicHost:          cfg.SSHPublicHost,
-	}
-	if panelDB != nil {
-		baseOpts.PanelDB = panelDB
-	} // else: leave the interface nil (a typed-nil *DB would defeat the
-	// nil checks and crash the relay on first use — legacy static-token
-	// mode when the panel is disabled).
-	// Sentinel (v1.1.0): one instance shared by the relay handlers and the
-	// HTTP error log (scanner intel); pre-seeding here makes Handler() use
-	// this one instead of lazily creating its own.
-	sntl := baseOpts.EnsureSentinel()
 	baseHandler := server.Handler(baseOpts)
 	var handler http.Handler = baseHandler
-	if panelDB != nil {
+	if central != nil {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/token/", func(w http.ResponseWriter, r *http.Request) {
+			central.ForwardPublic(w, r, server.ResolveClientIP(r, cfg.TrustCloudflareIPs))
+		})
+		mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+		mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+		mux.Handle("/", baseHandler)
+		handler = mux // node public routes never expose the authority's admin API
+	} else if panelDB != nil {
 		target, perr := url.Parse(panelUpstream)
 		if perr != nil {
 			log.Fatalf("panel upstream: %v", perr)
@@ -407,9 +465,7 @@ func main() {
 	}
 
 	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
+		<-lifetime.Done()
 		fmt.Println("\nshutting down…")
 		_ = srv.Close()
 		if intSrv != nil {
@@ -449,7 +505,7 @@ func main() {
 					h3Cert.Store(&cert)
 					log.Printf("h3: certificate loaded (%s)", acmeDomains[0])
 				}
-				refreshH3Cert = loadH3Cert
+				refreshH3Cert.Store(&loadH3Cert)
 				h3TLS := tlsCfg.Clone()
 				h3TLS.NextProtos = []string{"h3"}
 				if acmeDir != "" {
@@ -466,6 +522,9 @@ func main() {
 					loadH3Cert()
 				} // static-cert deployments serve tlsCfg.Certificates as-is
 				h3srv := &http3.Server{TLSConfig: h3TLS, Handler: handler}
+				defer h3srv.Close()
+				defer udpConn.Close()
+				go func() { <-lifetime.Done(); _ = h3srv.Close(); _ = udpConn.Close() }()
 				go func() {
 					log.Printf("h3 (HTTP/3) listener on udp/%s", port)
 					if herr := h3srv.Serve(udpConn); herr != nil && herr != http.ErrServerClosed {

@@ -68,6 +68,62 @@ export interface DeviceHealth {
   last_ip?: string
   country?: string
   at: string
+  update_channel?: string
+  update_state?: string
+  channel_authentication?: boolean
+}
+
+export interface SettingsPolicy {
+  kill_switch: boolean
+  kill_switch_reason: string
+  kill_switch_allow: string[]
+  auto_accept_until?: string
+  auto_accept_active: boolean
+  ssh_tier_max_bps: number
+  ssh_tier_daily_mb: number
+  ssh_tier_trickle_kbps: number
+}
+
+export interface SettingsMutation {
+  kill_switch?: boolean
+  kill_switch_reason?: string
+  kill_switch_allow?: string[]
+  auto_accept_minutes?: number
+  ssh_tier_max_bps?: number
+  ssh_tier_daily_mb?: number
+  ssh_tier_trickle_kbps?: number
+}
+
+export interface PrivacyPolicy {
+  mode: "preserve" | "minimal"
+  visit_retention_days: number
+  health_retention_days: number
+  peer_ip_retention_days: number
+}
+
+export interface RelayNodeHealth {
+  node: string
+  online: boolean
+  age_seconds: number
+  snapshot: {
+    version: string
+    active_sessions: number
+    heap_mb: number
+    goroutines: number
+    guard_dropped_sources?: number
+    sentinel_dropped_subjects?: number
+  }
+}
+
+export interface HardeningStatus {
+  privacy: PrivacyPolicy
+  relay_nodes: RelayNodeHealth[]
+  channel_verified_current_identities: number
+  device_count: number
+  managed_ssh_desired: number
+  managed_ssh_revoked: number
+  ssh_apply_status: string
+  release_acceptance: string
 }
 
 export interface AlertItem {
@@ -77,6 +133,20 @@ export interface AlertItem {
   message: string
   acked: boolean
   at: string
+}
+
+export type SentinelMode = "off" | "alert" | "respond"
+
+export interface SentinelFinding {
+  severity: "info" | "warning" | "critical"
+  message: string
+  at: string
+}
+
+export interface SentinelSnapshot {
+  mode: SentinelMode
+  alerts_24h: number
+  recent: SentinelFinding[]
 }
 
 export interface ServerHealth {
@@ -132,25 +202,31 @@ const post = (body: unknown): RequestInit => ({
 })
 
 export const api = {
+  privacy: () => req<PrivacyPolicy>("/admin/api/privacy"),
+  hardeningStatus: () => req<HardeningStatus>("/admin/api/hardening-status"),
+  setPrivacy: (policy: PrivacyPolicy, applyRetentionNow: boolean) =>
+    req<{ ok: boolean }>("/admin/api/privacy", post({
+      policy,
+      apply_retention_now: applyRetentionNow,
+      confirm_retention_purge: applyRetentionNow,
+    })),
   stats: () => req<Stats>("/admin/api/stats"),
   peers: () => req<Peer[]>("/admin/api/peers"),
   events: () => req<EventItem[]>("/admin/api/events"),
   categories: () => req<Category[]>("/admin/api/categories"),
   blocklist: () => req<BlockEntry[]>("/admin/api/blocklist"),
-  settings: () =>
-    req<{
-      kill_switch: boolean
-      auto_accept_until?: string
-      auto_accept_active: boolean
-    }>("/admin/api/settings"),
+  settings: () => req<SettingsPolicy>("/admin/api/settings"),
+  setSettings: (policy: SettingsMutation) => req<{ ok: boolean }>("/admin/api/settings", post(policy)),
   visits: () => req<{ domain: string; hits: number; last: string }[]>("/admin/api/visits"),
   report: () => req<{ day: string; up: number; down: number }[]>("/admin/api/report"),
   devices: () => req<DeviceHealth[]>("/admin/api/devices"),
   alerts: () => req<{ alerts: AlertItem[]; unacked: number }>("/admin/api/alerts"),
   ackAlert: (id: number) => req<{ ok: boolean }>("/admin/api/alerts", post({ id, ack: true })),
+  sentinel: () => req<SentinelSnapshot>("/admin/api/sentinel"),
+  setSentinelMode: (mode: SentinelMode) => req<{ mode: SentinelMode }>("/admin/api/sentinel", post({ mode })),
   serverHealth: () => req<ServerHealth>("/admin/api/server-health"),
   peerAction: (token: string, action: string, body?: unknown) =>
-    req<{ ok: boolean }>(`/admin/api/peers/${token}/${action}`, body !== undefined ? post(body) : { method: "POST" }),
+    req<{ ok: boolean; ssh_reconcile_pending?: boolean }>(`/admin/api/peers/${token}/${action}`, body !== undefined ? post(body) : { method: "POST" }),
   peerLimits: (token: string) => req<PeerLimits>(`/admin/api/peers/${token}/limits`),
   setPeerLimits: (token: string, limits: PeerLimits) =>
     req<{ ok: boolean }>(`/admin/api/peers/${token}/limits`, post(limits)),

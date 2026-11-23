@@ -13,12 +13,27 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
 )
 
 var errH3Deadline = os.ErrDeadlineExceeded
+
+// Forward native H2/H3 deadlines/flush without a detached copy worker.
+type streamingResponse struct {
+	http.ResponseWriter
+	controller *http.ResponseController
+}
+
+func (w *streamingResponse) SetReadDeadline(t time.Time) error {
+	return w.controller.SetReadDeadline(t)
+}
+func (w *streamingResponse) SetWriteDeadline(t time.Time) error {
+	return w.controller.SetWriteDeadline(t)
+}
+func (w *streamingResponse) FlushError() error { return w.controller.Flush() }
 
 // h3ServerConn adapts the HTTP/3 request/response pair into a net.Conn.
 type h3ServerConn struct {

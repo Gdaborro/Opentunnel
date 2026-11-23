@@ -13,7 +13,7 @@ package server
 //
 //   - auth-failure flood from one IP  → 30-minute guard ban + alert
 //   - unverified token use (v5 signature mismatch / v4 downgrade) → critical
-//     alert; sustained failures may ban the source, never the named victim
+//     alert only; neither the failing source nor the named victim is banned
 //   - scanning/probing floods → alert only (probers already get the decoy;
 //     changing their response would itself fingerprint the relay)
 //
@@ -45,8 +45,11 @@ const (
 	sentinelChurnCount  = 12 // sessions per device
 	sentinelIPAggCount  = 30 // sessions per source IP across devices
 
-	sentinelThrottle = 30 * time.Minute // min gap between same-key alerts
-	sentinelBanTime  = 30 * time.Minute // auth-flood IP ban
+	sentinelThrottle     = 30 * time.Minute // min gap between same-key alerts
+	sentinelBanTime      = 30 * time.Minute // auth-flood IP ban
+	maxSentinelBuckets   = 4096
+	maxSentinelEvents    = 64 // above all detection thresholds; counters saturate visibly
+	maxSentinelThrottles = 8192
 )
 
 // Reporter is the panel surface the sentinel reports through. The relay's
@@ -75,12 +78,16 @@ type Sentinel struct {
 	rep Reporter
 	g   *Guard
 
-	mu      sync.Mutex
-	buckets map[string][]int64   // class\x00subject -> event unixnano timestamps
-	seen    map[string]time.Time // throttle key -> last alert/action
-	mode    string
-	modeAt  time.Time
-	now     func() time.Time
+	mu               sync.Mutex
+	buckets          map[string][]int64   // class\x00subject -> event unixnano timestamps
+	seen             map[string]time.Time // throttle key -> last alert/action
+	mode             string
+	modeAt           time.Time
+	now              func() time.Time
+	gcAt             int64
+	droppedSubjects  uint64
+	droppedThrottles uint64
+	saturatedEvents  uint64
 }
 
 // NewSentinel builds a detector reporting through rep (may be nil) and
@@ -157,26 +164,43 @@ func (s *Sentinel) respond() bool { return s.Mode() == "respond" }
 
 // hit records one event and returns the count inside the rolling window.
 func (s *Sentinel) hit(class, subject string, window time.Duration) int {
+	if len(class) > 32 || len(subject) > 1024 || class == "" || subject == "" || window <= 0 {
+		return 0
+	}
 	now := s.now().UnixNano()
 	cut := now - int64(window)
 	key := class + "\x00" + subject
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.gcLocked(now)
 	ev := s.buckets[key]
+	if ev == nil && len(s.buckets) >= maxSentinelBuckets {
+		s.droppedSubjects++
+		return 0
+	}
 	for len(ev) > 0 && ev[0] < cut {
 		ev = ev[1:]
 	}
-	ev = append(ev, now)
-	s.buckets[key] = ev
-	if len(s.buckets) > 4096 {
-		s.gcLocked(now)
+	if len(ev) >= maxSentinelEvents {
+		s.saturatedEvents++
+		// Keep a fixed-size rolling ring, not all timestamps from one source.
+		// Threshold events remain represented even when the count saturates.
+		copy(ev, ev[1:])
+		ev[len(ev)-1] = now
+	} else {
+		ev = append(ev, now)
 	}
+	s.buckets[key] = ev
 	return len(ev)
 }
 
 // gcLocked drops buckets whose newest event is older than an hour.
 func (s *Sentinel) gcLocked(now int64) {
+	if now-s.gcAt < int64(time.Minute) {
+		return
+	}
+	s.gcAt = now
 	cut := now - int64(time.Hour)
 	for k, ev := range s.buckets {
 		if len(ev) == 0 || ev[len(ev)-1] < cut {
@@ -192,17 +216,28 @@ func (s *Sentinel) gcLocked(now int64) {
 
 // throttle returns true when key has not fired within d (and marks it).
 func (s *Sentinel) throttle(key string, d time.Duration) bool {
+	if len(key) > 1152 || d <= 0 {
+		return false
+	}
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.gcLocked(now.UnixNano())
 	if last, ok := s.seen[key]; ok && now.Sub(last) < d {
 		return false
 	}
-	s.seen[key] = now
-	if len(s.seen) > 8192 {
-		s.gcLocked(now.UnixNano())
+	if _, exists := s.seen[key]; !exists && len(s.seen) >= maxSentinelThrottles {
+		s.droppedThrottles++
+		return false
 	}
+	s.seen[key] = now
 	return true
+}
+
+func (s *Sentinel) CapacityCounters() (subjects, throttles, saturated uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.droppedSubjects, s.droppedThrottles, s.saturatedEvents
 }
 
 // alert emits a throttled alert (panel + journal). The throttle is
@@ -259,15 +294,15 @@ func (s *Sentinel) AuthFail(ip string) {
 }
 
 // StolenToken observes an attempt that knows a token but has not proven
-// private-key possession. Automatically kicking the named device here lets
-// a token thief disconnect the legitimate victim by sending one bad signature.
-// Alert on the evidence; only the failing source may be rate-limited.
+// private-key possession. Automatically kicking the named device or banning
+// the failing source here would turn unverified evidence into a denial-of-
+// service primitive. Report only; generic malformed/unknown-token floods keep
+// their independent brute-force handling.
 func (s *Sentinel) StolenToken(token, ip, what string) {
 	if token == "" || !s.active() {
 		return
 	}
 	s.hit("stolen", token, sentinelThrottle)
-	s.AuthFail(ip)
 	msg := what + " for device " + shortToken(token) + " — possible stolen token"
 	if ip != "" && !isLoopbackIP(ip) {
 		msg += " (source " + ip + "; device left connected)"

@@ -38,7 +38,10 @@ type CtrlRequest struct {
 	// HostileNet reports that the client's own adaptive stealth latched
 	// hostile mode: this network intercepts TLS (censor / enterprise
 	// middlebox). Surfaced by the relay sentinel as operator intel.
-	HostileNet bool `json:"hostile_net,omitempty"`
+	HostileNet            bool   `json:"hostile_net,omitempty"`
+	UpdateChannel         string `json:"update_channel,omitempty"`
+	UpdateState           string `json:"update_state,omitempty"`
+	ChannelAuthentication bool   `json:"channel_authentication,omitempty"`
 }
 
 // CtrlResponse answers a control request. Pin carries the relay's CURRENT
@@ -61,7 +64,8 @@ type CtrlResponse struct {
 	// target after the tunnel domain moves behind a CDN, without any
 	// per-device config update. Injection is impossible from outside: the
 	// control channel lives inside the authenticated, AEAD-sealed session.
-	SSHHost string `json:"ssh_host,omitempty"`
+	SSHHost       string `json:"ssh_host,omitempty"`
+	TelemetryMode string `json:"telemetry_mode,omitempty"`
 }
 
 // WriteCtrlMessage frames v as [u16 length][JSON].

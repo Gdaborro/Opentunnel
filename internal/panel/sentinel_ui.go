@@ -4,13 +4,10 @@ import (
 	"net/http"
 )
 
-// sentinelPage is a standalone admin console for the proactive sentinel
-// (v1.1.0), mirroring the kill-switch page: no SPA rebuild needed. It lets
-// the operator switch the response mode (off | alert | respond) and watch
-// recent findings.
+// sentinelPage keeps the old bookmark working while the integrated SPA owns
+// the operator-facing sentinel UI.
 func (h *Handler) sentinelPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(sentinelHTML))
+	http.Redirect(w, r, "/admin/#sentinel", http.StatusFound)
 }
 
 const sentinelHTML = `<!doctype html>

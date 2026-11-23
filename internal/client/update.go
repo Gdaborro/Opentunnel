@@ -33,16 +33,26 @@ import (
 
 const (
 	updateRepo     = "Gdaborro/Opentunnel"
-	updateAssetWin = "otu-client-windows-amd64.exe"
 	updateCheckGap = 6 * time.Hour
 )
 
+// Select only this compile-time edition. The historical asset name remains
+// hosted; public generic clients use a distinct name even in signed bundles.
+const updateAssetWin = version.ClientWindowsUpdateAsset
+
+func windowsUpdateAsset(tag string) string {
+	return version.ClientWindowsUpdateAsset
+}
+
 // Release is the subset of the GitHub Releases API we consume.
 type Release struct {
-	TagName string `json:"tag_name"`
-	Name    string `json:"name"`
-	Body    string `json:"body"`
-	Assets  []struct {
+	Draft        bool `json:"draft"`
+	Prerelease   bool `json:"prerelease"`
+	signedBundle *signedBundle
+	TagName      string `json:"tag_name"`
+	Name         string `json:"name"`
+	Body         string `json:"body"`
+	Assets       []struct {
 		Name string `json:"name"`
 		URL  string `json:"browser_download_url"`
 		Size int64  `json:"size"`
@@ -140,25 +150,7 @@ func expectedSHA256(body string) string {
 // floor is what blocks a middleman from pinning the fleet to an old,
 // genuinely-signed, known-vulnerable build (audit round three, N-3).
 func CheckUpdate(ctx context.Context, socksAddr string) (*Release, error) {
-	rel, err := LatestRelease(ctx, socksAddr)
-	if err != nil {
-		return nil, err
-	}
-	if _, _, _, ok := parseVersion(rel.TagName); !ok || !strings.HasPrefix(rel.TagName, "v") {
-		return nil, errors.New("auto-update: release feed returned an invalid tag")
-	}
-	if belowMinTag(rel.TagName) {
-		return nil, fmt.Errorf("auto-update: release %s is below the minimum supported version %s — refusing", rel.TagName, MinUpdateTag)
-	}
-	cl := updateClient(socksAddr)
-	defer cl.CloseIdleConnections()
-	if err := checkReleaseFreshness(ctx, cl, rel, version.Version); err != nil {
-		return nil, err
-	}
-	if !isNewer(version.Version, rel.TagName) {
-		return nil, nil
-	}
-	return rel, nil
+	return CheckUpdateChannel(ctx, socksAddr, "stable")
 }
 
 // belowMinTag reports whether tag sorts strictly below MinUpdateTag.
@@ -260,6 +252,9 @@ func socksDialContext(ctx context.Context, socksAddr, network, addr string) (net
 // sha256 line all ride channels a middlebox can rewrite, but a forged
 // binary cannot produce a valid signature for the offline private key.
 func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
+	if version.LocalPreview != "" {
+		return errors.New("auto-update: unreleased local preview cannot install release assets")
+	}
 	if rel == nil {
 		return errors.New("auto-update: missing release metadata")
 	}
@@ -272,7 +267,7 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	if !isNewer(version.Version, rel.TagName) {
 		return errors.New("auto-update: release is not newer than the running version")
 	}
-	assetName := updateAssetWin
+	assetName := windowsUpdateAsset(rel.TagName)
 	var url, sigURL string
 	for _, a := range rel.Assets {
 		switch a.Name {
@@ -291,7 +286,7 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	if url == "" {
 		return fmt.Errorf("auto-update: release %s has no %s asset", rel.TagName, assetName)
 	}
-	if sigURL == "" {
+	if sigURL == "" && rel.signedBundle == nil {
 		// Unsigned releases are refused outright: an interceptor who can
 		// strip the signature can strip anything else in the feed. The
 		// manifest signature binds the TAG to the binary hash, so a
@@ -299,8 +294,11 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 		// (audit round three, N-3).
 		return fmt.Errorf("auto-update: release %s has no manifest signature — refusing install", rel.TagName)
 	}
-	if !validReleaseAssetURL(url, rel.TagName, assetName) || !validReleaseAssetURL(sigURL, rel.TagName, "manifest.sig") {
+	if !validReleaseAssetURL(url, rel.TagName, assetName) || (sigURL != "" && !validReleaseAssetURL(sigURL, rel.TagName, "manifest.sig")) {
 		return errors.New("auto-update: release asset URL is outside the expected GitHub release")
+	}
+	if requiresReleaseBundle(rel.TagName) && rel.signedBundle == nil {
+		return errors.New("auto-update: required signed artifact/channel manifest bundle is missing")
 	}
 	// The swap/re-exec machinery is Windows-only.
 	if runtime.GOOS != "windows" {
@@ -331,8 +329,33 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	}
 	cl := updateClient(socksAddr)
 	defer cl.CloseIdleConnections()
+	var bundleTarget *protocol.ReleaseArtifact
+	if rel.signedBundle != nil {
+		selected := rel.signedBundle.Bundle
+		verified, err := fetchReleaseBundle(ctx, cl, rel, selected.Channel)
+		if err != nil {
+			return err
+		}
+		oldDigest, _ := selected.Digest()
+		newDigest, _ := verified.Bundle.Digest()
+		if oldDigest != newDigest {
+			return errors.New("auto-update: signed bundle changed after channel selection")
+		}
+		cohort, err := updateCohort()
+		if err != nil {
+			return err
+		}
+		if !rolloutAllowed(verified.Bundle, cohort) {
+			return errors.New("auto-update: not in explicitly staged signed cohort")
+		}
+		artifact, err := verified.Bundle.Artifact(assetName, "windows/amd64")
+		if err != nil {
+			return err
+		}
+		bundleTarget = &artifact
+	}
 	var fresh *protocol.ReleaseManifest
-	if requiresFreshManifest(rel.TagName) {
+	if rel.signedBundle == nil && requiresFreshManifest(rel.TagName) {
 		fresh, err = freshTarget(ctx, cl, rel)
 		if err != nil {
 			return err
@@ -349,29 +372,33 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	}
 
 	// Signature first: tiny, and refusing early avoids a wasted download.
-	sresp, err := fetch(sigURL)
-	if err != nil {
-		return err
-	}
-	if sresp.StatusCode != http.StatusOK {
-		_ = sresp.Body.Close()
-		return fmt.Errorf("auto-update: manifest download %s", sresp.Status)
-	}
-	sigRaw, err := io.ReadAll(io.LimitReader(sresp.Body, 4096))
-	sresp.Body.Close()
-	if err != nil {
-		return err
-	}
-	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sigRaw)))
-	if err != nil {
-		return fmt.Errorf("auto-update: bad signature encoding: %w", err)
-	}
-	if len(sig) != ed25519.SignatureSize {
-		return fmt.Errorf("auto-update: bad signature length %d", len(sig))
-	}
-	pub, err := base64.StdEncoding.DecodeString(ReleasePubKey)
-	if err != nil || len(pub) != ed25519.PublicKeySize {
-		return errors.New("auto-update: embedded release key is corrupt")
+	var sig []byte
+	var pub []byte
+	if rel.signedBundle == nil {
+		sresp, err := fetch(sigURL)
+		if err != nil {
+			return err
+		}
+		if sresp.StatusCode != http.StatusOK {
+			_ = sresp.Body.Close()
+			return fmt.Errorf("auto-update: manifest download %s", sresp.Status)
+		}
+		sigRaw, err := io.ReadAll(io.LimitReader(sresp.Body, 4096))
+		sresp.Body.Close()
+		if err != nil {
+			return err
+		}
+		sig, err = base64.StdEncoding.DecodeString(strings.TrimSpace(string(sigRaw)))
+		if err != nil {
+			return fmt.Errorf("auto-update: bad signature encoding: %w", err)
+		}
+		if len(sig) != ed25519.SignatureSize {
+			return fmt.Errorf("auto-update: bad signature length %d", len(sig))
+		}
+		pub, err = base64.StdEncoding.DecodeString(ReleasePubKey)
+		if err != nil || len(pub) != ed25519.PublicKeySize {
+			return errors.New("auto-update: embedded release key is corrupt")
+		}
 	}
 
 	resp, err := fetch(url)
@@ -410,6 +437,9 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	if fresh != nil && (fresh.Bytes != n || !strings.EqualFold(fresh.SHA256, got)) {
 		return errors.New("binary differs from its signed freshness target")
 	}
+	if bundleTarget != nil && (bundleTarget.Bytes != n || bundleTarget.SHA256 != got) {
+		return errors.New("binary differs from signed artifact/provenance bundle")
+	}
 	if want := expectedSHA256(rel.Body); want != "" && got != want {
 		os.Remove(tmp)
 		return fmt.Errorf("auto-update: sha256 mismatch (got %s)", got[:12])
@@ -418,7 +448,7 @@ func SelfUpdate(ctx context.Context, rel *Release, socksAddr string) error {
 	// the tag from the (interceptable) feed is cryptographically bound to
 	// the binary hash, so neither a forged tag nor a swapped asset can
 	// pass — only a tuple the offline release key actually signed.
-	if !ed25519.Verify(ed25519.PublicKey(pub), ReleaseMsg(rel.TagName, got), sig) {
+	if rel.signedBundle == nil && !ed25519.Verify(ed25519.PublicKey(pub), ReleaseMsg(rel.TagName, got), sig) {
 		os.Remove(tmp)
 		return errors.New("auto-update: release manifest signature verification failed — refusing install")
 	}
@@ -480,16 +510,25 @@ func UpdateLoop(socksAddr string) {
 // Even in thin mode metadata is checked; a pending signed update cannot be
 // deferred forever merely because the network remains slow.
 func RunUpdateLoop(ctx context.Context, socksAddr string, onUpdated func()) {
+	RunUpdateLoopChannel(ctx, socksAddr, "stable", onUpdated)
+}
+
+func RunUpdateLoopChannel(ctx context.Context, socksAddr, channel string, onUpdated func()) {
+	if version.LocalPreview != "" {
+		setUpdateStatus("unreleased local preview; automatic updates disabled", "", 0)
+		return
+	}
 	var deferredSince time.Time
 	if !updateWait(ctx, 30*time.Second) {
 		return
 	}
 	for {
 		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		rel, err := CheckUpdate(checkCtx, socksAddr)
+		rel, err := CheckUpdateChannel(checkCtx, socksAddr, channel)
 		cancel()
 		if err != nil {
 			log.Printf("auto-update: check failed: %v", err)
+			setUpdateStatus("check failed; no install authorized", "", 0)
 		} else if rel != nil {
 			if ThinMode() {
 				if deferredSince.IsZero() {
@@ -503,12 +542,15 @@ func RunUpdateLoop(ctx context.Context, socksAddr string, onUpdated func()) {
 				}
 			}
 			log.Printf("auto-update: %s available (running %s) — downloading", rel.TagName, version.Version)
+			setUpdateStatus("verifying staged download", rel.TagName, CurrentUpdateStatus().ExpiresAt)
 			dctx, dcancel := context.WithTimeout(ctx, 30*time.Minute)
 			err := SelfUpdate(dctx, rel, socksAddr)
 			dcancel()
 			if err != nil {
 				log.Printf("auto-update: %v", err)
+				setUpdateStatus("install failed; current/rollback evidence retained", rel.TagName, 0)
 			} else {
+				setUpdateStatus("verified replacement armed; readiness pending", rel.TagName, CurrentUpdateStatus().ExpiresAt)
 				if onUpdated != nil {
 					onUpdated()
 				}
@@ -535,14 +577,14 @@ func updateWait(ctx context.Context, d time.Duration) bool {
 // replaceExecutable never deletes an existing backup. Failed install or
 // process creation restores the original path and checks rollback errors.
 func replaceExecutable(exe, staged, backup string, start func() error) error {
-	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(backup); !errors.Is(err, os.ErrNotExist) {
 		return errors.New("auto-update: backup path already exists")
 	}
-	if err := os.Rename(exe, backup); err != nil {
+	if err := moveUpdateNoReplace(exe, backup); err != nil {
 		return fmt.Errorf("auto-update: backup: %w", err)
 	}
-	if err := os.Rename(staged, exe); err != nil {
-		return errors.Join(fmt.Errorf("auto-update: install: %w", err), os.Rename(backup, exe))
+	if err := moveUpdateNoReplace(staged, exe); err != nil {
+		return errors.Join(fmt.Errorf("auto-update: install: %w", err), moveUpdateNoReplace(backup, exe))
 	}
 	if err := start(); err != nil {
 		if errors.Is(err, errReplacementStillRunning) {
@@ -550,11 +592,11 @@ func replaceExecutable(exe, staged, backup string, start func() error) error {
 			// could not be confirmed. Keep both files and the recovery journal.
 			return fmt.Errorf("auto-update: rollback deferred: %w", err)
 		}
-		moveErr := os.Rename(exe, staged)
+		moveErr := moveUpdateNoReplace(exe, staged)
 		if moveErr != nil {
 			return errors.Join(fmt.Errorf("auto-update: launch failed: %w", err), moveErr)
 		}
-		return errors.Join(fmt.Errorf("auto-update: launch failed; original restored: %w", err), os.Rename(backup, exe))
+		return errors.Join(fmt.Errorf("auto-update: launch failed; original restored: %w", err), moveUpdateNoReplace(backup, exe))
 	}
 	return nil
 }

@@ -169,14 +169,14 @@ func (s *SecureStream) padLen(payload int) int {
 	for _, b := range [...]int{64, 256, 1024, 4096, 16384, 32768} {
 		if total <= b {
 			jitter := b / 8
-			pad := mathrand.Intn(jitter + 1)
-			if total+pad <= maxPlaintext-2 {
+			pad := (b - total) + mathrand.Intn(jitter+1)
+			if total+pad <= maxPlaintext {
 				return pad
 			}
-			return 0
+			return max(0, maxPlaintext-total)
 		}
 	}
-	return mathrand.Intn(65)
+	return mathrand.Intn(min(64, max(0, maxPlaintext-total)) + 1)
 }
 
 // frameBufPool recycles ciphertext scratch buffers across frames.
@@ -272,7 +272,26 @@ func (s *SecureStream) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (s *SecureStream) Close() error                       { return s.conn.Close() }
+func (s *SecureStream) Close() error { return s.conn.Close() }
+
+// Preserve a carrier's real half-close capability. Carriers without one
+// still close fully; inventing an unnegotiated FIN frame would break old peers.
+func (s *SecureStream) CloseWrite() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if conn, ok := s.conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return s.conn.Close()
+}
+
+func (s *SecureStream) CloseNow() error {
+	_ = s.conn.SetDeadline(time.Now())
+	if conn, ok := s.conn.(interface{ CloseNow() error }); ok {
+		return conn.CloseNow()
+	}
+	return s.conn.Close()
+}
 func (s *SecureStream) LocalAddr() net.Addr                { return s.conn.LocalAddr() }
 func (s *SecureStream) RemoteAddr() net.Addr               { return s.conn.RemoteAddr() }
 func (s *SecureStream) SetDeadline(t time.Time) error      { return s.conn.SetDeadline(t) }

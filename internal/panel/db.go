@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -163,6 +162,46 @@ func migrateSchema(db schemaDB) error {
 		nonce TEXT PRIMARY KEY,
 		valid_until INTEGER NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS managed_ssh_keys (
+		public_key TEXT PRIMARY KEY,
+		desired INTEGER NOT NULL CHECK(desired IN (0,1)),
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS authority_reservations (
+		id TEXT PRIMARY KEY,
+		node_id TEXT NOT NULL,
+		token TEXT NOT NULL,
+		generation TEXT NOT NULL,
+		ingress TEXT NOT NULL,
+		down INTEGER NOT NULL CHECK(down IN (0,1)),
+		requested INTEGER NOT NULL,
+		bytes INTEGER NOT NULL,
+		day TEXT NOT NULL,
+		ready_at INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL,
+		settled INTEGER NOT NULL DEFAULT 0 CHECK(settled IN (0,1)),
+		refund INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS authority_reservations_node ON authority_reservations(node_id,settled);
+	CREATE INDEX IF NOT EXISTS authority_reservations_peer ON authority_reservations(token,settled);
+	CREATE INDEX IF NOT EXISTS authority_reservations_time ON authority_reservations(created_at);
+	CREATE TABLE IF NOT EXISTS authority_rates (
+		token TEXT NOT NULL,
+		scope TEXT NOT NULL,
+		generation TEXT NOT NULL,
+		next_ns INTEGER NOT NULL,
+		PRIMARY KEY(token,scope)
+	);
+	CREATE TABLE IF NOT EXISTS authority_node_metrics (
+		node_id TEXT PRIMARY KEY,
+		snapshot TEXT NOT NULL,
+		at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS authority_node_events (
+		node_id TEXT PRIMARY KEY,
+		window INTEGER NOT NULL,
+		count INTEGER NOT NULL
+	);
 	CREATE TABLE IF NOT EXISTS peers (
 		token TEXT PRIMARY KEY,
 		fingerprint TEXT NOT NULL,
@@ -274,6 +313,8 @@ func migrateSchema(db schemaDB) error {
 		// sticky upgrade — once a peer proved key possession, v4
 		// handshakes for its token are downgrade attempts).
 		{"v5_seen", "DATETIME"},
+		{"channel_seen", "INTEGER NOT NULL DEFAULT 0"},
+		{"channel_epoch", "TEXT NOT NULL DEFAULT ''"},
 		// Explicit approval cannot be confused with ordinary bootstrap state.
 		{"approval_required", "INTEGER NOT NULL DEFAULT 0"},
 		// A new generation invalidates already-authenticated sessions, even
@@ -304,7 +345,44 @@ func migrateSchema(db schemaDB) error {
 			}
 		}
 	}
+	var channelColumn int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('server_pool_authority') WHERE name='channel_required'`).Scan(&channelColumn); err != nil {
+		return err
+	}
+	if channelColumn == 0 {
+		if _, err := db.Exec(`ALTER TABLE server_pool_authority ADD COLUMN channel_required INTEGER NOT NULL DEFAULT 0 CHECK(channel_required IN (0,1))`); err != nil {
+			return err
+		}
+	}
+	// Retain explicit key ownership across every writer (including reaper,
+	// rekey and interrupted callbacks) before a peer row can disappear.
+	if _, err := db.Exec(`
+		INSERT OR IGNORE INTO managed_ssh_keys(public_key,desired)
+			SELECT ssh_pubkey,0 FROM peers WHERE COALESCE(ssh_pubkey,'')!='';
+		CREATE TRIGGER IF NOT EXISTS managed_ssh_peer_insert AFTER INSERT ON peers
+			WHEN COALESCE(NEW.ssh_pubkey,'')!='' BEGIN
+			INSERT OR IGNORE INTO managed_ssh_keys(public_key,desired) VALUES(NEW.ssh_pubkey,0); END;
+		CREATE TRIGGER IF NOT EXISTS managed_ssh_peer_update AFTER UPDATE OF ssh_pubkey,status ON peers BEGIN
+			INSERT OR IGNORE INTO managed_ssh_keys(public_key,desired) SELECT OLD.ssh_pubkey,0 WHERE COALESCE(OLD.ssh_pubkey,'')!='';
+			INSERT OR IGNORE INTO managed_ssh_keys(public_key,desired) SELECT NEW.ssh_pubkey,0 WHERE COALESCE(NEW.ssh_pubkey,'')!=''; END;
+		CREATE TRIGGER IF NOT EXISTS managed_ssh_peer_delete BEFORE DELETE ON peers
+			WHEN COALESCE(OLD.ssh_pubkey,'')!='' BEGIN
+			INSERT OR IGNORE INTO managed_ssh_keys(public_key,desired) VALUES(OLD.ssh_pubkey,0); END;
+	`); err != nil {
+		return err
+	}
 	// Seed the built-in categories (disabled until an admin enables them).
+	for _, column := range []struct{ name, definition string }{{"update_channel", "TEXT NOT NULL DEFAULT ''"}, {"update_state", "TEXT NOT NULL DEFAULT ''"}, {"channel_authentication", "INTEGER NOT NULL DEFAULT 0"}} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('device_health') WHERE name=?`, column.name).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err := db.Exec(`ALTER TABLE device_health ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
+				return err
+			}
+		}
+	}
 	for cat := range categoryLists {
 		if _, err := db.Exec(`INSERT OR IGNORE INTO blocked_categories(category,enabled) VALUES(?,0)`, cat); err != nil {
 			return err
@@ -334,8 +412,9 @@ func reaper(db *DB, purgeAfterDays int) {
 			db.Exec(`DELETE FROM ingress_usage WHERE token NOT IN (SELECT token FROM peers) OR day < date('now','-30 days')`)
 			db.Exec(`DELETE FROM device_health WHERE token NOT IN (SELECT token FROM peers)`)
 			db.Exec(`DELETE FROM peer_enrollments WHERE token NOT IN (SELECT token FROM peers)`)
+			db.Exec(`DELETE FROM authority_rates WHERE token NOT IN (SELECT token FROM peers)`)
 			db.Exec(`DELETE FROM peer_ips WHERE token NOT IN (SELECT token FROM peers)`)
-			db.Exec(`DELETE FROM peer_ips WHERE at < datetime('now','-7 days')`)
+			_ = db.PrunePrivacyRetention(context.Background())
 			db.Exec(`UPDATE peers SET status='approved', kick_expires=NULL, kick_reason=NULL WHERE status='kicked' AND kick_expires IS NOT NULL AND kick_expires < datetime('now')`)
 			db.Exec(`DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 500)`)
 			db.offlineSweep()
@@ -349,22 +428,9 @@ func (db *DB) RecordEvent(kind, detail string) {
 }
 
 // RecentEvents returns the newest events for the panel feed.
+// Legacy callers receive nil on unavailable reads; HTTP uses RecentEventsChecked.
 func (db *DB) RecentEvents(limit int) []map[string]string {
-	if limit <= 0 {
-		limit = 30
-	}
-	rows, err := db.Query(`SELECT kind, detail, at FROM events ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := []map[string]string{}
-	for rows.Next() {
-		var k, d, at string
-		if rows.Scan(&k, &d, &at) == nil {
-			out = append(out, map[string]string{"kind": k, "detail": d, "at": at})
-		}
-	}
+	out, _ := db.RecentEventsChecked(context.Background(), limit)
 	return out
 }
 
@@ -501,14 +567,6 @@ func (db *DB) IsBlocked(domain string) bool {
 	if db == nil {
 		return false
 	}
-	domain = strings.ToLower(strings.TrimSpace(domain))
-	if domain == "" {
-		return false
-	}
-	for _, d := range db.blockedSuffixes() {
-		if domain == d || strings.HasSuffix(domain, "."+d) {
-			return true
-		}
-	}
-	return false
+	blocked, _, err := db.CheckBlocked(domain)
+	return blocked || err != nil
 }

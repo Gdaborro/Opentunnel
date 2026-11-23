@@ -86,5 +86,5 @@ func isOtuProcess(pid uint32) bool {
 	}
 	name := strings.ToLower(filepath.Base(windows.UTF16ToString(buf[:size])))
 	name = strings.TrimSuffix(name, ".old")
-	return name == strings.ToLower(version.ProcessID)+".exe" || name == strings.ToLower(version.ProcessID)+"-windows-amd64.exe"
+	return name == strings.ToLower(version.ProcessID)+".exe" || name == strings.ToLower(version.ProcessID)+"-windows-amd64.exe" || name == "otu-client-aborro-windows-amd64.exe" || name == "otu-client-generic-windows-amd64.exe"
 }

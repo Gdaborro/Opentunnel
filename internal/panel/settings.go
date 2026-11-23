@@ -3,7 +3,9 @@ package panel
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"opentunnel/internal/serverpool"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,15 +49,18 @@ func (h *Handler) apiSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req settingsRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err != nil || serverpool.DecodeStrict(raw, &req) != nil {
 		http.Error(w, "invalid settings request", 400)
 		return
 	}
 	updates, err := prepareSettings(req)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
+		return
+	}
+	if h.poolID != "" && req.AutoAcceptMin != nil && *req.AutoAcceptMin > 0 {
+		http.Error(w, "trusted pools require separate manual approval; automatic admission windows are unavailable", 409)
 		return
 	}
 	if err := h.db.SetSettings(updates); err != nil {

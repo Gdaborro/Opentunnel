@@ -132,6 +132,7 @@ func freshTarget(ctx context.Context, cl *http.Client, rel *Release) (*protocol.
 	if err := saveReleaseCheckpoint(m); err != nil {
 		return nil, err
 	}
+	setUpdateStatus("legacy signed freshness verified", m.Tag, m.ExpiresAt)
 	return &m, nil
 }
 

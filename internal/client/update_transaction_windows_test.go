@@ -166,6 +166,85 @@ func TestInterruptedExecutableTransactionRecoversNextStart(t *testing.T) {
 	}
 }
 
+func TestMissingExecutableRecoveryFromStagedAndBackup(t *testing.T) {
+	for _, launch := range []string{"staged", "backup"} {
+		t.Run(launch, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("LOCALAPPDATA", filepath.Join(dir, "appdata"))
+			store, err := NewTokenStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			updates := filepath.Join(store.Dir, "updates")
+			if err := privatefile.EnsureDir(updates); err != nil {
+				t.Fatal(err)
+			}
+			source, err := os.ReadFile(os.Args[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			exe := filepath.Join(dir, "fixture.exe")
+			backup := exe + ".old-fixture"
+			staged := exe + ".new-fixture.exe"
+			if err := os.WriteFile(backup, source, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(staged, append(bytes.Clone(source), []byte("staged-recovery-image")...), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			previous, err := fileDigest(backup)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement, err := fileDigest(staged)
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(dir, "child-result")
+			tx := updateTransaction{Version: 1, Executable: exe, Staged: staged, Backup: backup, SHA256: replacement, PreviousSHA256: previous, Parent: 2147483646, Helper: 2147483645, Token: strings.Repeat("a", 43), Args: []string{"-test.run=^TestInterruptedUpdateRecoveryChild$"}, ReadyFile: filepath.Join(updates, "ready-fixture"), StartedAt: time.Now().Unix()}
+			raw, err := json.Marshal(tx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			journal := filepath.Join(updates, updateJournalName)
+			if err := privatefile.WriteNew(journal, raw); err != nil {
+				t.Fatal(err)
+			}
+			image := staged
+			if launch == "backup" {
+				image = backup
+			}
+			cmd := exec.Command(image, "-test.run=^TestInterruptedUpdateRecoveryChild$")
+			cmd.Env = append(withoutUpdateEnvironment(os.Environ()), "OTU_TEST_UPDATE_RECOVERY=1", "OTU_TEST_RECOVERED="+marker)
+			if err := cmd.Run(); err != nil {
+				t.Fatal("recovery image failed", err)
+			}
+			deadline := time.Now().Add(8 * time.Second)
+			for {
+				if data, err := os.ReadFile(marker); err == nil && string(data) == "verified previous executable started" {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("canonical restored executable did not start")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if got, err := fileDigest(exe); err != nil || got != previous {
+				t.Fatal("missing install was not restored to the verified previous digest")
+			}
+			if _, err := os.Stat(journal); !os.IsNotExist(err) {
+				t.Fatal("completed recovery retained its journal")
+			}
+			if _, err := os.Stat(backup); err != nil {
+				t.Fatal("recovery moved or deleted the verified backup")
+			}
+			if _, err := os.Stat(staged); err != nil {
+				t.Fatal("recovery discarded the staged image")
+			}
+		})
+	}
+}
+
 // Real Windows executable rename/readiness/rollback, copied TEST executables
 // and private temp state only. No installed-client or proxy/registry changes.
 func TestExecutableTransactionCommitsOrRollsBack(t *testing.T) {

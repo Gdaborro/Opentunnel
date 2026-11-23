@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/subtle"
 	"crypto/tls"
+	"database/sql"
 	"errors"
 	"io"
 	"log"
@@ -23,6 +24,8 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
 
+	"opentunnel/internal/access"
+	"opentunnel/internal/authority"
 	"opentunnel/internal/metrics"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/server/decoy"
@@ -51,6 +54,30 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return false
 }
 
+// PolicyDB retains the local embedding interface; central authorities must
+// additionally implement the checked policy/accounting/control contracts.
+type PolicyDB interface {
+	CheckToken(string) (string, string, string, error)
+	RecordTraffic(string, int64, int64)
+	IsBlocked(string) bool
+	BlockWhy(string) string
+	KillSwitch() bool
+	KillSwitchReason() string
+	KillSwitchAllow(string) bool
+	PeerLimits(string) (int64, int64)
+	SSHTierLimits() (int64, int64, int64)
+	SetPeerIP(string, string)
+	RecordHealth(string, string, string, string, float64, float64, float64, int64, float64, float64, float64)
+	BanReason(string) string
+	TouchPeer(string)
+	KnownPeer(string) bool
+	RecordVisit(string, string)
+	SSHPubKey(string) string
+	RecordAlert(string, string, string)
+	MarkV5(string)
+	V5Seen(string) bool
+}
+
 type Options struct {
 	PoolID, AuthorityID string                // nonempty pools require the matching shared authority and v5 device-key authentication
 	Token               string                // shared secret (no-panel mode; legacy fallback when AllowLegacyMaster)
@@ -62,42 +89,12 @@ type Options struct {
 	// AllowRestrictedTargets disables the SSRF dial filter (loopback,
 	// private, link-local/metadata, CGNAT ranges). Off by default.
 	AllowRestrictedTargets bool
+	AllowStreamingHTTP2    bool // opt-in full-duplex H2 origin contract for a streaming H3 front
 	// AllowLegacyMaster accepts the shared master token at the handshake
 	// (migration aid while clients move to per-device tokens). The token is
 	// never shipped in client binaries.
 	AllowLegacyMaster bool
-	PanelDB           interface { // optional panel DB for per-token checks
-		CheckToken(token string) (status, reason, kickExpires string, err error)
-		RecordTraffic(token string, up, down int64)
-		IsBlocked(domain string) bool
-		BlockWhy(domain string) string
-		KillSwitch() bool
-		// Kill-switch detail: the admin's reason (shown on the client's
-		// traffic-down page) and the token allowlist that keeps the
-		// operator's own devices tunneling while the switch is engaged.
-		KillSwitchReason() string
-		KillSwitchAllow(token string) bool
-		PeerLimits(token string) (maxBps, quotaBytes int64)
-		// SSH-tier containment (sshtier.go): sustained cap and daily byte
-		// budget for the ssh transport's ingress, plus the post-budget
-		// trickle rate. All 0 = disabled.
-		SSHTierLimits() (maxBps, dailyBytes, trickleBps int64)
-		SetPeerIP(token, ip string)
-		// Control channel (v0.9.23): in-band status/health mirroring the
-		// panel's public token API for devices on TLS-intercepting networks.
-		RecordHealth(token, version, osName, arch string, cpuPct, memPct, tempC float64, uptimeS int64, latencyMs, jitterMs, probeLossPct float64)
-		BanReason(token string) string
-		TouchPeer(token string)
-		KnownPeer(token string) bool
-		RecordVisit(token, domain string)
-		// V5 handshake binding: the SSH public key registered for a token
-		// (proof-of-possession check) and security alerting.
-		SSHPubKey(token string) string
-		RecordAlert(severity, kind, message string)
-		// Sticky per-peer v5 upgrade latch (downgrade gate).
-		MarkV5(token string)
-		V5Seen(token string) bool
-	}
+	PanelDB           PolicyDB // local database or explicit central authority; never fail-open fallback
 	// CurrentPin, when set, returns the relay's CURRENT leaf certificate
 	// fingerprint (hex). Every control response carries it so clients
 	// survive certificate rotation (LE renews ~every 60-90 days; a stale
@@ -127,8 +124,10 @@ type Options struct {
 	SetupTimeout                        time.Duration
 	InnerTLSCertificate                 *tls.Certificate
 	RequireInnerTLS                     bool
+	RequireChannelAuth                  bool
 	state                               *relayState
 	sessionBound                        bool
+	sessionChannelBound                 bool
 	sessionGeneration, sessionPublicKey string
 	innerGeneration, innerPublicKey     string
 }
@@ -190,7 +189,8 @@ func Handler(opt Options) http.Handler {
 		// HTTP/3 arrivals (ProtoMajor 3): the h3 transport tier tunnels
 		// the protocol over a streaming request — no WebSocket upgrade
 		// exists on that path. Same guard, same session machinery.
-		if r.ProtoMajor == 3 {
+		streamingOrigin := r.ProtoMajor == 2 && opt.AllowStreamingHTTP2 && r.Header.Get(protocol.StreamingHeader) == protocol.StreamingValue
+		if r.ProtoMajor == 3 || streamingOrigin {
 			if r.Method != http.MethodPost {
 				decoyHandler.ServeHTTP(w, r)
 				return
@@ -214,6 +214,11 @@ func Handler(opt Options) http.Handler {
 			// session machinery reads from the request body.
 			w.WriteHeader(http.StatusOK)
 			controller := http.NewResponseController(w)
+			if streamingOrigin {
+				if err := controller.SetReadDeadline(time.Now().Add(opt.setupTimeout())); err != nil {
+					return
+				}
+			}
 			if err := controller.SetWriteDeadline(time.Now().Add(opt.setupTimeout())); err != nil {
 				return
 			}
@@ -222,7 +227,7 @@ func Handler(opt Options) http.Handler {
 					return
 				}
 			}
-			handleSession(&h3ServerConn{Reader: r.Body, Writer: w, Flusher: flusher}, opt, peerIP, ingress)
+			handleSession(&h3ServerConn{Reader: r.Body, Writer: &streamingResponse{ResponseWriter: w, controller: controller}, Flusher: flusher}, opt, peerIP, ingress)
 			return
 		}
 		release := opt.guard().Acquire(peerIP)
@@ -277,6 +282,30 @@ func Handler(opt Options) http.Handler {
 func (o Options) verifyHandshakeToken(tok string) byte {
 	if o.PoolID != "" {
 		p, err := o.readPolicy(tok)
+		if err != nil {
+			return protocol.StatusPending
+		}
+		switch p.Status {
+		case "approved", "kicked":
+			return protocol.StatusOK
+		case "banned":
+			return protocol.StatusBanned
+		case "expired":
+			return protocol.StatusExpired
+		default:
+			return protocol.StatusPending
+		}
+	}
+	if o.PanelDB != nil && o.AllowLegacyMaster && subtle.ConstantTimeCompare([]byte(tok), []byte(o.Token)) == 1 {
+		return protocol.StatusOK
+	}
+	if store, ok := o.PanelDB.(interface {
+		AccessPolicy(string) (access.Snapshot, error)
+	}); ok {
+		p, err := store.AccessPolicy(tok)
+		if errors.Is(err, sql.ErrNoRows) {
+			return protocol.StatusBadToken
+		}
 		if err != nil {
 			return protocol.StatusPending
 		}
@@ -359,19 +388,25 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 	stream = secured
 	hs, err := protocol.ReadHandshake(stream)
 	if err != nil {
-		var st byte = protocol.StatusBadVersion
-		if errors.Is(err, protocol.ErrBadToken) {
-			st = protocol.StatusBadToken
-		}
 		opt.guard().Punish(peerIP)
 		opt.sentinel().AuthFail(peerIP)
 		opt.logger().Printf("server: handshake rejected: %v", err)
-		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			_ = protocol.WriteHandshakeStatus(stream, protocol.ProtoVersion, st)
-		}
+		// Malformed anonymous traffic gets no protocol-specific version/status
+		// oracle. Pinned transports still report connection setup failure.
 		return
 	}
 	status := opt.verifyHandshakeToken(hs.Token)
+	if hs.Version == protocol.ChannelVersion {
+		inner, ok := stream.(*tls.Conn)
+		if !ok || innerToken == "" {
+			return
+		}
+		if _, err := protocol.ChannelBinding(inner.ConnectionState()); err != nil {
+			return
+		}
+	} else if opt.RequireChannelAuth {
+		return
+	}
 	if innerToken != "" && hs.Token != innerToken {
 		return
 	}
@@ -391,10 +426,14 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 			return
 		}
 		pub := p.PublicKey
+		if (p.ChannelSeen || p.ChannelRequired) && hs.Version != protocol.ChannelVersion {
+			return
+		}
 		if innerToken != "" && (p.Generation != opt.innerGeneration || pub != opt.innerPublicKey) {
 			return
 		}
 		opt.sessionBound = true
+		opt.sessionChannelBound = hs.Version == protocol.ChannelVersion
 		opt.sessionGeneration, opt.sessionPublicKey = p.Generation, pub
 		if pub == "" && (opt.PoolID != "" || (!opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After))) {
 			// The migration deadline applies to keyless legacy rows too.
@@ -407,8 +446,7 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 		case hs.Version >= protocol.ProtoVersion:
 			if pub == "" {
 				opt.logger().Printf("server: no registered key for %s — v5 signature not enforced this session", shortToken(hs.Token))
-			} else if !verifyHandshakeSig(pub, hs) {
-				opt.guard().Punish(peerIP)
+			} else if !verifySessionHandshakeSig(pub, hs, stream) {
 				opt.sentinel().StolenToken(hs.Token, peerIP, "handshake signature mismatch")
 				opt.logger().Printf("server: v5 signature mismatch for %s", shortToken(hs.Token))
 				_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
@@ -416,7 +454,29 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 			} else {
 				// Sticky per-peer upgrade latch: from this moment a v4
 				// hello for this token is a downgrade attempt.
-				opt.PanelDB.MarkV5(hs.Token)
+				if hs.Version == protocol.ChannelVersion {
+					store, ok := opt.PanelDB.(interface {
+						CommitAuthentication(string, string, string, bool) error
+					})
+					if !ok || store.CommitAuthentication(hs.Token, p.Generation, pub, true) != nil {
+						return
+					}
+				} else if store, ok := opt.PanelDB.(interface {
+					CommitV5(string, string, string) error
+				}); ok {
+					if err := store.CommitV5(hs.Token, p.Generation, pub); err != nil {
+						_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusPending)
+						return
+					}
+				} else {
+					// Compatibility embedders retain their interface, but success is
+					// conditional on observable durable/authoritative latch state.
+					opt.PanelDB.MarkV5(hs.Token)
+					if !opt.PanelDB.V5Seen(hs.Token) {
+						_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusPending)
+						return
+					}
+				}
 			}
 		default: // v4 hello
 			// Downgrade gate (audit round four): a token that has ever
@@ -431,7 +491,6 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 				enforce = !opt.RequireV5After.IsZero() && time.Now().After(opt.RequireV5After)
 			}
 			if enforce {
-				opt.guard().Punish(peerIP)
 				opt.sentinel().StolenToken(hs.Token, peerIP, "v4 downgrade attempt")
 				opt.logger().Printf("server: v4 downgrade attempt for %s (v5 required)", shortToken(hs.Token))
 				_ = protocol.WriteHandshakeStatus(stream, hs.Version, protocol.StatusBadToken)
@@ -505,7 +564,15 @@ func handleSession(stream net.Conn, opt Options, peerIP, ingress string) {
 		clientToken = authTok // very old clients: handshake token doubles as panel token
 	}
 	if opt.PanelDB != nil {
-		go opt.PanelDB.SetPeerIP(clientToken, peerIP)
+		if store, ok := opt.PanelDB.(interface {
+			SetPeerIPBound(context.Context, authority.PeerIPRequest) error
+		}); ok && opt.sessionBound && opt.sessionChannelBound {
+			go func() {
+				_ = store.SetPeerIPBound(context.Background(), authority.PeerIPRequest{Token: clientToken, Generation: opt.sessionGeneration, PublicKey: opt.sessionPublicKey, IP: peerIP})
+			}()
+		} else {
+			go opt.PanelDB.SetPeerIP(clientToken, peerIP)
+		}
 	}
 	opt.sentinel().SessionStart(clientToken, peerIP)
 	var peerStatus = "approved"
@@ -620,12 +687,16 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 		if name == "" && target.IP != nil {
 			name = target.IP.String()
 		}
-		if name != "" && opt.PanelDB.IsBlocked(name) {
+		blocked, why, policyErr := opt.checkBlocked(name)
+		if policyErr != nil {
+			writeBlocked(rw, ver, "unavailable", "filtering policy unavailable")
+			return
+		}
+		if name != "" && blocked {
 			opt.logger().Printf("blocked %q for %s", name, shortToken(token))
 			_ = protocol.WriteTargetResponse(rw, ver, protocol.StatusBlocked)
 			// Send the rule (not just the domain): the client block page
 			// states the reason, e.g. "ads category".
-			why := opt.PanelDB.BlockWhy(name)
 			if why == "" {
 				why = "blocked"
 			}
@@ -638,8 +709,19 @@ func relayTarget(atyp byte, rw deadlineRW, opt Options, token, peerStatus, peerR
 	// connection added latency to every page load; the bounded queue
 	// drops under flood (monitoring data, not billing). Logs are sampled
 	// so a busy relay does not fill journald.
-	if opt.PanelDB != nil && token != "" && target.Domain != "" {
-		recordVisitAsync(opt.PanelDB, token, target.Domain)
+	monitoring := true
+	if opt.PanelDB != nil {
+		p, err := opt.readPolicy(token)
+		monitoring = err == nil && p.TelemetryMode != "minimal"
+	}
+	if monitoring && opt.PanelDB != nil && token != "" && target.Domain != "" {
+		if store, ok := opt.PanelDB.(interface {
+			RecordVisitBound(context.Context, authority.VisitRequest) error
+		}); ok && opt.sessionBound && opt.sessionChannelBound {
+			recordBoundVisitAsync(store, authority.VisitRequest{Token: token, Generation: opt.sessionGeneration, PublicKey: opt.sessionPublicKey, Domain: target.Domain})
+		} else {
+			recordVisitAsync(opt.PanelDB, token, target.Domain)
+		}
 		if visitLogN.Add(1)%8 == 1 {
 			opt.logger().Printf("visit %s -> %q", shortToken(token), target.Domain)
 		}
@@ -780,6 +862,10 @@ var (
 type visitEntry struct {
 	db            visitRecorder
 	token, domain string
+	bound         interface {
+		RecordVisitBound(context.Context, authority.VisitRequest) error
+	}
+	req authority.VisitRequest
 }
 
 // recordVisitAsync queues a visit record onto a bounded worker (started
@@ -790,12 +876,39 @@ func recordVisitAsync(db visitRecorder, token, domain string) {
 		visitCh = make(chan visitEntry, 1024)
 		go func() {
 			for e := range visitCh {
-				e.db.RecordVisit(e.token, e.domain)
+				if e.bound != nil {
+					_ = e.bound.RecordVisitBound(context.Background(), e.req)
+				} else {
+					e.db.RecordVisit(e.token, e.domain)
+				}
 			}
 		}()
 	})
 	select {
-	case visitCh <- visitEntry{db, token, domain}:
+	case visitCh <- visitEntry{db: db, token: token, domain: domain}:
+	default:
+	}
+}
+
+func recordBoundVisitAsync(store interface {
+	RecordVisitBound(context.Context, authority.VisitRequest) error
+}, req authority.VisitRequest) {
+	// Reuse the same bounded single writer queue without enqueuing a dummy
+	// identity or detaching an unbounded goroutine for each visited site.
+	visitOnce.Do(func() {
+		visitCh = make(chan visitEntry, 1024)
+		go func() {
+			for e := range visitCh {
+				if e.bound != nil {
+					_ = e.bound.RecordVisitBound(context.Background(), e.req)
+				} else {
+					e.db.RecordVisit(e.token, e.domain)
+				}
+			}
+		}()
+	})
+	select {
+	case visitCh <- visitEntry{bound: store, req: req}:
 	default:
 	}
 }
@@ -826,6 +939,34 @@ func serveCtrlStream(rw deadlineRW, opt Options, authTok string) {
 	resp.SSHHost = opt.SSHPublicHost
 	defer func() { _ = protocol.WriteCtrlMessage(rw, resp) }()
 	if opt.PanelDB == nil || authTok == "" {
+		return
+	}
+	if store, ok := opt.PanelDB.(interface {
+		ControlSession(context.Context, authority.ControlRequest, bool) (protocol.CtrlResponse, error)
+	}); ok && opt.sessionBound {
+		bound, err := store.ControlSession(context.Background(), authority.ControlRequest{Token: authTok, Generation: opt.sessionGeneration, PublicKey: opt.sessionPublicKey, Request: req}, opt.sessionChannelBound)
+		if err != nil {
+			return
+		}
+		bound.Pin, bound.SSHHost = resp.Pin, resp.SSHHost
+		resp = bound
+		if req.Op == "health" && req.HostileNet && resp.OK && resp.TelemetryMode != "minimal" {
+			opt.sentinel().HostileNet(authTok)
+		}
+		return
+	}
+	if store, ok := opt.PanelDB.(interface {
+		ControlBound(context.Context, authority.ControlRequest) (protocol.CtrlResponse, error)
+	}); ok && opt.sessionBound && opt.sessionChannelBound {
+		bound, err := store.ControlBound(context.Background(), authority.ControlRequest{Token: authTok, Generation: opt.sessionGeneration, PublicKey: opt.sessionPublicKey, Request: req})
+		if err != nil {
+			return
+		}
+		bound.Pin, bound.SSHHost = resp.Pin, resp.SSHHost
+		resp = bound
+		if req.Op == "health" && req.HostileNet && resp.OK && resp.TelemetryMode != "minimal" {
+			opt.sentinel().HostileNet(authTok)
+		}
 		return
 	}
 	switch req.Op {
@@ -880,4 +1021,32 @@ func shortToken(t string) string {
 		return t[:8]
 	}
 	return t
+}
+
+func verifySessionHandshakeSig(publicKey string, hs *protocol.Handshake, conn net.Conn) bool {
+	if hs.Version != protocol.ChannelVersion {
+		return verifyHandshakeSig(publicKey, hs)
+	}
+	inner, ok := conn.(*tls.Conn)
+	if !ok {
+		return false
+	}
+	binding, err := protocol.ChannelBinding(inner.ConnectionState())
+	if err != nil {
+		return false
+	}
+	msg, err := protocol.ChannelHandshakeMsg(hs.Token, hs.Salt, binding)
+	if err != nil {
+		return false
+	}
+	pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(publicKey))
+	if err != nil {
+		return false
+	}
+	cryptoKey, ok := pk.(ssh.CryptoPublicKey)
+	if !ok {
+		return false
+	}
+	ed, ok := cryptoKey.CryptoPublicKey().(ed25519.PublicKey)
+	return ok && ed25519.Verify(ed, msg, hs.Sig)
 }

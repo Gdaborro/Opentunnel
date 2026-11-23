@@ -26,6 +26,7 @@ func main() {
 	nodesPath := flag.String("nodes", "", "bounded JSON array of explicitly provisioned nodes with their verified TLS pins")
 	name := flag.String("name", "", "operator pool display name")
 	validity := flag.Duration("valid-for", 30*24*time.Hour, "profile validity; maximum 90 days")
+	channelCanary := flag.Bool("require-channel-auth", false, "export a stronger v2 profile for a canary after independent inner TLS is provisioned; does not change authority policy")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -67,8 +68,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("load server config: %v", err)
 	}
+	if cfg.AuthorityURL != "" {
+		log.Fatal("export profiles at the central authority, not from a relay node or copied database")
+	}
 	if cfg.PoolID != id {
 		log.Fatal("server.toml pool_id must match this dedicated operator key; no authority changed")
+	}
+	if *channelCanary && (cfg.InnerTLSCertFile == "" || cfg.InnerTLSKeyFile == "") {
+		log.Fatal("channel-authentication canary needs independently provisioned inner TLS on every relay; no profile exported")
 	}
 	raw, err := serverpool.ReadDocument(*nodesPath)
 	if err != nil {
@@ -79,7 +86,7 @@ func main() {
 		log.Fatal("node manifest must be one credential-free JSON array with exact node fields")
 	}
 	now := time.Now()
-	p := serverpool.Profile{Name: *name, AuthorityID: id, IssuedAt: now.Unix(), ExpiresAt: now.Add(*validity).Unix(), LoginRequired: cfg.EnrollmentLogin, ApprovalRequired: true, Nodes: nodes}
+	p := serverpool.Profile{Name: *name, AuthorityID: id, IssuedAt: now.Unix(), ExpiresAt: now.Add(*validity).Unix(), LoginRequired: cfg.EnrollmentLogin, ApprovalRequired: true, RequireChannelAuth: cfg.RequireChannelAuth || *channelCanary, Nodes: nodes}
 	if err := p.Sign(key, now); err != nil {
 		log.Fatal(err)
 	}
@@ -92,7 +99,7 @@ func main() {
 		log.Fatalf("local approval database unavailable: %v", err)
 	}
 	defer db.Close()
-	info, err := db.BindServerPool(id, cfg.EnrollmentLogin)
+	info, err := db.BindServerPoolAuthentication(id, cfg.EnrollmentLogin, cfg.RequireChannelAuth)
 	if err != nil {
 		log.Fatalf("authority binding refused: %v", err)
 	}

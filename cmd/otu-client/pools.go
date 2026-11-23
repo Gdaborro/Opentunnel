@@ -64,6 +64,7 @@ func handlePoolCommands(args []string) (bool, error) {
 		}
 		fmt.Printf("Pool: %s\nOperator fingerprint: %s\nAuthority: %s\nExpires: %s\n", p.Name, p.ID, p.AuthorityID, time.Unix(p.ExpiresAt, 0).UTC().Format(time.RFC3339))
 		fmt.Printf("Enrollment login: %t. Administrator device approval: required.\n", p.LoginRequired)
+		fmt.Printf("Connection-bound device authentication required: %t.\n", p.RequireChannelAuth)
 		for _, n := range p.Nodes {
 			fmt.Printf("  %s: %s (TCP %s), %d explicit TLS pin(s)\n", n.Name, n.Address, n.DialAddr(), len(n.Pins))
 		}
@@ -160,6 +161,7 @@ func configureTrustedPool(cfg *config.ClientConf, selector *client.PoolSelector)
 	cfg.ServerAddr, cfg.PoolDialAddress, cfg.ServerIP, cfg.ServerFallbacks = n.Address, n.DialAddr(), "", nil
 	cfg.Fingerprint, cfg.Fingerprints, cfg.WSPath = n.Pins[0], append([]string(nil), n.Pins...), n.WSPath
 	cfg.Token, cfg.Transport, cfg.Insecure, cfg.AllowUntrustedBootstrap = "", "wstls", false, false
+	cfg.RequireChannelAuth = p.RequireChannelAuth // the signed operator policy, never a previous operator's TOML flag
 	cfg.CarrierSOCKS, cfg.CarrierTarget, cfg.Reality, cfg.InnerTLSPins = "", "", nil, nil
 	cfg.SSHKey, cfg.SSHUser, cfg.SSHHostKeys, cfg.SSHDialHostOverride, cfg.SSHInternal, cfg.SSHClientVersion, cfg.SSHPort = "", "", "", "", "", "", ""
 	cfg.FallbackSSH, cfg.HostileSSH, cfg.H3Tier, cfg.ECH = boolPtr(false), boolPtr(false), boolPtr(false), boolPtr(false)

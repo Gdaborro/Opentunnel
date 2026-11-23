@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -144,12 +145,33 @@ func main() {
 	// Signed update preflight is a pure version query. Do not open identity,
 	// crash logs or recovery journals for a temporary staged executable.
 	if len(os.Args) == 2 && (os.Args[1] == "-version" || os.Args[1] == "--version") {
-		fmt.Println("opentunnel client", version.Version)
+		fmt.Println(clientVersionText())
+		return
+	}
+	if handled, err := handleBuildInfoCommand(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "build info:", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if handled, err := handlePoolCommands(os.Args[1:]); handled {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "server pools:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if handled, err := handleStatusCommand(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "status:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if handled, err := handleReleaseRootCommand(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "release trust:", err)
 			os.Exit(1)
 		}
 		return
@@ -166,17 +188,26 @@ func main() {
 		}
 		return
 	}
-	setupCrashLog()
-	if err := client.WaitForUpdateParent(45 * time.Second); err != nil {
-		log.Printf("auto-update: replacement startup refused: %v", err)
-		return
+	recoveryCommand := networkRecoveryRequested(os.Args[1:])
+	if !recoveryCommand {
+		if err := client.WaitForReplacementAuthorization(); err != nil {
+			fmt.Fprintln(os.Stderr, "replacement startup refused:", err)
+			return
+		}
 	}
-	if os.Getenv("OTU_UPDATE_READY_FILE") == "" {
-		if restarted, err := client.RecoverPendingUpdate(); err != nil {
-			log.Printf("pending update recovery: %v", err)
+	setupCrashLog()
+	if !recoveryCommand {
+		if err := client.WaitForUpdateParent(45 * time.Second); err != nil {
+			startupRefused("replacement startup refused", err)
 			return
-		} else if restarted {
-			return
+		}
+		if os.Getenv("OTU_UPDATE_READY_FILE") == "" {
+			if restarted, err := client.RecoverPendingUpdate(); err != nil {
+				startupRefused("pending update recovery", err)
+				return
+			} else if restarted {
+				return
+			}
 		}
 	}
 	defer func() {
@@ -197,12 +228,80 @@ func main() {
 	run()
 }
 
+// A failed executable update must not strand an orphaned user-proxy journal.
+// Recovery is ownership-checked and touches networking only; updater/identity
+// evidence is never erased. Keep double-click failures visible instead of
+// disappearing before users can distinguish refusal from a process crash.
+func startupRefused(operation string, failure error) {
+	log.Printf("%s: %v", operation, failure)
+	if mgr, err := netenv.NewManager(); err == nil {
+		if err := mgr.Recover(); err != nil {
+			log.Printf("orphan settings recovery incomplete; evidence retained: %v", err)
+		}
+		reportNetworkWarnings(mgr, "startup recovery")
+	}
+	fmt.Println("[!] Client startup was refused. Existing identities and recovery evidence were preserved.")
+	fmt.Println("    Stop any existing client first. Use --restore for network-only recovery; review the message above.")
+	if len(os.Args) == 1 {
+		fmt.Println("Press Enter to close...")
+		_, _ = fmt.Scanln()
+	}
+}
+
+// fatalVisible replaces log.Fatal on startup and command paths that run before
+// a new proxy journal is installed. A double-click console stays open so users
+// can read the refusal instead of reporting an instant crash. Recovery
+// evidence is never deleted here.
+func fatalVisible(operation string, failure error) {
+	log.Printf("%s: %v", operation, failure)
+	fmt.Printf("[!] %s failed. Existing identities and recovery evidence were preserved.\n", operation)
+	if len(os.Args) == 1 {
+		fmt.Println("Press Enter to close...")
+		_, _ = fmt.Scanln()
+	}
+	os.Exit(1)
+}
+
+// restoreWithRetry tolerates the short interval between a forced client stop
+// and release of the settings lease. Without it, stop-otu.bat can report a
+// false recovery failure while the dead process's lease is still closing, and
+// the dead proxy remains configured until the next attempt. A genuinely live
+// owner still fails promptly; the bounded window only covers process teardown.
+func restoreWithRetry(mgr *netenv.Manager, from string) error {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var err error
+		if from != "" {
+			err = mgr.RestoreFrom(from)
+		} else {
+			err = mgr.Restore()
+		}
+		if !errors.Is(err, netenv.ErrAlreadyRunning) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func clientVersionText() string {
+	display := version.Version
+	if !strings.HasPrefix(display, "v") {
+		display = "v" + display
+	}
+	text := "opentunnel client " + display
+	if version.LocalPreview != "" {
+		text += " (UNRELEASED local preview " + version.LocalPreview + "; edition=" + version.ClientEdition + ")"
+	}
+	return text
+}
+
 func run() {
 	cfgPath := flag.String("c", "client.toml", "path to client config")
 	genConfig := flag.Bool("gen-config", false, "write a template config and exit")
 	autoProxy := flag.Bool("auto-proxy", false, "configure the Windows user-level system proxy automatically (restored on exit)")
 	restoreOnly := flag.Bool("restore", false, "restore previously saved network settings and exit")
 	restoreFrom := flag.String("restore-from", "", "restore network settings from a backup file (settings-backup) and exit")
+	stopClient := flag.Bool("stop", false, "stop only the verified owner process and recover its network settings")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	shareLink := flag.Bool("share-link", false, "print an otu:// share link for this config and exit")
 	qrOut := flag.String("qr", "", "with -share-link: also write a PNG QR code to this path")
@@ -223,13 +322,23 @@ func run() {
 	}
 
 	if *showVersion {
-		fmt.Println("opentunnel client", version.Version)
+		fmt.Println(clientVersionText())
 		return
 	}
-
-	// Everything from here on is mirrored to crash.log: the console hides
-	// itself in double-click mode, so unexpected exits must leave a trace.
-	setupCrashLog()
+	if *stopClient {
+		mgr, err := netenv.NewManager()
+		if err != nil {
+			fatalVisible("settings manager", err)
+		}
+		if err := netenv.StopClient(); err != nil {
+			fatalVisible("checked client stop", err)
+		}
+		if err := restoreWithRetry(mgr, ""); err != nil {
+			fatalVisible("post-stop settings recovery", err)
+		}
+		fmt.Println("otu stopped; journaled settings recovery completed.")
+		return
+	}
 
 	// Standalone mode: when -c is not given explicitly, look for client.toml
 	// next to the executable (not the working directory) and create it from
@@ -257,27 +366,12 @@ func run() {
 		return
 	}
 
-	if _, err := os.Stat(*cfgPath); os.IsNotExist(err) {
+	if _, err := os.Stat(*cfgPath); os.IsNotExist(err) && !*restoreOnly && *restoreFrom == "" {
 		if werr := config.WriteDefaultClientConfig(*cfgPath); werr != nil {
-			log.Fatalf("write default config: %v", werr)
+			startupRefused("write default config", werr)
+			return
 		}
 		fmt.Printf("[i] no config found — wrote default settings to %s\n", *cfgPath)
-		// Also drop a stop helper next to the exe: the double-click console
-		// hides itself, so recipients need an obvious off switch. It kills
-		// the client then runs its own --restore to put network settings
-		// back immediately (no admin needed).
-		if exe, eerr := os.Executable(); eerr == nil {
-			stop := filepath.Join(filepath.Dir(exe), version.StopHelper)
-			if _, serr := os.Stat(stop); os.IsNotExist(serr) {
-				image := filepath.Base(exe)
-				bat := "@echo off\r\n" +
-					"taskkill /IM " + image + " /F >nul 2>&1\r\n" +
-					"\"%~dp0" + image + "\" --restore\r\n" +
-					"if errorlevel 1 (echo Recovery incomplete - keep the journal and retry.) else (echo otu stopped - review any pending-policy warnings above.)\r\n" +
-					"pause\r\n"
-				_ = os.WriteFile(stop, []byte(bat), 0o755)
-			}
-		}
 	}
 
 	var cfg *config.ClientConf
@@ -296,7 +390,7 @@ func run() {
 
 	mgr, mgrErr := netenv.NewManager()
 	if mgrErr != nil && (*autoProxy || *restoreOnly || *restoreFrom != "") {
-		log.Fatalf("settings manager: %v", mgrErr)
+		fatalVisible("settings manager", mgrErr)
 	}
 
 	// Always attempt orphan recovery: a previous session may have been
@@ -304,13 +398,13 @@ func run() {
 	// live-owner conflict is tolerated (that owner restores on its own exit).
 	if mgr != nil {
 		if err := recoverNetwork(mgr); err != nil && *autoProxy {
-			log.Fatalf("%v", err)
+			fatalVisible("settings recovery", err)
 		}
 	}
 
 	if *restoreOnly {
-		if err := mgr.Restore(); err != nil {
-			log.Fatalf("restore: %v", err)
+		if err := restoreWithRetry(mgr, ""); err != nil {
+			fatalVisible("restore", err)
 		}
 		if reportNetworkWarnings(mgr, "restore") {
 			fmt.Println("system proxy restored; browser-policy cleanup remains pending. Retry --restore when policy access is available.")
@@ -321,8 +415,8 @@ func run() {
 	}
 
 	if *restoreFrom != "" {
-		if err := mgr.RestoreFrom(*restoreFrom); err != nil {
-			log.Fatalf("restore-from: %v", err)
+		if err := restoreWithRetry(mgr, *restoreFrom); err != nil {
+			fatalVisible("restore-from", err)
 		}
 		if reportNetworkWarnings(mgr, "restore-from") {
 			fmt.Println("system proxy restored from backup; browser-policy cleanup remains pending.")
@@ -336,7 +430,11 @@ func run() {
 	// orphan recovery above. An expired imported profile must not strand a
 	// previous client's proxy journal after a crash.
 	if startupErr != nil {
-		log.Printf("client startup refused after orphan recovery: %v", startupErr)
+		startupRefused("client startup refused after orphan recovery; configure your server in client.toml", startupErr)
+		return
+	}
+	if *autoProxy && cfg.HTTPAddr == "" {
+		log.Print("automatic system proxy requires an HTTP listener; startup refused before changing settings. Configure http_addr or run without --auto-proxy.")
 		return
 	}
 
@@ -344,7 +442,16 @@ func run() {
 	// and exit quietly — never look like a crash loop.
 	if singleInstance(mgr, cfg.SOCKSAddr, cfg.HTTPAddr) {
 		return
-	} // Relative ssh_key paths are resolved against the config file's
+	}
+	if err := netenv.RecordProcessOwner(); err != nil {
+		fatalVisible("client ownership record", err)
+	}
+	if exe, err := os.Executable(); err == nil {
+		if err := writeStopHelper(exe); err != nil {
+			log.Printf("stop helper could not be refreshed: %v", err)
+		}
+	}
+	// Relative ssh_key paths are resolved against the config file's
 	// directory, so a key dropped next to the exe/config just works.
 	if cfg.SSHKey != "" && !filepath.IsAbs(cfg.SSHKey) {
 		cfg.SSHKey = filepath.Join(filepath.Dir(*cfgPath), cfg.SSHKey)
@@ -382,13 +489,19 @@ func run() {
 	// extended inactivity (re-register → re-approve).
 	tokenStore, err := client.NewPoolTokenStore(cfg.IdentityScope())
 	if err != nil {
-		log.Fatalf("token store: %v", err)
+		fatalVisible("token store", err)
 	}
 	device, err := tokenStore.LoadOrCreate()
 	if err != nil {
-		log.Fatalf("device token: %v", err)
+		startupRefused("device identity unavailable; administrator-assisted recovery required", err)
+		return
 	}
 	fmt.Printf("[i] device: %s\n", device.DeviceName)
+	if current, err := os.Hostname(); err == nil && cfg.Pool == nil && current != "" && !strings.EqualFold(current, device.DeviceName) {
+		fmt.Println("[!] Saved device name differs from this PC's current name. This usually means the identity was copied from another PC.")
+		fmt.Println("    Re-approval alone cannot give a copied PC its own identity; use the administrator's identity-reset package instead.")
+		fmt.Println("    Credentials have NOT been reset automatically.")
+	}
 
 	// Graceful stop path: signals (Ctrl+C / window close) or panel decisions
 	// (ban) both cancel the context and wake the main loop.
@@ -452,12 +565,15 @@ func run() {
 	// for the grace period — then disconnect.
 	banGate := &proxy.BanGate{}
 	var dialer *client.Adaptive
+	directHosts := map[string]bool{}
 	defer func() {
 		if dialer != nil {
 			_ = dialer.Close()
 		}
 	}()
 	var graceStop *time.Timer
+	var admissionMu sync.Mutex
+	var startAdmissionPoll func()
 	graceStart := false
 	if reason, isBanned := checkBanAtStartup(cfg, device.Token, tokenStore); isBanned {
 		graceStart = true
@@ -475,19 +591,26 @@ func run() {
 		// token to the middlebox at every start (audit round three, N-1
 		// Window A). The re-register paths that matter (purged token →
 		// OnAuthRejected) still fire on demand.
-		if cfg.Pool == nil && !tokenStore.EverApproved(device.Fingerprint) {
-			safeGo("register", func() { client.RegisterWithPanel(cfg, device) })
+		if cfg.Pool == nil && device.Created && !tokenStore.EverApproved(device.Fingerprint) {
+			safeGo("register", func() { client.RegisterWithPanelContext(ctx, cfg, device) })
 		}
 		// A mid-session ban switches to notice mode (ban page everywhere)
 		// for the grace period instead of dropping instantly; an unban
 		// landing mid-grace cancels the shutdown and clears the gate.
 		onBan := func(reason string) {
+			admissionMu.Lock()
+			defer admissionMu.Unlock()
 			banGate.Activate(reason)
 			fmt.Printf("\n[X] This device has been banned by the administrator.\n    Reason: %s\n", reason)
 			fmt.Printf("    Every page shows this notice for %s, then otu disconnects.\n", banGracePeriod)
+			if graceStop != nil {
+				graceStop.Stop()
+			}
 			graceStop = time.AfterFunc(banGracePeriod, requestStop)
 		}
 		onApproved := func() {
+			admissionMu.Lock()
+			defer admissionMu.Unlock()
 			if graceStop != nil {
 				if graceStop.Stop() {
 					fmt.Println("[+] Ban lifted — staying connected.")
@@ -502,7 +625,9 @@ func run() {
 			}
 		}
 		// Background heartbeat and status poll (kick/ban/pending)
-		safeGo("poll", func() { client.PollTokenStatus(cfg, device, requestStop, onBan, onApproved) })
+		startAdmissionPoll = func() {
+			safeGo("poll", func() { client.PollTokenStatusContext(ctx, cfg, device, requestStop, onBan, onApproved) })
+		}
 	}
 
 	if *shareLink {
@@ -517,13 +642,13 @@ func run() {
 			UDP:         boolPtr(cfg.UDPEnabled()),
 		})
 		if lerr != nil {
-			log.Fatalf("share: %v", lerr)
+			fatalVisible("share link", lerr)
 		}
 		fmt.Println(link)
 		fmt.Println("\nWARNING: this link contains your secret token — share only with people you trust.")
 		if *qrOut != "" {
 			if werr := share.QRPNGFile(link, *qrOut, 512); werr != nil {
-				log.Fatalf("qr: %v", werr)
+				fatalVisible("QR code", werr)
 			}
 			fmt.Printf("QR code written to %s\n", *qrOut)
 		} else if txt, terr := share.QRText(link); terr == nil {
@@ -580,6 +705,13 @@ func run() {
 				return
 			}
 			fmt.Println("[i] independent pinned mutual TLS enabled on all tunnel carriers")
+		}
+		if cfg.RequireChannelAuth {
+			if err := dialer.RequireChannelAuthentication(); err != nil {
+				log.Print(err)
+				return
+			}
+			fmt.Println("[i] connection-bound device authentication required; no legacy fallback")
 		}
 		dialer.AllowHostileSSH = cfg.AllowHostileSSH()
 		// Rotatable entries: primary plus fallbacks (same cert assumed).
@@ -656,12 +788,26 @@ func run() {
 		defer client.SetPoolControlChannel(cfg.IdentityScope(), nil)
 		// If the panel no longer knows our device token (purged after
 		// inactivity), re-register and wait for approval again.
-		dialer.OnAuthRejected = func() { client.RegisterWithPanel(cfg, device) }
+		dialer.OnAuthRejected = func() { client.RegisterWithPanelContext(ctx, cfg, device) }
 		defer dialer.Close()
 
 		switch cfg.TransportKind() {
 		case "carrier":
 			fmt.Println("[i] transport: managed fixed-target carrier")
+		case "h3":
+			fmt.Println("[i] transport: pinned HTTP/3 (QUIC)")
+			dialer.UseTransportBuilder(func(string) transport.Transport {
+				return transport.NewH3(transport.H3Options{
+					ServerAddr:    baseOpts.ServerAddr,
+					ServerName:    baseOpts.ServerName,
+					HTTPAuthority: baseOpts.HTTPAuthority,
+					Path:          baseOpts.WSPath,
+					Fingerprint:   baseOpts.Fingerprint,
+					Fingerprints:  append([]string(nil), baseOpts.Fingerprints...),
+					Insecure:      baseOpts.Insecure,
+					DialTimeout:   15 * time.Second,
+				})
+			})
 		case "ssh":
 			internal := cfg.SSHInternal
 			if internal == "" {
@@ -673,7 +819,7 @@ func run() {
 			}
 			key := cfg.SSHKey
 			if key == "" {
-				log.Fatal("transport=ssh requires ssh_key in config")
+				fatalVisible("ssh transport", errors.New("transport=ssh requires ssh_key in config"))
 			}
 			dialer.UseTransportBuilder(func(profile string) transport.Transport {
 				return transport.NewSSH(transport.SSHOptions{
@@ -770,9 +916,11 @@ func run() {
 		safeGo("health", func() {
 			hr.Run(ctx, 60*time.Second)
 		})
-		if cfg.AutoUpdateEnabled() {
-			safeGo("update", func() { client.RunUpdateLoop(ctx, cfg.SOCKSAddr, requestStop) })
-			fmt.Println("[i] auto-update: watching GitHub releases")
+		if version.LocalPreview != "" {
+			fmt.Println("[!] UNRELEASED local preview:", version.LocalPreview, "- automatic updates are disabled; this is not a signed release.")
+		} else if cfg.AutoUpdateEnabled() {
+			safeGo("update", func() { client.RunUpdateLoopChannel(ctx, cfg.SOCKSAddr, cfg.UpdateChannel, requestStop) })
+			fmt.Println("[i] auto-update channel:", firstNonEmpty(cfg.UpdateChannel, "stable"))
 		}
 		// Loop guard: entry hosts dial direct instead of entering the tunnel
 		// (the old WinINET bypass entries leaked operator domains into the
@@ -796,7 +944,8 @@ func run() {
 				}
 			}
 		}
-		serveDialer = &proxy.BanDialer{Inner: &proxy.DirectDialer{Inner: dialer, Hosts: loopHosts}, Gate: banGate}
+		directHosts = loopHosts
+		serveDialer = &proxy.BanDialer{Inner: &proxy.DirectDialer{Inner: dialer, Hosts: loopHosts, OnDirect: client.NoteDirectBypass}, Gate: banGate}
 	}
 
 	httpAddr := cfg.HTTPAddr
@@ -828,9 +977,6 @@ func run() {
 			return
 		}
 		addr := httpAddr
-		if addr == "" {
-			addr = socksAddr
-		}
 		host, port, _ := net.SplitHostPort(addr)
 		sysProxy := net.JoinHostPort(firstNonEmpty(host, "127.0.0.1"), port)
 		restore := func() {
@@ -860,22 +1006,40 @@ func run() {
 	} else if doubleClick {
 		fmt.Println()
 		fmt.Println("================================================================")
-		fmt.Println(" otu is running. The Windows user-level proxy is configured.")
+		fmt.Println(" otu's local proxies are running. Remote connectivity is not yet confirmed.")
 		fmt.Println()
 		fmt.Println(" HOW TO USE")
 		fmt.Println("   1. Apps using the system proxy can use the tunnel.")
 		fmt.Println("      Enforced browser policies may differ; check warnings above.")
 		fmt.Println("   2. First time only: the admin must approve this device,")
-		fmt.Println("      then pages load automatically (can take a minute).")
-		fmt.Println("   3. This window hides itself in a few seconds and otu keeps")
-		fmt.Println("      running in the background. To stop, run " + version.StopHelper)
+		fmt.Println("      TLS, SSH and browser-policy errors need separate review; approval alone cannot fix them.")
+		fmt.Println("   3. This window stays visible until a tunnel connection is verified.")
+		fmt.Println("      It then hides while otu keeps running. To stop, run " + version.StopHelper)
 		fmt.Println("      (next to otu-client.exe). Journaled cleanup runs on exit.")
 		fmt.Println("================================================================")
 		// Close-proof: hide the console once the banner has been read so an
 		// accidental window close can't take the tunnel down.
 		safeGo("hide-console", func() {
-			time.Sleep(8 * time.Second)
-			netenv.HideConsole()
+			if !waitForContext(ctx, 8*time.Second) {
+				return
+			}
+			if dialer == nil {
+				return
+			}
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				if dialer.ConnectionVerified() {
+					fmt.Println("[+] Authenticated tunnel activity verified. The console is hiding; otu remains running.")
+					netenv.HideConsole()
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
 		})
 	} else {
 		fmt.Println("[i] Point your browser at the SOCKS5 or HTTP proxy above, or press Ctrl+C to stop.")
@@ -885,7 +1049,41 @@ func run() {
 		log.Printf("replacement readiness failed: %v", err)
 		requestStop()
 	}
+	if dialer != nil {
+		safeGo("network-change", func() { dialer.WatchNetworkChanges(ctx) })
+	}
+	// Publish callbacks only after the adaptive dialer and proxy/recovery state
+	// are initialized; a fast approval poll cannot race their construction.
+	if startAdmissionPoll != nil {
+		startAdmissionPoll()
+	}
+	statusSnapshot := func(running bool) {
+		admission := ""
+		if graceStart {
+			admission = "banned; local notice mode"
+		}
+		pending := mgr != nil && mgr.PendingPolicyCleanup()
+		_ = client.SaveRuntimeStatus(cfg, dialer, admission, directHosts, pending, running)
+	}
+	statusSnapshot(true)
+	statusDone := make(chan struct{})
+	safeGo("local-status", func() {
+		defer close(statusDone)
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				statusSnapshot(true)
+			}
+		}
+	})
+	fmt.Println("[i] Protected scope: application HTTP/SOCKS proxy only, not a system-wide VPN. Run --status for a credential-free local summary.")
 	<-ctx.Done()
+	<-statusDone
+	statusSnapshot(false) // no late background snapshot can claim we restarted
 	if lnSOCKS != nil {
 		_ = lnSOCKS.Close()
 	}
@@ -940,11 +1138,87 @@ func sshDialHost(cfg *config.ClientConf) string {
 	return cfg.SSHDialHost()
 }
 
+func stopHelperContents(image string) (string, bool) {
+	if image == "" || filepath.Base(image) != image {
+		return "", false
+	}
+	for _, r := range image {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return "", false
+	}
+	return "@echo off\r\n\"%~dp0" + image + "\" --stop\r\n" +
+		"if errorlevel 1 (echo Stop or recovery refused - read the message and keep the journal.) else (echo otu stopped - review any pending-policy warnings above.)\r\n" +
+		"pause\r\n", true
+}
+
+func writeStopHelper(exe string) error {
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	image := filepath.Base(exe)
+	contents, ok := stopHelperContents(image)
+	if !ok {
+		return errors.New("executable name is not safe for a batch helper")
+	}
+	path := filepath.Join(filepath.Dir(exe), version.StopHelper)
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == contents {
+		return nil
+	}
+	return os.WriteFile(path, []byte(contents), 0o755)
+}
+
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a
 	}
 	return b
+}
+
+// Explicit settings recovery is independent of executable update recovery. A
+// corrupt/stale update journal must not prevent an ordinary user from restoring
+// journal-owned proxy settings. The networking manager still checks ownership.
+func networkRecoveryRequested(args []string) bool {
+	stringFlags := map[string]bool{"c": true, "pool": true, "qr": true, "release-root-import": true}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		name, value, hasValue := strings.Cut(arg, "=")
+		name = strings.TrimLeft(name, "-")
+		switch name {
+		case "restore":
+			if !hasValue {
+				return true
+			}
+			parsed, err := strconv.ParseBool(value)
+			return err == nil && parsed
+		case "restore-from":
+			if hasValue {
+				return value != ""
+			}
+			return i+1 < len(args) && args[i+1] != ""
+		case "stop":
+			return true
+		}
+		if !hasValue && stringFlags[name] {
+			i++ // a string flag's value is not a recovery switch
+		}
+	}
+	return false
+}
+
+func waitForContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // listenRetry retries binding for a few seconds. After a self-update the

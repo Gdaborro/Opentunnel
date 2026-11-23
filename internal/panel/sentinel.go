@@ -14,6 +14,9 @@ package panel
 // person holding the kill-switch allowlist.
 
 import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
 	"fmt"
 	"net"
 	"sort"
@@ -26,22 +29,31 @@ import (
 // kick expires on its own via the reaper (db.go reaper releases expired
 // kicks). Returns true when the peer was actually kicked.
 func (db *DB) AutoKick(token, reason string, until time.Time) bool {
-	if db == nil || token == "" {
+	if db == nil || !validTokenCharset(token) || len(reason) > 500 || !until.After(time.Now()) || until.After(time.Now().Add(24*time.Hour)) {
 		return false
 	}
-	if db.KillSwitchAllow(token) {
-		return false
-	}
-	res, err := db.Exec(`UPDATE peers SET status='kicked', kick_reason=?, kick_expires=? WHERE token=? AND status='approved'`,
-		reason, until.UTC().Format("2006-01-02 15:04:05"), token)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false
 	}
-	n, _ := res.RowsAffected()
-	if n > 0 {
-		db.RecordEvent("sentinel", "auto-kick "+shortPK(token)+": "+reason)
+	defer tx.Rollback()
+	p, err := accessPolicy(ctx, tx, token)
+	if err != nil || p.KillAllowed || p.Status != "approved" {
+		return false
 	}
-	return n > 0
+	res, err := tx.ExecContext(ctx, `UPDATE peers SET status='kicked',kick_reason=?,kick_expires=? WHERE token=? AND status='approved' AND auth_epoch=?`, reason, until.UTC().Format("2006-01-02 15:04:05"), token, p.Generation)
+	if err != nil {
+		return false
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(kind,detail) VALUES('sentinel',?)`, "auto-kick "+shortPK(token)+": "+reason); err != nil {
+		return false
+	}
+	return tx.Commit() == nil
 }
 
 // TravelHit is one impossible-travel finding: a token seen from two
@@ -189,6 +201,81 @@ func (db *DB) DetectRegBurst(minN int, window time.Duration) []RegBurstHit {
 	return out
 }
 
+const (
+	sentinelIdentityPeerLimit = 4096
+	sentinelIdentityHitLimit  = 64
+)
+
+type duplicateIdentityHit struct {
+	TokenA, TokenB           string
+	SameKey, SameFingerprint bool
+}
+
+// detectDuplicateIdentities compares approved and pending peers without changing
+// identity state. Both the inventory and emitted pairs are bounded; key
+// comments/options are ignored by canonicalization before comparison.
+func (db *DB) detectDuplicateIdentities(limit int) []duplicateIdentityHit {
+	if db == nil || limit <= 0 {
+		return nil
+	}
+	limit = min(limit, sentinelIdentityHitLimit)
+	rows, err := db.Query(`SELECT token,fingerprint,COALESCE(ssh_pubkey,'') FROM peers
+		WHERE status IN ('approved','pending') ORDER BY token LIMIT ?`, sentinelIdentityPeerLimit)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	type identity struct {
+		token, fingerprint, key string
+	}
+	peers := make([]identity, 0, 256)
+	byKey := map[string][]int{}
+	byFingerprint := map[string][]int{}
+	var out []duplicateIdentityHit
+	for rows.Next() {
+		var p identity
+		var rawKey string
+		if rows.Scan(&p.token, &p.fingerprint, &rawKey) != nil {
+			continue
+		}
+		p.key, _ = CanonicalSSHPubKey(rawKey)
+		candidates := map[int]struct{}{}
+		for _, i := range byKey[p.key] {
+			candidates[i] = struct{}{}
+		}
+		for _, i := range byFingerprint[p.fingerprint] {
+			candidates[i] = struct{}{}
+		}
+		prior := make([]int, 0, len(candidates))
+		for i := range candidates {
+			prior = append(prior, i)
+		}
+		sort.Ints(prior)
+		current := len(peers)
+		for _, i := range prior {
+			other := peers[i]
+			hit := duplicateIdentityHit{TokenA: other.token, TokenB: p.token,
+				SameKey:         p.key != "" && p.key == other.key,
+				SameFingerprint: p.fingerprint != "" && p.fingerprint == other.fingerprint}
+			if hit.SameKey || hit.SameFingerprint {
+				out = append(out, hit)
+				if len(out) >= limit {
+					return out
+				}
+			}
+		}
+		peers = append(peers, p)
+		if p.key != "" {
+			byKey[p.key] = append(byKey[p.key], current)
+		}
+		if p.fingerprint != "" {
+			byFingerprint[p.fingerprint] = append(byFingerprint[p.fingerprint], current)
+		}
+	}
+	return out
+}
+
 // SentinelTick runs the panel-side detectors once. otu-panel calls it on a
 // one-minute cadence. countryOf may be nil (travel detection degrades).
 func (db *DB) SentinelTick(countryOf func(string) string) {
@@ -226,23 +313,77 @@ func (db *DB) SentinelTick(countryOf func(string) string) {
 		db.RecordAlert("warning", "sentinel", fmt.Sprintf(
 			"registration burst: %d new devices from %s in 1h", h.N, h.Subnet))
 	}
+	for _, h := range db.detectDuplicateIdentities(sentinelIdentityHitLimit) {
+		if !db.throttleKV(sentinelDigestKey("duplicate-identity", h.TokenA, h.TokenB), 6*time.Hour) {
+			continue
+		}
+		shared := "both the same canonical device public key and the same hardware fingerprint"
+		switch {
+		case h.SameKey && !h.SameFingerprint:
+			shared = "the same canonical device public key with different hardware fingerprints"
+		case h.SameFingerprint && !h.SameKey:
+			shared = "the same hardware fingerprint with different device public keys"
+		}
+		db.RecordAlert("warning", "security", fmt.Sprintf(
+			"possible clone, reinstall, or spoof: active devices %s and %s share %s — review only; stored identities unchanged",
+			shortPK(h.TokenA), shortPK(h.TokenB), shared))
+	}
+}
+
+// sentinelDigestKey keeps raw identity material out of persistent throttle
+// keys while giving each stable subject its own gate.
+func sentinelDigestKey(scope string, parts ...string) string {
+	h := sha256.New()
+	for _, part := range parts {
+		fmt.Fprintf(h, "%d:", len(part))
+		h.Write([]byte(part))
+	}
+	return fmt.Sprintf("%s|%x", scope, h.Sum(nil))
 }
 
 // throttleKV is a persistent per-subject throttle: true when key has not
 // fired within d. State lives in the settings table so restarts and
 // redeploys do not reset the gates.
 func (db *DB) throttleKV(key string, d time.Duration) bool {
+	if db == nil || len(key) < 1 || len(key) > 512 || d <= 0 || d > 24*time.Hour {
+		return false
+	}
 	k := "sentinel_ts_" + key
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback()
+	var raw string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, k).Scan(&raw)
+	if err != nil && err != sql.ErrNoRows {
+		return false
+	}
 	var last int64
-	if _, err := fmt.Sscanf(db.Setting(k), "%d", &last); err != nil {
-		last = 0
+	if err == nil {
+		if _, err := fmt.Sscanf(raw, "%d", &last); err != nil {
+			return false
+		}
 	}
 	now := time.Now().Unix()
 	if last > 0 && now-last < int64(d.Seconds()) {
 		return false
 	}
-	db.SetSetting(k, fmt.Sprintf("%d", now))
-	return true
+	if last == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key LIKE 'sentinel_ts_%' AND CAST(value AS INTEGER)<?`, now-24*3600); err != nil {
+			return false
+		}
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key LIKE 'sentinel_ts_%'`).Scan(&count); err != nil || count >= 8192 {
+			return false
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, k, fmt.Sprintf("%d", now)); err != nil {
+		return false
+	}
+	return tx.Commit() == nil
 }
 
 func shortPK(t string) string {

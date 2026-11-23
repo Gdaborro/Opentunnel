@@ -22,6 +22,26 @@ No network-specific measurements or fleet credentials belong here.
 - EOF propagates through TCP and smux write halves. Errors/cancellation close
   both endpoints and join both copy workers.
 
+## Identity anomaly review
+
+- Bounded duplicate detection compares approved and pending peers. Reused
+  canonical public keys or hardware fingerprints create throttled review-only
+  warnings; a duplicate can mean cloning, reinstalling, or spoofing and is not
+  treated as proof of an attacker. Peer state, keys, generations and identity
+  bans are not changed by the detector.
+- Signed-pool enrollment identity conflicts preserve the stored binding and
+  create a throttled security warning. Recent Sentinel results include both
+  `sentinel` and `security` findings.
+- Bad-signature and established-key downgrade attempts alert without automatic
+  source-IP or named-device bans. Generic malformed/unknown-token brute-force
+  protection and connection limits remain independent and enabled.
+- There is no automatic HWID-based identity restoration, reset or rekey.
+  Hardware-derived values are risk signals, not attestation. Deliberate admin
+  rekey requires the expected current public key and out-of-band confirmation,
+  then returns the replacement to pending for separate approval.
+- The main console has an integrated Sentinel tab with stale-read warnings and
+  mode read-back. The legacy `/admin/sentinel` route redirects to the tab.
+
 ## Accounting and storage
 
 The relay obtains a consistent SQL snapshot of admission, identity, schedules,

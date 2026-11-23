@@ -22,23 +22,26 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"opentunnel/internal/protocol"
 )
 
 // H3Options configures the HTTP/3 transport. The pin/entry fields mirror
 // WSTLSOptions so the same rotation pin sets apply.
 type H3Options struct {
-	ServerAddr   string   // host[:port]; port 443 added if missing
-	ServerName   string   // optional SNI override; defaults to host part
-	Path         string   // tunnel endpoint; defaults to DefaultWSPath
-	Fingerprint  string   // hex SHA-256 pin of the server certificate
-	Fingerprints []string // rotation set (learned pins rejoin here)
-	Insecure     bool     // dev only: skip pin verification
-	DialTimeout  time.Duration
+	ServerAddr    string   // host[:port]; port 443 added if missing
+	ServerName    string   // optional SNI override; defaults to host part
+	HTTPAuthority string   // trusted HTTP host:port independent of TCP/UDP override
+	Path          string   // tunnel endpoint; defaults to DefaultWSPath
+	Fingerprint   string   // hex SHA-256 pin of the server certificate
+	Fingerprints  []string // rotation set (learned pins rejoin here)
+	Insecure      bool     // dev only: skip pin verification
+	DialTimeout   time.Duration
 }
 
 type h3Transport struct {
@@ -49,33 +52,94 @@ type h3Transport struct {
 	// mux rotation — slower and a "browser reconnecting on a metronome"
 	// flow-shape tell. The transport pools the QUIC connection across
 	// sessions; streams still close independently.
-	trOnce sync.Once
-	tr     *http3.Transport
-	trErr  error
+	trOnce        sync.Once
+	tr            *http3.Transport
+	trErr         error
+	udp           *net.UDPConn
+	quicTransport *quic.Transport
+	closeOnce     sync.Once
+	closeErr      error
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 // sharedTransport lazily builds (once) the pooled HTTP/3 transport.
 func (t *h3Transport) sharedTransport(tlsCfg *tls.Config) (*http3.Transport, error) {
 	t.trOnce.Do(func() {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
+		if err != nil {
+			t.trErr = err
+			return
+		}
+		t.udp = conn
+		t.quicTransport = &quic.Transport{Conn: conn}
 		t.tr = &http3.Transport{
 			TLSClientConfig: tlsCfg,
 			QUICConfig:      quicDialConfig(),
+			Dial: func(ctx context.Context, _ string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
+				ctx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				stop := context.AfterFunc(t.ctx, cancel)
+				defer stop()
+				addr := t.opt.ServerAddr
+				if _, _, err := net.SplitHostPort(addr); err != nil {
+					addr = net.JoinHostPort(addr, "443")
+				}
+				target, err := resolveH3Address(ctx, addr)
+				if err != nil {
+					return nil, err
+				}
+				return t.quicTransport.DialEarly(ctx, target, cfg, qcfg)
+			},
 		}
 	})
 	return t.tr, t.trErr
 }
 
 // NewH3 builds the HTTP/3 transport tier.
-func NewH3(opt H3Options) Transport { return &h3Transport{opt: opt} }
+func NewH3(opt H3Options) Transport {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &h3Transport{opt: opt, ctx: ctx, cancel: cancel}
+}
+
+func resolveH3Address(ctx context.Context, address string) (*net.UDPAddr, error) {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, errors.New("transport: invalid QUIC port")
+	}
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("transport: QUIC hostname has no address")
+	}
+	return &net.UDPAddr{IP: addresses[0].IP, Zone: addresses[0].Zone, Port: port}, nil
+}
 
 func (t *h3Transport) Name() string { return "h3" }
 
 func (t *h3Transport) Close() error {
-	t.trOnce.Do(func() { t.trErr = net.ErrClosed })
-	if t.tr != nil {
-		return t.tr.Close()
-	}
-	return nil
+	t.closeOnce.Do(func() {
+		if t.cancel != nil {
+			t.cancel()
+		} // cancel DNS before Transport.Close waits for its dial job
+		t.trOnce.Do(func() { t.trErr = net.ErrClosed })
+		if t.tr != nil {
+			t.closeErr = t.tr.Close()
+		}
+		if t.quicTransport != nil {
+			t.closeErr = errors.Join(t.closeErr, t.quicTransport.Close())
+		}
+		if t.udp != nil {
+			t.closeErr = errors.Join(t.closeErr, t.udp.Close())
+		}
+	})
+	return t.closeErr
 }
 
 func (o *H3Options) pathOrDefault() string {
@@ -116,14 +180,21 @@ func (t *h3Transport) tlsConfig(host string) (*tls.Config, error) {
 // Dial opens one HTTP/3 request whose streaming bodies form the byte
 // pipe for the tunnel protocol.
 func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
+	return t.DialSetup(ctx, ctx)
+}
+
+func (t *h3Transport) DialSetup(setup, lifetime context.Context) (net.Conn, error) {
 	hostPort := t.opt.ServerAddr
 	if _, _, err := net.SplitHostPort(hostPort); err != nil {
 		hostPort = net.JoinHostPort(hostPort, "443")
 	}
-	host, _, _ := net.SplitHostPort(hostPort)
-	sni := host
+	host, port, _ := net.SplitHostPort(hostPort)
+	authority := hostPort
 	if t.opt.ServerName != "" {
-		sni = t.opt.ServerName
+		authority = net.JoinHostPort(t.opt.ServerName, port)
+	}
+	if t.opt.HTTPAuthority != "" {
+		authority = t.opt.HTTPAuthority
 	}
 
 	tlsCfg, err := t.tlsConfig(host)
@@ -135,12 +206,16 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
+	dctx, cancelSetup := context.WithTimeout(setup, timeout)
+	defer cancelSetup()
 	// The request stream must outlive this function: the protocol
 	// handshake only flows after Dial returns. Dial-scoped contexts
 	// cancel the stream on return (H3_REQUEST_CANCELLED), so the request
 	// carries a conn-owned context and the timeout races the round trip
 	// from outside.
-	rctx, rcancel := context.WithCancel(ctx)
+	rctx, rcancel := context.WithCancel(lifetime)
+	stopSetup := context.AfterFunc(dctx, rcancel)
+	defer stopSetup()
 	owned := false // the conn takes exclusive ownership of rcancel on success
 	defer func() {
 		if !owned {
@@ -162,19 +237,20 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 		}
 	}()
 	req, err := http.NewRequestWithContext(rctx, http.MethodPost,
-		"https://"+hostPort+t.opt.pathOrDefault(), pr)
+		"https://"+authority+t.opt.pathOrDefault(), pr)
 	if err != nil {
 		return nil, err
 	}
 	// The browser story for h3: a same-origin streaming fetch() from the
 	// site's own page (browsers do exactly this for realtime uploads).
 	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set(protocol.StreamingHeader, protocol.StreamingValue)
 	req.Header.Set("User-Agent", browserUA)
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("sec-ch-ua", `"Not(A:Brand";v="24", "Chromium";v="133", "Google Chrome";v="133"`)
 	req.Header.Set("sec-ch-ua-mobile", "?0")
 	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-	req.Header.Set("Origin", "https://"+sni)
+	req.Header.Set("Origin", "https://"+authority)
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
@@ -197,12 +273,9 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 	select {
 	case r := <-ch:
 		resp, err = r.resp, r.err
-	case <-ctx.Done():
+	case <-dctx.Done():
 		rcancel()
-		return nil, ctx.Err()
-	case <-time.After(timeout):
-		rcancel()
-		return nil, fmt.Errorf("transport: h3 dial %s: timeout", hostPort)
+		return nil, dctx.Err()
 	}
 	if err != nil {
 		_ = pw.CloseWithError(err)
@@ -212,6 +285,14 @@ func (t *h3Transport) Dial(ctx context.Context) (net.Conn, error) {
 		resp.Body.Close()
 		_ = pw.CloseWithError(errors.New("transport: h3 status " + resp.Status))
 		return nil, fmt.Errorf("transport: h3 dial %s: status %s", hostPort, resp.Status)
+	}
+	if !stopSetup() || dctx.Err() != nil {
+		rcancel()
+		_ = resp.Body.Close()
+		if err := dctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, context.Canceled
 	}
 	owned = true
 	return &h3ClientConn{
@@ -230,8 +311,13 @@ type h3ClientConn struct {
 	body   io.ReadCloser
 	cancel context.CancelFunc
 
-	dlMu    sync.Mutex
-	dlTimer *time.Timer
+	dlMu       sync.Mutex
+	readTimer  *time.Timer
+	writeTimer *time.Timer
+	readEpoch  uint64
+	writeEpoch uint64
+	closed     bool
+	closeOnce  sync.Once
 }
 
 func (c *h3ClientConn) Read(p []byte) (int, error) { return c.body.Read(p) }
@@ -243,20 +329,27 @@ func (c *h3ClientConn) Write(p []byte) (int, error) {
 	return n, nil
 }
 func (c *h3ClientConn) Close() error {
-	c.dlMu.Lock()
-	if c.dlTimer != nil {
-		c.dlTimer.Stop()
-		c.dlTimer = nil
-	}
-	c.dlMu.Unlock()
-	_ = c.pw.CloseWithError(errors.New("transport: closed"))
-	_ = c.body.Close()
-	// Only this stream dies: the shared transport keeps the pooled QUIC
-	// connection for the next mux session (connection reuse is both
-	// faster and a more browser-like flow shape).
-	c.cancel()
+	c.closeOnce.Do(func() {
+		c.dlMu.Lock()
+		c.closed = true
+		if c.readTimer != nil {
+			c.readTimer.Stop()
+		}
+		if c.writeTimer != nil {
+			c.writeTimer.Stop()
+		}
+		c.dlMu.Unlock()
+		_ = c.pw.CloseWithError(errors.New("transport: closed"))
+		_ = c.body.Close()
+		// Only this stream dies: the shared transport keeps the pooled QUIC
+		// connection for the next mux session (connection reuse is both
+		// faster and a more browser-like flow shape).
+		c.cancel()
+	})
 	return nil
 }
+func (c *h3ClientConn) CloseNow() error      { return c.Close() }
+func (c *h3ClientConn) CloseWrite() error    { return c.pw.Close() }
 func (c *h3ClientConn) LocalAddr() net.Addr  { return dummyH3Addr{} }
 func (c *h3ClientConn) RemoteAddr() net.Addr { return dummyH3Addr{} }
 
@@ -265,26 +358,51 @@ func (c *h3ClientConn) RemoteAddr() net.Addr { return dummyH3Addr{} }
 // hold the mux dial forever). The mux session factory clears the deadline
 // once the session is authenticated, so this only ever bounds setup.
 func (c *h3ClientConn) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
+}
+
+func (c *h3ClientConn) setDirectionDeadline(deadline time.Time, read bool) error {
 	c.dlMu.Lock()
 	defer c.dlMu.Unlock()
-	if c.dlTimer != nil {
-		c.dlTimer.Stop()
-		c.dlTimer = nil
+	if c.closed {
+		return net.ErrClosed
 	}
-	if t.IsZero() {
+	timer, epoch := &c.writeTimer, &c.writeEpoch
+	if read {
+		timer, epoch = &c.readTimer, &c.readEpoch
+	}
+	*epoch++
+	generation := *epoch
+	if *timer != nil {
+		(*timer).Stop()
+		*timer = nil
+	}
+	if deadline.IsZero() {
 		return nil
 	}
-	d := time.Until(t)
-	if d <= 0 {
-		go func() { _ = c.Close() }()
-		return nil
-	}
-	c.dlTimer = time.AfterFunc(d, func() { _ = c.Close() })
+	*timer = time.AfterFunc(max(0, time.Until(deadline)), func() {
+		c.dlMu.Lock()
+		current := c.writeEpoch
+		if read {
+			current = c.readEpoch
+		}
+		active := !c.closed && current == generation
+		if active {
+			c.closed = true
+		} // timer wins atomically against a later deadline clear
+		c.dlMu.Unlock()
+		if active {
+			_ = c.Close()
+		}
+	})
 	return nil
 }
 
-func (c *h3ClientConn) SetReadDeadline(t time.Time) error  { return c.SetDeadline(t) }
-func (c *h3ClientConn) SetWriteDeadline(t time.Time) error { return c.SetDeadline(t) }
+func (c *h3ClientConn) SetReadDeadline(t time.Time) error  { return c.setDirectionDeadline(t, true) }
+func (c *h3ClientConn) SetWriteDeadline(t time.Time) error { return c.setDirectionDeadline(t, false) }
 
 type dummyH3Addr struct{}
 

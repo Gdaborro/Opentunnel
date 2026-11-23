@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -30,7 +31,7 @@ func TestMalformedEnforcementDateFailsConfiguration(t *testing.T) {
 	}
 }
 func TestClientExposureAndCarrierLoopsRequireExplicitChoice(t *testing.T) {
-	base := "server_addr = \"example.test:443\"\n"
+	base := "server_addr = \"example.test:443\"\nfingerprint = \"" + strings.Repeat("a", 64) + "\"\n"
 	for _, extra := range []string{"socks_addr = \"0.0.0.0:1080\"\n", "carrier_socks = \"203.0.113.1:19090\"\n", "carrier_socks = \"127.0.0.1:1080\"\n", "transport = \"unknown\"\n"} {
 		if _, err := LoadClient(configFixture(t, base+extra)); err == nil {
 			t.Fatalf("unsafe config accepted: %s", extra)

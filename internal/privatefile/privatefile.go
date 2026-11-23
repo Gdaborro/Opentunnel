@@ -109,6 +109,18 @@ func Write(path string, data []byte) error {
 
 // Read bounds private config/state before decoding and refuses linked files.
 func Read(path string, maxBytes int64) ([]byte, error) {
+	return readExisting(path, maxBytes, true)
+}
+
+// ReadOnly bounds a provisioned regular file without trying to rewrite its
+// ownership/permissions. Root-owned credentials may be read by a dedicated
+// service group; chmod-on-read would break that least-privilege installation.
+// The installer must independently enforce private file/parent permissions.
+func ReadOnly(path string, maxBytes int64) ([]byte, error) {
+	return readExisting(path, maxBytes, false)
+}
+
+func readExisting(path string, maxBytes int64, protect bool) ([]byte, error) {
 	if maxBytes < 0 || maxBytes == math.MaxInt64 {
 		return nil, errors.New("invalid private state size limit")
 	}
@@ -119,8 +131,10 @@ func Read(path string, maxBytes int64) ([]byte, error) {
 	if !info.Mode().IsRegular() || info.Size() > maxBytes {
 		return nil, errors.New("private state is linked or oversized")
 	}
-	if err := Protect(path); err != nil {
-		return nil, err
+	if protect {
+		if err := Protect(path); err != nil {
+			return nil, err
+		}
 	}
 	f, err := os.Open(path)
 	if err != nil {

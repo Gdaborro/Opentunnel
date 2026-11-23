@@ -16,13 +16,27 @@ import (
 )
 
 func (h *Handler) WithServerPool(id string, loginRequired bool) (*Handler, error) {
-	info, err := h.db.BindServerPool(id, loginRequired)
+	return h.WithServerPoolAuthentication(id, loginRequired, false)
+}
+
+func (h *Handler) WithServerPoolAuthentication(id string, loginRequired, channelRequired bool) (*Handler, error) {
+	info, err := h.db.BindServerPoolAuthentication(id, loginRequired, channelRequired)
 	if err != nil {
 		return nil, err
 	}
 	h.poolID, h.enrollmentLogin = id, loginRequired
 	h.poolAuthorityID = info.AuthorityID
+	h.poolInfo = info
+	h.poolChannelSupport = channelRequired
 	return h, nil
+}
+
+// New clients request a v2 capability view. Legacy clients still receive the
+// exact v1 schema until policy is explicitly migrated, permitting a real canary
+// rollout before the authority requires channel authentication globally.
+func (h *Handler) WithPoolChannelSupport(supported bool) *Handler {
+	h.poolChannelSupport = supported || h.poolInfo.RequireChannelAuth
+	return h
 }
 
 func (h *Handler) serverInfo(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +50,12 @@ func (h *Handler) serverInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(serverpool.Info{Version: 1, PoolID: h.poolID, AuthorityID: h.poolAuthorityID, LoginRequired: h.enrollmentLogin, ApprovalRequired: true})
+	info := h.poolInfo
+	if r.Header.Get("X-Otu-Profile-Version") == "2" && h.poolChannelSupport {
+		info.Version = serverpool.ChannelProfileVersion
+		info.ChannelAuthSupported = true
+	}
+	_ = json.NewEncoder(w).Encode(info)
 }
 
 type enrollmentRequest struct {
@@ -155,6 +174,10 @@ func (h *Handler) enrollPool(w http.ResponseWriter, r *http.Request) {
 		var err error
 		account, err = h.db.verifyEnrollmentAccount(r.Context(), req.Username, req.Password)
 		if err != nil {
+			if errors.Is(err, ErrAuthenticationBusy) {
+				http.Error(w, "enrollment authentication busy", 429)
+				return
+			}
 			http.Error(w, "enrollment login unavailable", 503)
 			return
 		}
@@ -171,6 +194,7 @@ func (h *Handler) enrollPool(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "enrollment login required", 401)
 		return
 	case errors.Is(err, errEnrollmentIdentityConflict):
+		h.db.recordPoolIdentityConflict(req, clientIP(r))
 		http.Error(w, "stored identity differs; administrator verification required", 409)
 		return
 	case errors.Is(err, errEnrollmentDenied):
@@ -197,6 +221,36 @@ var (
 	errEnrollmentDenied           = errors.New("enrollment denied")
 )
 
+// recordPoolIdentityConflict makes a rejected signed-pool identity change
+// visible without changing the enrolled identity or banning either party.
+func (db *DB) recordPoolIdentityConflict(req enrollmentRequest, ip string) {
+	if db == nil || !db.throttleKV(sentinelDigestKey("pool-key-conflict", req.Token), time.Hour) {
+		return
+	}
+	var existingKey, existingFP, enrolledUser string
+	err := db.QueryRow(`SELECT COALESCE(p.ssh_pubkey,''),p.fingerprint,COALESCE(e.username,'')
+		FROM peers p LEFT JOIN peer_enrollments e ON e.token=p.token WHERE p.token=?`, req.Token).
+		Scan(&existingKey, &existingFP, &enrolledUser)
+	fields := make([]string, 0, 3)
+	if err == nil {
+		if !sameSSHKey(existingKey, req.SSHPubKey) {
+			fields = append(fields, "ssh_pubkey")
+		}
+		if existingFP != req.Fingerprint {
+			fields = append(fields, "fingerprint")
+		}
+		if req.Username != "" && enrolledUser != "" && enrolledUser != req.Username {
+			fields = append(fields, "username")
+		}
+	}
+	if len(fields) == 0 {
+		fields = append(fields, "identity")
+	}
+	db.RecordAlert("warning", "security", "conflicting signed-pool enrollment identity for device "+shortPK(req.Token)+
+		" from "+ip+"; changed field(s): "+strings.Join(fields, ", ")+
+		"; stored identity preserved — possible clone, reinstall, or spoof; review required")
+}
+
 type verifiedEnrollmentAccount struct {
 	username string
 	hash     string
@@ -205,11 +259,16 @@ type verifiedEnrollmentAccount struct {
 // Bcrypt is performed without holding the SQLite writer lock. Recheck the
 // account's exact enabled/hash state inside the enrollment transaction.
 func (db *DB) verifyEnrollmentAccount(parent context.Context, username, password string) (*verifiedEnrollmentAccount, error) {
+	release, err := passwordWork()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
 	var hash string
 	var enabled bool
-	err := db.QueryRowContext(ctx, `SELECT password_hash, enabled FROM enrollment_accounts WHERE username=?`, username).Scan(&hash, &enabled)
+	err = db.QueryRowContext(ctx, `SELECT password_hash, enabled FROM enrollment_accounts WHERE username=?`, username).Scan(&hash, &enabled)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
 	}

@@ -44,6 +44,7 @@ func TestRegistrationKeyRotation(t *testing.T) {
 	}
 
 	h := New(db, NewAuth(db), false)
+	h.WithSSHReconciler(func() error { _, err := db.ReconcileSSH(akPath, "127.0.0.1:8081"); return err })
 	h.OnApprove = func(tok string) {
 		if _, err := UpsertAuthorizedKey(akPath, h.SSHKeyPath(tok), "127.0.0.1:8081"); err != nil {
 			t.Errorf("approve hook: %v", err)

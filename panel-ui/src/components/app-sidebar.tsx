@@ -16,6 +16,7 @@ import {
   LayoutDashboardIcon,
   ActivityIcon,
   ShieldIcon,
+  ShieldAlertIcon,
   ServerIcon,
   UsersIcon,
   FilterIcon,
@@ -28,6 +29,7 @@ export type PageKey =
   | "Overview"
   | "Monitoring"
   | "Security"
+  | "Sentinel"
   | "Devices"
   | "Clients"
   | "Filtering"
@@ -37,6 +39,7 @@ const navMain: { title: PageKey; url: string; icon: React.ReactNode }[] = [
   { title: "Overview", url: "#", icon: <LayoutDashboardIcon /> },
   { title: "Monitoring", url: "#", icon: <ActivityIcon /> },
   { title: "Security", url: "#", icon: <ShieldIcon /> },
+  { title: "Sentinel", url: "#sentinel", icon: <ShieldAlertIcon /> },
   { title: "Devices", url: "#", icon: <ServerIcon /> },
   { title: "Clients", url: "#", icon: <UsersIcon /> },
   { title: "Filtering", url: "#", icon: <FilterIcon /> },
@@ -44,6 +47,11 @@ const navMain: { title: PageKey; url: string; icon: React.ReactNode }[] = [
 ]
 
 const navSecondary = [
+  {
+    title: "Privacy and retention",
+    url: "/admin/privacy",
+    icon: <ShieldIcon />,
+  },
   {
     title: "Service Status",
     url: "/status",

@@ -4,6 +4,7 @@ package test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"debug/buildinfo"
 	"encoding/base64"
@@ -130,8 +131,10 @@ func requireFixtureClientBinary(t *testing.T, binary string) string {
 	}
 	fixtureBuild := false
 	for _, setting := range info.Settings {
-		if setting.Key == "-tags" && setting.Value == "netenvfixture" {
-			fixtureBuild = true
+		if setting.Key == "-tags" {
+			for _, tag := range strings.FieldsFunc(setting.Value, func(r rune) bool { return r == ',' || r == ' ' }) {
+				fixtureBuild = fixtureBuild || tag == "netenvfixture"
+			}
 		}
 	}
 	if !fixtureBuild {
@@ -373,14 +376,16 @@ func TestFixtureClientAutomaticProxyStartupAndLegacyRecovery(t *testing.T) {
 			hc := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
 			defer hc.CloseIdleConnections()
 			_, originPort, _ := net.SplitHostPort(origin.Listener.Addr().String())
+			transferStarted := time.Now()
 			resp, err := hc.Get("http://localhost:" + originPort + "/")
 			if err != nil {
-				t.Fatal("automatic-proxy client startup did not remain functional", err)
+				t.Fatalf("automatic-proxy client startup did not remain functional after %s: %v", time.Since(transferStarted), err)
 			}
 			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			transferElapsed := time.Since(transferStarted)
 			if err != nil || !bytes.Equal(body, bulk) {
-				t.Fatal("automatic-proxy fixture lost bulk payload", err)
+				t.Fatalf("automatic-proxy fixture lost bulk payload after %s: received=%d want=%d: %v", transferElapsed, len(body), len(bulk), err)
 			}
 			policy, err := db.AccessPolicy(device.Token)
 			if err != nil || policy.UsedBytes < int64(len(bulk)) {
@@ -453,8 +458,51 @@ func TestFixtureClientAutomaticProxyStartupAndLegacyRecovery(t *testing.T) {
 			if scenario == "read-only-at-start" && !strings.Contains(string(logs), "browser-policy bundles were skipped") {
 				t.Fatal("read-only startup did not expose a nonfatal browser warning")
 			}
-			t.Logf("%s: actual --auto-proxy startup, %d authenticated payload bytes and fixture-only journal recovery passed; HKCU unavailable in this build", scenario, len(bulk))
+			t.Logf("%s: actual --auto-proxy startup, %d authenticated payload bytes in %s and fixture-only journal recovery passed; HKCU unavailable in this build", scenario, len(bulk), transferElapsed)
 		})
+	}
+}
+
+func TestFixtureSOCKSOnlyAutoProxyRefusesBeforeMutationButRecoversOrphan(t *testing.T) {
+	binary := fixtureClientBinary(t)
+	dir := t.TempDir()
+	app := filepath.Join(dir, "appdata")
+	t.Setenv("LOCALAPPDATA", app)
+	fixturePath := filepath.Join(dir, "network-fixture.json")
+	t.Setenv("OTU_NETENV_FIXTURE", fixturePath)
+	root, err := client.NewTokenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]any{"proxy_enable": 0, "proxy_server": map[string]any{"exists": true, "data": "original.invalid:9000"}, "proxy_override": map[string]any{"exists": true, "data": "original-local"}, "autoconfig_url": map[string]any{"exists": false}, "otu_applied_server": "127.0.0.1:18080"}
+	raw, _ := json.Marshal(legacy)
+	if err := privatefile.Write(filepath.Join(root.Dir, "snapshot.json"), raw); err != nil {
+		t.Fatal(err)
+	}
+	writeProxyFixture(t, fixturePath, proxyFixture{Keys: map[string]map[string]fixtureValue{fixtureWinINET: {"ProxyEnable": {Exists: true, Kind: 4, Integer: 1}, "ProxyServer": fixtureString("127.0.0.1:18080"), "ProxyOverride": fixtureString("localhost;127.0.0.1;<local>")}}})
+	cfg := filepath.Join(dir, "client.toml")
+	if err := os.WriteFile(cfg, []byte("server_addr = \"must-not-connect.invalid:443\"\nsocks_addr = \"127.0.0.1:18099\"\nhttp_addr = \"\"\nauto_update = false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "-c", cfg, "--auto-proxy")
+	cmd.Env = os.Environ()
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output), "automatic system proxy requires an HTTP listener") {
+		t.Fatal("SOCKS-only mode not refused clearly", string(output))
+	}
+	f, err := readProxyFixture(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Keys[fixtureWinINET]["ProxyEnable"].Integer != 0 || f.Keys[fixtureWinINET]["ProxyServer"].Text != "original.invalid:9000" {
+		t.Fatal("orphan recovery failed or invalid SOCKS HTTP proxy was applied")
+	}
+	if _, err := os.Stat(root.TokenPath()); !os.IsNotExist(err) {
+		t.Fatal("refused automatic mode minted a new identity")
 	}
 }
 
@@ -485,5 +533,108 @@ func TestProductionClientVersionPreflightIsStateFree(t *testing.T) {
 	entries, err := os.ReadDir(stateDir)
 	if err != nil || len(entries) != 1 {
 		t.Fatal("production version preflight opened identity or crash-log state", err)
+	}
+}
+
+func TestFixtureStartupRefusalAndExplicitRestorePreserveIdentityAndUpdaterEvidence(t *testing.T) {
+	binary := fixtureClientBinary(t)
+	for _, scenario := range []string{"corrupt-updater-startup", "corrupt-identity-startup", "explicit-restore-missing-config"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			app := filepath.Join(dir, "appdata")
+			t.Setenv("LOCALAPPDATA", app)
+			settings := filepath.Join(dir, "sanitized-network.json")
+			t.Setenv("OTU_NETENV_FIXTURE", settings)
+			store, err := client.NewTokenStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedFixtureIdentity(t, store, "startup-refusal-fixture")
+			if _, err := store.EnsureSSHKey(); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "corrupt-identity-startup" {
+				if err := privatefile.Write(store.TokenPath(), []byte(`{"token":`)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := privatefile.Write(filepath.Join(store.Dir, "approved.flag"), []byte("synthetic established identity")); err != nil {
+				t.Fatal(err)
+			}
+			if err := privatefile.Write(store.BanPath(), []byte(`{"reason":"synthetic preserved ban"}`)); err != nil {
+				t.Fatal(err)
+			}
+			updates := filepath.Join(store.Dir, "updates", "update-transaction.json")
+			if scenario != "corrupt-identity-startup" {
+				if err := privatefile.Write(updates, []byte(`{"version":`)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := map[string][]byte{}
+			for _, path := range []string{store.TokenPath(), store.SSHPrivatePath(), store.SSHPublicPath(), filepath.Join(store.Dir, "approved.flag"), filepath.Join(store.Dir, "device-key-established.flag"), store.BanPath()} {
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[path] = raw
+			}
+			if scenario != "corrupt-identity-startup" {
+				raw, err := os.ReadFile(updates)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[updates] = raw
+			}
+			legacy := `{"proxy_enable":0,"proxy_server":{"exists":true,"data":"original-refusal.invalid:9000"},"proxy_override":{"exists":true,"data":"original-local"},"autoconfig_url":{"exists":false},"otu_applied_server":"127.0.0.1:18080"}`
+			if err := privatefile.Write(filepath.Join(store.Dir, "snapshot.json"), []byte(legacy)); err != nil {
+				t.Fatal(err)
+			}
+			writeProxyFixture(t, settings, proxyFixture{Keys: map[string]map[string]fixtureValue{fixtureWinINET: {
+				"ProxyEnable": {Exists: true, Kind: 4, Integer: 1}, "ProxyServer": fixtureString("127.0.0.1:18080"), "ProxyOverride": fixtureString("localhost;127.0.0.1;<local>"),
+			}}})
+			cfg := filepath.Join(dir, "missing-restore-config.toml")
+			if scenario == "corrupt-identity-startup" {
+				if err := os.WriteFile(cfg, []byte("server_addr = \"must-not-contact.invalid:443\"\nauto_update = false\nh3_tier = false\nfallback_ssh = false\nech = false\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{"-c", cfg}
+			if scenario == "explicit-restore-missing-config" {
+				args = append(args, "--restore")
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, binary, args...)
+			cmd.Dir = dir
+			for _, value := range os.Environ() {
+				key, _, _ := strings.Cut(value, "=")
+				if !strings.HasPrefix(strings.ToUpper(key), "OTU_UPDATE_") {
+					cmd.Env = append(cmd.Env, value)
+				}
+			}
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatal("isolated refusal/restore executable failed", err, string(output))
+			}
+			if scenario != "explicit-restore-missing-config" && !strings.Contains(string(output), "Client startup was refused") {
+				t.Fatal("startup failure disappeared without an actionable refusal", string(output))
+			}
+			if scenario != "corrupt-identity-startup" {
+				if _, err := os.Lstat(cfg); !os.IsNotExist(err) {
+					t.Fatal("network-only restore/startup refusal created an unrelated config", err)
+				}
+			}
+			f, err := readProxyFixture(settings)
+			if err != nil || f.Keys[fixtureWinINET]["ProxyEnable"].Integer != 0 || f.Keys[fixtureWinINET]["ProxyServer"].Text != "original-refusal.invalid:9000" {
+				t.Fatal("startup refusal stranded the orphan proxy", err)
+			}
+			waitFixtureRecoveryComplete(t, store.Dir)
+			for path, raw := range before {
+				after, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(raw, after) {
+					t.Fatalf("network-only recovery changed identity/ban/updater file %s: %v", filepath.Base(path), err)
+				}
+			}
+		})
 	}
 }

@@ -49,7 +49,8 @@ type HealthReporter struct {
 
 	// hostileLogged throttles the "interception detected, skipping the
 	// pinned channel" notice to once per process.
-	hostileLogged bool
+	hostileLogged   bool
+	operatorMinimal bool
 }
 
 type healthProbe struct {
@@ -96,7 +97,7 @@ func (h *HealthReporter) maybeThroughputProbe() {
 }
 
 func (h *HealthReporter) throughputWithContext(parent context.Context) {
-	if h.ThroughputProbe == nil {
+	if h.ThroughputProbe == nil || (h.cfg != nil && h.cfg.Telemetry == "minimal") || h.operatorMinimal {
 		return
 	}
 	h.mu.Lock()
@@ -184,25 +185,29 @@ func (h *HealthReporter) reportWithContext(parent context.Context) {
 		}
 	}
 	s := healthSample{version: version.Version, osName: runtime.GOOS, arch: runtime.GOARCH}
-	if pcts, err := cpu.PercentWithContext(parent, time.Second, false); err == nil && len(pcts) > 0 {
-		s.cpuPct = math.Round(pcts[0]*10) / 10
-	}
-	if vm, err := mem.VirtualMemory(); err == nil {
-		s.memPct = math.Round(vm.UsedPercent*10) / 10
-	}
-	if temps, err := sensors.TemperaturesWithContext(parent); err == nil {
-		var max float64
-		for _, t := range temps {
-			if t.Temperature > max && t.Temperature < 150 {
-				max = t.Temperature
-			}
+	minimal := h.cfg.Telemetry == "minimal" || h.operatorMinimal
+	update := CurrentUpdateStatus()
+	if !minimal {
+		if pcts, err := cpu.PercentWithContext(parent, time.Second, false); err == nil && len(pcts) > 0 {
+			s.cpuPct = math.Round(pcts[0]*10) / 10
 		}
-		s.tempC = max
+		if vm, err := mem.VirtualMemory(); err == nil {
+			s.memPct = math.Round(vm.UsedPercent*10) / 10
+		}
+		if temps, err := sensors.TemperaturesWithContext(parent); err == nil {
+			var max float64
+			for _, t := range temps {
+				if t.Temperature > max && t.Temperature < 150 {
+					max = t.Temperature
+				}
+			}
+			s.tempC = max
+		}
+		if up, err := host.Uptime(); err == nil {
+			s.uptimeS = int64(up)
+		}
 	}
-	if up, err := host.Uptime(); err == nil {
-		s.uptimeS = int64(up)
-	}
-	if h.probe != nil {
+	if h.probe != nil && !minimal {
 		ctx, cancel := context.WithTimeout(parent, 12*time.Second)
 		d, err := h.probe(ctx)
 		cancel()
@@ -226,10 +231,12 @@ func (h *HealthReporter) reportWithContext(parent context.Context) {
 			// this when pinned TLS fails everywhere — exactly the network
 			// where the in-band channel is the only lifeline, so report it
 			// here. The panel raises a throttled sentinel alert.
-			HostileNet: HostileMode(),
+			HostileNet:    !minimal && HostileMode(),
+			UpdateChannel: h.cfg.UpdateChannel, UpdateState: update.State, ChannelAuthentication: h.cfg.RequireChannelAuth,
 		})
 		cancel()
 		if err == nil && resp != nil && resp.OK {
+			h.operatorMinimal = resp.TelemetryMode == "minimal"
 			if h.lastFail {
 				h.lastFail = false
 				log.Printf("health: reporting again (in-band)")
@@ -245,7 +252,7 @@ func (h *HealthReporter) reportWithContext(parent context.Context) {
 	if HostileMode() {
 		if !h.hostileLogged {
 			h.hostileLogged = true
-			log.Printf("health: TLS interception detected — pinned control channel skipped (in-band only)")
+			log.Printf("health: TLS pin verification failed; pinned control remains fail-closed, authenticated in-band reports are preferred")
 		}
 		return
 	}
@@ -262,6 +269,7 @@ func (h *HealthReporter) reportWithContext(parent context.Context) {
 		"latency_ms":     s.latencyMs,
 		"jitter_ms":      s.jitterMs,
 		"probe_loss_pct": s.lossPct,
+		"update_channel": h.cfg.UpdateChannel, "update_state": update.State, "channel_authentication": h.cfg.RequireChannelAuth,
 	}
 	body, _ := json.Marshal(payload)
 	cl, base, cerr := panelHTTP(h.cfg)
@@ -287,7 +295,7 @@ func (h *HealthReporter) reportWithContext(parent context.Context) {
 			if isPinFailure(err) {
 				// Interception raced the hostile latch (or cleared it while
 				// the middlebox stayed): one human sentence, no raw x509.
-				log.Printf("health: pinned control channel unreachable (network interception) — relying on in-band reports")
+				log.Printf("health: pinned control channel unavailable (possible interception or stale trust) - relying on authenticated in-band reports")
 			} else {
 				log.Printf("health: report failed: %v", err)
 			}
