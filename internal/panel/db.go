@@ -129,6 +129,20 @@ func sqliteBusy(err error) bool {
 	return false
 }
 
+// sqliteLockContention is plain SQLITE_BUSY (5), not BUSY_SNAPSHOT (6).
+// Retrying the latter would only repeat a stale read; immediate transactions
+// and fail-closed handling are required instead.
+func sqliteLockContention(err error) bool {
+	if err == nil {
+		return false
+	}
+	var code interface{ Code() int }
+	if errors.As(err, &code) {
+		return code.Code()&0xff == 5
+	}
+	return false
+}
+
 func migrateSchema(db schemaDB) error {
 	_, err := db.Exec(`
 	CREATE TABLE IF NOT EXISTS admins (

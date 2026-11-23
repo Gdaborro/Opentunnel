@@ -30,6 +30,30 @@ type policyReader interface {
 }
 
 func accessPolicy(ctx context.Context, reader policyReader, token string) (access.Snapshot, error) {
+	return retryAccessPolicy(ctx, func() (access.Snapshot, error) {
+		return accessPolicyOnce(ctx, reader, token)
+	})
+}
+
+// retryAccessPolicy retries only plain SQLITE_BUSY with the caller's bounded
+// context. Snapshot conflicts, SQL errors and canceled reads never repeat.
+func retryAccessPolicy(ctx context.Context, read func() (access.Snapshot, error)) (access.Snapshot, error) {
+	for {
+		p, err := read()
+		if !sqliteLockContention(err) {
+			return p, err
+		}
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return p, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func accessPolicyOnce(ctx context.Context, reader policyReader, token string) (access.Snapshot, error) {
 	p := access.Snapshot{Status: "pending"}
 	var kickReason, banReason, identityReason, kickExpiry, expiry, schedule string
 	var kill, allow, sshMax, sshDaily, sshTrickle string

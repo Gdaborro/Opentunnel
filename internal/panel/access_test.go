@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"opentunnel/internal/access"
 )
 
 func accessPeer(t *testing.T, db *DB) string {
@@ -18,6 +20,44 @@ func accessPeer(t *testing.T, db *DB) string {
 		t.Fatal(err)
 	}
 	return token
+}
+
+type policyTestError int
+
+func (e policyTestError) Error() string { return "synthetic sqlite policy error" }
+func (e policyTestError) Code() int     { return int(e) }
+
+func TestAccessPolicyRetriesOnlyPlainSQLiteBusy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	calls := 0
+	p, err := retryAccessPolicy(ctx, func() (access.Snapshot, error) {
+		calls++
+		if calls < 4 {
+			return access.Snapshot{Status: "pending"}, policyTestError(5)
+		}
+		return access.Snapshot{Status: "approved"}, nil
+	})
+	if err != nil || p.Status != "approved" || calls != 4 {
+		t.Fatalf("plain SQLITE_BUSY was not retried correctly: %+v %v calls=%d", p, err, calls)
+	}
+	calls = 0
+	if _, err := retryAccessPolicy(ctx, func() (access.Snapshot, error) {
+		calls++
+		return access.Snapshot{Status: "pending"}, policyTestError(6)
+	}); err == nil || calls != 1 {
+		t.Fatalf("BUSY_SNAPSHOT was retried: %v calls=%d", err, calls)
+	}
+}
+
+func TestAccessPolicyBusyRetryHasDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	if _, err := retryAccessPolicy(ctx, func() (access.Snapshot, error) {
+		return access.Snapshot{Status: "pending"}, policyTestError(5)
+	}); err == nil {
+		t.Fatal("persistent SQLITE_BUSY had no bounded failure")
+	}
 }
 
 func TestAccessPolicyFailsClosedOnSQLFailure(t *testing.T) {
