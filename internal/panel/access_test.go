@@ -270,7 +270,10 @@ func TestReservationsSurviveIndependentMetadataWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	// Race-enabled Windows CI can need more than ten seconds for these two
+	// hundred serialized SQLite writes. Keep the corruption assertions, but
+	// allow for measured scheduler and disk variance on slower runners.
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	metadataDone := make(chan error, 1)
 	go func() {
