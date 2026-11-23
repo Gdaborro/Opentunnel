@@ -226,33 +226,48 @@ func TestGenericEditionUsesConfiguredLoopbackServerAndItsOwnApprovedIdentity(t *
 	if err := os.WriteFile(cfg, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(binary, "-c", cfg)
-	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = dir, os.Environ(), io.Discard, io.Discard
-	if err := cmd.Start(); err != nil {
+	logPath := filepath.Join(dir, "generic-client.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		conn, err := net.DialTimeout("tcp", proxyAddr, 100*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("configured generic executable did not start its own proxy")
-		}
-		time.Sleep(20 * time.Millisecond)
+	cmd := exec.Command(binary, "-c", cfg)
+	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = dir, os.Environ(), logFile, logFile
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		t.Fatal(err)
 	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	defer func() {
+		_ = cmd.Process.Kill()
+		<-done
+		_ = logFile.Close()
+		if t.Failed() {
+			raw, _ := os.ReadFile(logPath)
+			t.Logf("generic client output:\n%s", raw)
+		}
+	}()
 	payload := bytes.Repeat([]byte("generic-own-server-fixture"), 8192)
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(payload) }))
 	defer origin.Close()
 	hc := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: func(*http.Request) (*url.URL, error) { return url.Parse("http://" + proxyAddr) }}}
 	defer hc.CloseIdleConnections()
 	_, port, _ := net.SplitHostPort(origin.Listener.Addr().String())
-	response, err := hc.Get("http://localhost:" + port)
-	if err != nil {
-		t.Fatal("configured generic proxy transfer failed", err)
+	deadline := time.Now().Add(10 * time.Second)
+	var response *http.Response
+	for {
+		if cmd.ProcessState != nil {
+			t.Fatalf("configured generic executable exited during startup: %v", cmd.ProcessState)
+		}
+		response, err = hc.Get("http://localhost:" + port)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("configured generic proxy did not become ready: ", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	raw, err := io.ReadAll(response.Body)
 	_ = response.Body.Close()
