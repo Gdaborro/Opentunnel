@@ -22,6 +22,19 @@ No network-specific measurements or fleet credentials belong here.
 - EOF propagates through TCP and smux write halves. Errors/cancellation close
   both endpoints and join both copy workers.
 
+## Enrollment capacity controls
+
+- Login-free signed-pool enrollment and default bootstrap now share a separate
+  256-row unauthenticated pending budget in addition to the global 4,096-row
+  backstop. Account-bound pending rows do not consume that smaller budget;
+  existing account `max_devices` limits (1–32 across all retained statuses) stay
+  unchanged. This limits garbage-enrollment starvation without treating valid
+  device proofs as approval or changing the client protocol.
+- The pending budget is checked in the same immediate SQLite transaction as row
+  insertion so concurrent writers cannot overshoot it. Pending rows with no
+  enrollment binding count as unauthenticated. Explicitly approved bootstrap
+  registration does not consume the pending-only budget.
+
 ## Identity anomaly review
 
 - Bounded duplicate detection compares approved and pending peers. Reused

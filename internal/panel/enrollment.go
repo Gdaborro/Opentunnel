@@ -215,6 +215,8 @@ func (h *Handler) enrollPool(w http.ResponseWriter, r *http.Request) {
 	}{status})
 }
 
+const unauthenticatedPendingLimit = 256
+
 var (
 	errEnrollmentNeedsLogin       = errors.New("enrollment login required")
 	errEnrollmentIdentityConflict = errors.New("enrollment identity conflict")
@@ -343,6 +345,18 @@ func (db *DB) enrollPool(ctx context.Context, req enrollmentRequest, loginRequir
 	}
 	if loginRequired && account == nil {
 		return "", false, errEnrollmentNeedsLogin
+	}
+	if account == nil {
+		// Login-free enrollment must not let one hostile source consume the
+		// global pending queue. Account-backed enrollments already have their
+		// own smaller max_devices bound.
+		var unauthenticatedPending int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM peers p LEFT JOIN peer_enrollments e ON e.token=p.token WHERE p.status='pending' AND COALESCE(e.username,'')=''`).Scan(&unauthenticatedPending); err != nil {
+			return "", false, err
+		}
+		if unauthenticatedPending >= unauthenticatedPendingLimit {
+			return "", false, errEnrollmentDenied
+		}
 	}
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM peers WHERE status='pending'`).Scan(&count); err != nil {
