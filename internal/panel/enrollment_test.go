@@ -83,6 +83,87 @@ func createSyntheticEnrollmentAccount(t *testing.T, db *DB, max int) *verifiedEn
 	return account
 }
 
+func seedPendingRows(t *testing.T, db *DB, count int) {
+	t.Helper()
+	_, err := db.Exec(`WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?)
+		INSERT INTO peers(token,fingerprint,device_name,status,created_at,last_seen,ssh_pubkey,auth_epoch)
+		SELECT printf('flood-%04d',x),'flood-fingerprint','flood-device','pending',datetime('now'),datetime('now'),'','epoch' FROM n`, count)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnauthenticatedPendingCapIsBoundedAndRecoverable(t *testing.T) {
+	db, _ := enrollmentFixture(t, false)
+	seedPendingRows(t, db, unauthenticatedPendingLimit)
+	req, _ := enrollmentIdentity(t, "overflow")
+	if _, _, err := db.enrollPool(t.Context(), req, false, nil); !errors.Is(err, errEnrollmentDenied) {
+		t.Fatalf("unauthenticated pending cap was not enforced: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM peers WHERE token='flood-0001'`); err != nil {
+		t.Fatal(err)
+	}
+	status, created, err := db.enrollPool(t.Context(), req, false, nil)
+	if err != nil || status != "pending" || !created {
+		t.Fatalf("freeing one pending slot did not restore bounded enrollment: %q %v %v", status, created, err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='pending'`).Scan(&count); err != nil || count != unauthenticatedPendingLimit {
+		t.Fatalf("unexpected pending count after recovery: %d %v", count, err)
+	}
+}
+
+func TestAccountPendingDoesNotConsumeUnauthenticatedBudget(t *testing.T) {
+	db, _ := enrollmentFixture(t, true)
+	account := createSyntheticEnrollmentAccount(t, db, 1)
+	seedPendingRows(t, db, unauthenticatedPendingLimit)
+	req, _ := enrollmentIdentity(t, "account-backed")
+	status, created, err := db.enrollPool(t.Context(), req, true, account)
+	if err != nil || status != "pending" || !created {
+		t.Fatalf("account-backed enrollment was blocked by unauthenticated rows: %q %v %v", status, created, err)
+	}
+}
+
+func TestBootstrapApprovedRegistrationDoesNotUsePendingBudget(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingRows(t, db, unauthenticatedPendingLimit)
+	req := registrationRequest{Token: "bootstrap-approved-123456", Fingerprint: "approved-fingerprint", SSHPubKey: testKeyLine(t)}
+	status, _, created, err := db.registerBootstrap(t.Context(), req, true)
+	if err != nil || status != "approved" || !created {
+		t.Fatalf("explicitly approved bootstrap was blocked by pending capacity: %q %v %v", status, created, err)
+	}
+}
+
+func TestUnauthenticatedPendingCapConcurrentBoundary(t *testing.T) {
+	db, _ := enrollmentFixture(t, false)
+	seedPendingRows(t, db, unauthenticatedPendingLimit-1)
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, suffix := range []string{"boundary-a", "boundary-b"} {
+		req, _ := enrollmentIdentity(t, suffix)
+		wg.Go(func() { _, _, err := db.enrollPool(context.Background(), req, false, nil); errs <- err })
+	}
+	wg.Wait()
+	close(errs)
+	var success, denied int
+	for err := range errs {
+		if err == nil {
+			success++
+		} else if errors.Is(err, errEnrollmentDenied) {
+			denied++
+		} else {
+			t.Fatalf("unexpected concurrent enrollment error: %v", err)
+		}
+	}
+	if success != 1 || denied != 1 {
+		t.Fatalf("cap boundary allowed an overshoot or wrong failure: success=%d denied=%d", success, denied)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM peers WHERE status='pending'`).Scan(&count); err != nil || count != unauthenticatedPendingLimit {
+		t.Fatalf("concurrent cap committed the wrong pending total: %d %v", count, err)
+	}
+}
+
 func TestPoolLoginEnrollsButNeverApproves(t *testing.T) {
 	db, h := enrollmentFixture(t, true)
 	createSyntheticEnrollmentAccount(t, db, 5)

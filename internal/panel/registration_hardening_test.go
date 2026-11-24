@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,6 +9,22 @@ import (
 	"testing"
 	"time"
 )
+
+func TestBootstrapUnauthenticatedPendingCapIsBounded(t *testing.T) {
+	db := newTestDB(t)
+	seedPendingRows(t, db, unauthenticatedPendingLimit)
+	req := registrationRequest{Token: "bootstrap-overflow-123456", Fingerprint: "overflow-fingerprint", SSHPubKey: testKeyLine(t)}
+	if _, _, _, err := db.registerBootstrap(t.Context(), req, false); !errors.Is(err, errRegistrationDenied) {
+		t.Fatalf("bootstrap pending cap was not enforced: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM peers WHERE token='flood-0001'`); err != nil {
+		t.Fatal(err)
+	}
+	status, _, created, err := db.registerBootstrap(t.Context(), req, false)
+	if err != nil || status != "pending" || !created {
+		t.Fatalf("bootstrap did not recover after one pending slot opened: %q %v %v", status, created, err)
+	}
+}
 
 func TestBootstrapRegistrationReadAndAuditFaultCannotEnrollOrApprove(t *testing.T) {
 	for _, fault := range []string{"ban-read", "audit-write"} {

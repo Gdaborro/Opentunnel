@@ -2,6 +2,9 @@
 
 ## Next (unreleased)
 
+- Add a separate 256-row unauthenticated pending budget for login-free signed
+  pools and default bootstrap, with transactional concurrency checks and no
+  change to account quotas or approval behavior.
 - Add bounded, review-only duplicate-identity detection across approved and
   pending devices. Canonical key reuse and hardware-fingerprint reuse raise
   throttled `security` warnings without changing either identity, creating bans,

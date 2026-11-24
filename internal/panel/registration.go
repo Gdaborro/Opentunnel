@@ -115,6 +115,15 @@ func (db *DB) registerBootstrap(parent context.Context, req registrationRequest,
 	if autoApprove || autoAccept {
 		status = "approved"
 	}
+	if status == "pending" {
+		var unauthenticatedPending int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM peers WHERE status='pending'`).Scan(&unauthenticatedPending); err != nil {
+			return "", false, false, err
+		}
+		if unauthenticatedPending >= unauthenticatedPendingLimit {
+			return "", false, false, errRegistrationDenied
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO peers(token,fingerprint,device_name,ssh_pubkey,status,created_at,last_seen,auth_epoch) VALUES(?,?,?,?,?,datetime('now'),datetime('now'),hex(randomblob(16)))`, req.Token, req.Fingerprint, req.DeviceName, key, status); err != nil {
 		return "", false, false, err
 	}
