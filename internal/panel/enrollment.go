@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"opentunnel/internal/panelproxy"
 	"opentunnel/internal/serverpool"
 )
 
@@ -152,7 +153,10 @@ func (h *Handler) enrollPool(w http.ResponseWriter, r *http.Request) {
 	var account *verifiedEnrollmentAccount
 	if req.Username != "" || req.Password != "" {
 		// The client checks pins; server-side refuse plaintext public entry too.
-		if r.TLS == nil && !(trustedPanelProxy(r) && r.Header.Get("X-Otu-Original-Scheme") == "https") {
+		// A loopback peer's scheme header is sufficient only as part of the
+		// relay's authenticated client-IP/scheme/host tuple.
+		forwarded, proxiedTLS := panelproxy.FromRequest(r)
+		if r.TLS == nil && (!proxiedTLS || forwarded.Scheme != "https") {
 			http.Error(w, "verified TLS enrollment required", 403)
 			return
 		}

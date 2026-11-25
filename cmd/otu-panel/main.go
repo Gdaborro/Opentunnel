@@ -27,6 +27,7 @@ import (
 	"opentunnel/internal/authority"
 	"opentunnel/internal/config"
 	"opentunnel/internal/panel"
+	"opentunnel/internal/panelproxy"
 	"opentunnel/internal/privatefile"
 	"opentunnel/internal/serverpool"
 	"opentunnel/internal/transport"
@@ -83,6 +84,16 @@ func main() {
 		}
 	}
 	ph := panel.New(panelDB, auth, cfg.AutoApprove).WithGeoIP(geo)
+	if cfg.AuthorityListen == "" && !cfg.StaticTokenOnly {
+		// The local relay and panel already share this key pair. Read it
+		// without generating/replacing identity state; if it is unavailable,
+		// refuse startup rather than silently trusting or dropping metadata.
+		proxyProof, proofErr := panelproxy.Load(cfg.CertFile, cfg.KeyFile)
+		if proofErr != nil {
+			log.Fatal("panel relay proof identity unavailable")
+		}
+		ph.WithProxyProof(proxyProof)
+	}
 	ph, err = ph.WithServerPoolAuthentication(cfg.PoolID, cfg.EnrollmentLogin, cfg.RequireChannelAuth && cfg.PoolID != "")
 	if err != nil {
 		log.Fatalf("server pool authority: %v", err)

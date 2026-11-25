@@ -16,6 +16,7 @@ import (
 
 	"opentunnel/internal/authority"
 	"opentunnel/internal/panel/ui"
+	"opentunnel/internal/panelproxy"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/serverpool"
 )
@@ -33,6 +34,7 @@ type Handler struct {
 	auth               *Auth
 	autoApprove        bool
 	geo                *GeoIP // optional; nil = no country resolution
+	proxyProof         *panelproxy.Proof
 
 	rlMu        sync.Mutex
 	rlMap       map[string]*regLimit // per-IP rate-limit buckets (bucket|ip)
@@ -62,6 +64,13 @@ const regLimitWindow = time.Minute
 
 func New(db *DB, auth *Auth, autoApprove bool) *Handler {
 	return &Handler{db: db, auth: auth, autoApprove: autoApprove, rlMap: make(map[string]*regLimit), enrollmentSlots: make(chan struct{}, 4)}
+}
+
+// WithProxyProof enables authenticated relay metadata. A nil proof fails
+// closed: forwarded headers remain untrusted and direct requests still work.
+func (h *Handler) WithProxyProof(proof *panelproxy.Proof) *Handler {
+	h.proxyProof = proof
+	return h
 }
 
 // WithGeoIP attaches an offline GeoIP resolver (panel map / countries).
@@ -188,7 +197,35 @@ func (h *Handler) Mount(mux *http.ServeMux) {
 func (h *Handler) Handler() http.Handler {
 	mux := http.NewServeMux()
 	h.Mount(mux)
-	return securityHeaders(csrfOriginCheck(mux))
+	return securityHeaders(h.authenticatePanelProxy(csrfOriginCheck(mux)))
+}
+
+// authenticatePanelProxy is the sole boundary that promotes relay headers to
+// trusted request metadata. Header-free direct requests and authenticated
+// authority context pass through. Any unverified relay field is rejected so a
+// failed handoff cannot be demoted to the direct loopback identity.
+func (h *Handler) authenticatePanelProxy(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := panelproxy.FromRequest(r); !ok && panelproxy.HasForwardingMetadata(r) {
+			if !trustedPanelProxy(r) || h.proxyProof == nil {
+				http.Error(w, "panel proxy authentication failed", http.StatusForbidden)
+				return
+			}
+			authenticated, err := h.proxyProof.AuthenticateStrict(r)
+			if err != nil {
+				status := http.StatusForbidden
+				if errors.Is(err, panelproxy.ErrReplayCacheSaturated) {
+					status = http.StatusServiceUnavailable
+				} else if errors.Is(err, panelproxy.ErrBodyTooLarge) {
+					status = http.StatusRequestEntityTooLarge
+				}
+				http.Error(w, "panel proxy authentication failed", status)
+				return
+			}
+			r = authenticated
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // securityHeaders applies the control-plane baseline (audit round three,
@@ -221,16 +258,15 @@ func securityHeaders(next http.Handler) http.Handler {
 //
 // Host comparison must survive the relay's reverse proxy, which rewrites
 // r.Host to the loopback upstream (production incident 2026-10-28: the
-// original comparison 403'd every browser login). The relay stamps the
-// original, browser-facing host in X-Otu-Original-Host before rewriting —
-// overwritten relay-side so the value is unspoofable from outside.
+// original comparison 403'd every browser login). The original host is used
+// only after the panel authenticates the relay's complete forwarded tuple.
 func csrfOriginCheck(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if origin := r.Header.Get("Origin"); origin != "" {
 				hosts := []string{r.Host}
-				if fh := r.Header.Get("X-Otu-Original-Host"); fh != "" && trustedPanelProxy(r) {
-					hosts = append(hosts, fh)
+				if forwarded, ok := panelproxy.FromRequest(r); ok && forwarded.Host != "" {
+					hosts = append(hosts, forwarded.Host)
 				}
 				ok := false
 				for _, h := range hosts {
@@ -374,14 +410,12 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/login", 302)
 }
 
-// clientIP resolves the caller's IP. The relay's reverse proxy stamps
-// X-Otu-Client-IP on every proxied request (an unspoofable view — it
-// overwrites anything the outside sent, and includes the CDN-resolved
-// address when the relay is fronted). Direct requests (tests, emergency
-// panel access on loopback) fall back to RemoteAddr.
+// clientIP resolves the caller's IP from authenticated relay/authority
+// metadata. Untrusted or unproved headers never affect rate-limit identity.
+// Direct requests (tests, emergency panel access on loopback) use RemoteAddr.
 func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Otu-Client-IP"); net.ParseIP(v) != nil && trustedPanelProxy(r) {
-		return v
+	if forwarded, ok := panelproxy.FromRequest(r); ok && net.ParseIP(forwarded.ClientIP) != nil {
+		return forwarded.ClientIP
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

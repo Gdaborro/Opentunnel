@@ -5,6 +5,13 @@
 - Add a separate 256-row unauthenticated pending budget for login-free signed
   pools and default bootstrap, with transactional concurrency checks and no
   change to account quotas or approval behavior.
+- Authenticate relay-to-panel forwarded metadata with fresh, expiring, single-use
+  HMAC proofs bound to client IP, original host/scheme, method, URI and body.
+  Reject forged, replayed or failed handoffs instead of trusting loopback headers
+  or demoting them to direct loopback identity; preserve direct access and the
+  mutually authenticated central-authority path.
+- Update Gorilla WebSocket to the GO-2026-6278-fixed revision for cryptographic
+  mask-key generation without changing the reviewed Xray/REALITY source commit.
 - Add bounded, review-only duplicate-identity detection across approved and
   pending devices. Canonical key reuse and hardware-fingerprint reuse raise
   throttled `security` warnings without changing either identity, creating bans,

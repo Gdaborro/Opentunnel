@@ -318,9 +318,24 @@ func TestReservationsSurviveIndependentMetadataWriter(t *testing.T) {
 	metadataDone := make(chan error, 1)
 	go func() {
 		for range 100 {
-			if _, err := b.ExecContext(ctx, `UPDATE peers SET last_seen=datetime('now'),last_ip='192.0.2.2' WHERE token=?`, token); err != nil {
-				metadataDone <- err
-				return
+			for {
+				_, err := b.ExecContext(ctx, `UPDATE peers SET last_seen=datetime('now'),last_ip='192.0.2.2' WHERE token=?`, token)
+				if !sqliteLockContention(err) {
+					if err != nil {
+						metadataDone <- err
+						return
+					}
+					break
+				}
+				// Continuous immediate reservations can outlast busy_timeout on a
+				// loaded runner. Retry only plain SQLITE_BUSY within the test's
+				// existing bound; snapshot conflicts and other errors still fail.
+				select {
+				case <-ctx.Done():
+					metadataDone <- ctx.Err()
+					return
+				case <-time.After(25 * time.Millisecond):
+				}
 			}
 		}
 		metadataDone <- nil

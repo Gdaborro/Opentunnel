@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"opentunnel/internal/metrics"
+	"opentunnel/internal/panelproxy"
 	"opentunnel/internal/serverpool"
 )
 
@@ -83,7 +84,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		clone.Header = r.Header.Clone()
 		// Only an authenticated node supplies the resolved source address.
 		clone.RemoteAddr = "127.0.0.1:1"
-		clone.Header.Set("X-Otu-Original-Scheme", "https")
+		clone.Header.Set(panelproxy.SchemeHeader, "https")
+		clone = panelproxy.MarkAuthority(clone)
 		h.public.ServeHTTP(w, clone)
 		return
 	}

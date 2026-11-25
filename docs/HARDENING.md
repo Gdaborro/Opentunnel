@@ -35,6 +35,27 @@ No network-specific measurements or fleet credentials belong here.
   enrollment binding count as unauthenticated. Explicitly approved bootstrap
   registration does not consume the pending-only budget.
 
+## Panel relay metadata authentication
+
+- The local relay and panel derive a domain-separated HMAC key in memory from
+  their existing relay TLS key pair; the panel reads that pair without creating
+  or replacing it. Forwarded client IP, original host and scheme are trusted only
+  after proof verification, never merely because a request arrived on loopback.
+- Each proof carries a random nonce and 15-second expiry and is bound to the
+  outgoing method, request target and a maximum 2 MiB body. The panel consumes
+  nonces atomically in a bounded 4,096-entry replay cache. Replayed or transplanted
+  requests fail, as do invalid, duplicate or wrong-key headers. Cache pressure
+  returns 503 rather than admitting the request under the loopback identity.
+- Relay stamping occurs after reverse-proxy path rewriting. Invalid metadata,
+  oversized bodies and unavailable proof state are rejected before reaching the
+  panel; panel-side verification failures are rejected rather than demoted to
+  direct loopback. Header-free direct loopback requests remain available.
+- Authenticated central-authority forwarding remains a separate TLS 1.3 mutual-
+  authentication path and does not depend on a shared relay HMAC key. Replay
+  state is per panel process and in memory: after a panel restart, the proof's
+  short expiry is the residual replay window. Independent/shared replay state
+  for multi-panel HA is not claimed.
+
 ## Identity anomaly review
 
 - Bounded duplicate detection compares approved and pending peers. Reused
