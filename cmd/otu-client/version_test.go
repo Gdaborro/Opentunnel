@@ -10,8 +10,8 @@ import (
 func TestClientVersionTextUsesCanonicalReleaseTag(t *testing.T) {
 	previous := version.Version
 	defer func() { version.Version = previous }()
-	version.Version = "1.1.11"
-	if got := clientVersionText(); got != "opentunnel client v1.1.11" {
+	version.Version = "1.1.13"
+	if got := clientVersionText(); got != "opentunnel client v1.1.13" {
 		t.Fatalf("client version output = %q", got)
 	}
 	version.LocalPreview = "synthetic"

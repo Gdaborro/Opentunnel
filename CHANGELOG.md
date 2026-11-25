@@ -1,6 +1,6 @@
 # Changelog
 
-## Next (unreleased)
+## v1.1.13 - R7 hardening
 
 - Add a separate 256-row unauthenticated pending budget for login-free signed
   pools and default bootstrap, with transactional concurrency checks and no
@@ -27,6 +27,12 @@
   fingerprints remain risk evidence rather than hardware attestation; recovery
   still requires expected-key verification, out-of-band confirmation, and
   separate administrator approval.
+
+Version and update floor raised to v1.1.13. The candidate channel remains at 0%
+automatic rollout with the existing root-1 trust anchor. This remains a
+Windows/Linux application-proxy release, not a system-wide VPN/TUN driver. The
+72-hour pilot, independent-host/load acceptance, full real-device lifecycle
+acceptance and independent external security review remain separate gates.
 
 ## v1.1.11 - pre-1.2 hardening
 
