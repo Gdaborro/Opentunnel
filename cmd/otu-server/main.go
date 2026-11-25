@@ -34,6 +34,7 @@ import (
 	"opentunnel/internal/config"
 	"opentunnel/internal/metrics"
 	"opentunnel/internal/panel"
+	"opentunnel/internal/panelproxy"
 	"opentunnel/internal/privatefile"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/server"
@@ -323,59 +324,15 @@ func main() {
 		mux.Handle("/", baseHandler)
 		handler = mux // node public routes never expose the authority's admin API
 	} else if panelDB != nil {
+		proxyProof, proofErr := panelproxy.New(cert.PrivateKey)
+		if proofErr != nil {
+			log.Fatal("panel proxy proof unavailable; forwarded metadata would fail closed")
+		}
 		target, perr := url.Parse(panelUpstream)
 		if perr != nil {
 			log.Fatalf("panel upstream: %v", perr)
 		}
-		proxy := httputil.NewSingleHostReverseProxy(target)
-		origDirector := proxy.Director
-		proxy.Director = func(r *http.Request) {
-			origDirector(r)
-			r.Host = target.Host
-		}
-		// Keep-alive to the panel process: under load, each proxied request
-		// reuses a warm connection instead of paying a fresh loopback TCP
-		// setup, keeping admin actions fast when the relay is busy.
-		proxy.Transport = &http.Transport{
-			MaxIdleConns:          16,
-			MaxIdleConnsPerHost:   16,
-			IdleConnTimeout:       90 * time.Second,
-			DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-		}
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			// Panel process down or saturated: serve a plain-text pointer
-			// instead of hanging the admin's browser.
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			io.WriteString(w, "panel process unavailable — retry in a moment; the relay itself is fine\n")
-		}
-		// Stamp the REAL client IP (TCP peer, or CF-Connecting-IP behind
-		// the CDN front) before proxying: the panel's per-IP rate limits
-		// and login lockout key on it, and the header overwrites anything
-		// the outside sent — unspoofable from beyond the relay.
-		// The original browser-facing Host is preserved the same way: the
-		// Director below rewrites r.Host to the loopback upstream, and the
-		// panel's CSRF origin check needs the host the browser actually
-		// used (production incident 2026-10-28).
-		stampIP := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 1.0.1: strip client-named hop-by-hop headers FIRST. The
-			// stdlib reverse proxy removes headers the client listed in
-			// `Connection:` when it forwards, so a request carrying
-			// `Connection: X-Otu-Client-IP` used to delete our trusted
-			// stamps AFTER they were set — collapsing the panel's per-IP
-			// rate limits and login lockout into one shared bucket.
-			server.SanitizeConnectionHeaders(r.Header)
-			r.Header.Set("X-Otu-Client-IP", server.ResolveClientIP(r, cfg.TrustCloudflareIPs))
-			r.Header.Set("X-Otu-Original-Host", r.Host)
-			scheme := "http"
-			if r.TLS != nil {
-				scheme = "https"
-			}
-			r.Header.Set("X-Otu-Original-Scheme", scheme)
-			proxy.ServeHTTP(w, r)
-		})
+		stampIP := newPanelProxy(target, cfg.TrustCloudflareIPs, proxyProof)
 		mux := http.NewServeMux()
 		mux.Handle("/admin/", stampIP)
 		mux.Handle("/admin", stampIP)
@@ -543,6 +500,101 @@ func main() {
 			log.Fatalf("listen: %v", err)
 		}
 	}
+}
+
+type panelProxyRejection struct {
+	status int
+	cause  error
+}
+
+func (e *panelProxyRejection) Error() string { return e.cause.Error() }
+func (e *panelProxyRejection) Unwrap() error { return e.cause }
+
+type panelProxyRejectionKey struct{}
+
+type panelProxyTransport struct {
+	base http.RoundTripper
+}
+
+func (t panelProxyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if rejection, ok := r.Context().Value(panelProxyRejectionKey{}).(*panelProxyRejection); ok {
+		return nil, rejection
+	}
+	return t.base.RoundTrip(r)
+}
+
+// newPanelProxy authenticates the exact outgoing request after the Director's
+// path rewrite. A failed handoff is rejected, never demoted to direct loopback
+// identity at the panel.
+func newPanelProxy(target *url.URL, trustCloudflare bool, proof *panelproxy.Proof) http.Handler {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	origDirector := proxy.Director
+	proxy.Director = func(r *http.Request) {
+		origDirector(r)
+		r.Host = target.Host
+		if err := stampPanelProxyRequest(r, proof); err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, panelproxy.ErrInvalidMetadata) {
+				status = http.StatusBadRequest
+			} else if errors.Is(err, panelproxy.ErrBodyTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			rejection := &panelProxyRejection{status: status, cause: err}
+			*r = *r.WithContext(context.WithValue(r.Context(), panelProxyRejectionKey{}, rejection))
+		}
+	}
+	// Keep-alive to the panel process: under load, each proxied request
+	// reuses a warm connection instead of paying a fresh loopback TCP setup.
+	proxy.Transport = panelProxyTransport{base: &http.Transport{
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       90 * time.Second,
+		DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	}}
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		var rejection *panelProxyRejection
+		if errors.As(err, &rejection) && rejection.status != http.StatusServiceUnavailable {
+			http.Error(w, "panel proxy request rejected", rejection.status)
+			return
+		}
+		// Panel process down or saturated: serve a plain-text pointer instead
+		// of hanging the admin's browser. Proof failures also remain a 503.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "panel process unavailable — retry in a moment; the relay itself is fine\n")
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := preparePanelProxyRequest(r, trustCloudflare); err != nil {
+			http.Error(w, "invalid panel proxy metadata", http.StatusBadRequest)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})
+}
+
+// preparePanelProxyRequest overwrites client-supplied forwarding metadata.
+// Strip client-named hop-by-hop headers first so ReverseProxy cannot delete
+// the new stamps after the Director returns.
+func preparePanelProxyRequest(r *http.Request, trustCloudflare bool) error {
+	server.SanitizeConnectionHeaders(r.Header)
+	forwarded := panelproxy.Forwarded{ClientIP: server.ResolveClientIP(r, trustCloudflare), Scheme: "http", Host: r.Host}
+	if r.TLS != nil {
+		forwarded.Scheme = "https"
+	}
+	r.Header.Del(panelproxy.ProofHeader)
+	r.Header.Set(panelproxy.ClientIPHeader, forwarded.ClientIP)
+	r.Header.Set(panelproxy.OriginalHostHeader, forwarded.Host)
+	r.Header.Set(panelproxy.SchemeHeader, forwarded.Scheme)
+	return panelproxy.ValidateMetadata(forwarded)
+}
+
+// stampPanelProxyRequest runs after Director path rewriting. The original
+// browser-facing host is already preserved in its own header, so replacing
+// r.Host with the panel upstream does not change the authenticated CSRF value.
+func stampPanelProxyRequest(r *http.Request, proof *panelproxy.Proof) error {
+	return proof.Stamp(r, r.Header.Get(panelproxy.ClientIPHeader), r.Header.Get(panelproxy.SchemeHeader), r.Header.Get(panelproxy.OriginalHostHeader))
 }
 
 // probeVerifiedLeaf dials addr with FULL TLS verification (chain against

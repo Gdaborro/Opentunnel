@@ -19,6 +19,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/ssh"
+	"opentunnel/internal/panelproxy"
 	"opentunnel/internal/protocol"
 	"opentunnel/internal/serverpool"
 )
@@ -497,6 +498,56 @@ func TestPoolEnrollmentRejectsAmbiguousSchemaAndPlaintextPassword(t *testing.T) 
 	h.enrollPool(w, r)
 	if w.Code != 403 {
 		t.Fatal("plaintext local public request accepted credentials", w.Code)
+	}
+}
+
+func TestPoolPasswordEnrollmentRequiresAuthenticatedProxyScheme(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		forged     bool
+		missingKey bool
+		want       int
+	}{
+		{name: "genuine proxy-stamped loopback request", want: http.StatusOK},
+		{name: "forged scheme with proof for another tuple", forged: true, want: http.StatusForbidden},
+		{name: "missing panel key", missingKey: true, want: http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, h := enrollmentFixture(t, true)
+			createSyntheticEnrollmentAccount(t, db, 5)
+			req, key := enrollmentIdentity(t, "proxy-scheme")
+			req.Username, req.Password = "synthetic-user", syntheticEnrollmentPassword
+			r, _ := enrollmentHTTP(req, key, "")
+			r.TLS = nil
+			r.RemoteAddr = "127.0.0.1:40000"
+			if !test.missingKey {
+				proof := testPanelProxyProof(t)
+				h.WithProxyProof(proof)
+				scheme := "https"
+				if test.forged {
+					scheme = "http"
+				}
+				if err := proof.Stamp(r, "198.51.100.23", scheme, "entry.example"); err != nil {
+					t.Fatal(err)
+				}
+				if test.forged {
+					r.Header.Set(panelproxy.SchemeHeader, "https")
+				}
+			} else {
+				r.Header.Set(panelproxy.ClientIPHeader, "198.51.100.23")
+				r.Header.Set(panelproxy.SchemeHeader, "https")
+				r.Header.Set(panelproxy.OriginalHostHeader, "entry.example")
+				r.Header.Set(panelproxy.ProofHeader, "forged")
+			}
+			w := httptest.NewRecorder()
+			h.Handler().ServeHTTP(w, r)
+			if w.Code != test.want {
+				t.Fatalf("status = %d, want %d: %s", w.Code, test.want, w.Body.String())
+			}
+			if created := db.KnownPeer(req.Token); created != (test.want == http.StatusOK) {
+				t.Fatalf("enrollment created = %t for status %d", created, w.Code)
+			}
+		})
 	}
 }
 
